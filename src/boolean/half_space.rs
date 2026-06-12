@@ -964,11 +964,20 @@ impl<'a> Cutter<'a> {
         self.register_on_boundary_caps(loops, class);
     }
 
-    /// Register a face's straight On–On boundary edges (both endpoints in the cut
-    /// plane, the connecting edge a straight line lying in it) as wall-side cap
-    /// edges. The cap half-edge is the reversed sibling, so the opening where this
-    /// kept face borders removed material is sealed. Curved (arc) On edges are not
-    /// registered here — those bound disk caps handled by the arc-cap path.
+    /// Register a face's On–On boundary edges (both endpoints in the cut plane,
+    /// the connecting edge lying wholly in it) as wall-side cap edges. The cap
+    /// half-edge is the reversed sibling, so the opening where this kept face
+    /// borders removed material is sealed.
+    ///
+    /// Straight edges go through [`Self::add_section_edge`] (straight section
+    /// line). Circular / elliptical On–On edges — the rim of a coplanar lid that
+    /// was itself produced by a cylindrical boolean (a round void / sleeve / clip
+    /// column) — go through [`Self::register_arc_boundary_cap`], which records the
+    /// arc on the *same* shared section conic so it pairs as a sibling. Both kinds
+    /// are subject to signed-multiplicity cancellation in [`Self::collect_cap_edges`]:
+    /// an edge a lid and its abutting side face both record (in opposite
+    /// directions, over the same material) cancels, while a segment bordering
+    /// removed material survives once.
     fn register_on_boundary_caps(
         &mut self,
         loops: &[Id<Loop>],
@@ -988,8 +997,7 @@ impl<'a> Cutter<'a> {
                 ) else {
                     continue;
                 };
-                // Only straight edges in the cut plane.
-                let Some(CurveGeom::Line(_)) = self.input.geom.curve(he.curve) else {
+                let Some(curve) = self.input.geom.curve(he.curve).copied() else {
                     continue;
                 };
                 let s_start = class.get(&he.start).copied().unwrap_or(Sign3::On);
@@ -1009,9 +1017,60 @@ impl<'a> Cutter<'a> {
                 {
                     continue;
                 }
-                self.add_section_edge(pa, pb);
+                match curve {
+                    CurveGeom::Line(_) => self.add_section_edge(pa, pb),
+                    CurveGeom::Circle(_) | CurveGeom::Ellipse(_) => {
+                        self.register_arc_boundary_cap(he.curve, &curve, he.boundary, pa, pb);
+                    }
+                }
             }
         }
+    }
+
+    /// Register a circular / elliptical On–On boundary edge of a coplanar lid as a
+    /// wall-side cap arc. The whole edge lies in the cut plane (it is a rim of a
+    /// lid produced by a cylindrical boolean), so the section conic *is* the edge's
+    /// own circle / ellipse and the edge's boundary parameters serve directly as
+    /// the wall-side angular interval `[ta, tb]`. The cap arc is the reversed
+    /// sibling, exactly as a straight cap edge reverses a straight section line.
+    ///
+    /// Crucially, the cap arc must share the *same output curve* as the lid's own
+    /// verbatim rim arc so the two pair as siblings. The verbatim copy interns the
+    /// rim through [`Self::out_conic`] (keyed on the source curve id), so this does
+    /// the same — rather than minting a fresh section conic — which is what closes
+    /// the watertight loop.
+    fn register_arc_boundary_cap(
+        &mut self,
+        src_curve: CurveId,
+        curve: &CurveGeom,
+        boundary: [f64; 2],
+        pa: Point3,
+        pb: Point3,
+    ) {
+        if (pb - pa).norm() <= self.tol.length {
+            return;
+        }
+        if !matches!(curve, CurveGeom::Circle(_) | CurveGeom::Ellipse(_)) {
+            return;
+        }
+        // Resolve (and intern) the shared output curve via the same source-keyed
+        // path the verbatim lid copy uses, so the lid rim arc and this cap arc
+        // reference one `CurveId` and pair as reversed siblings.
+        let out_curve = self.out_conic(src_curve, *curve);
+        // Intern both endpoints; only `b` (at pb, the cap arc's start) is retained.
+        let _ = self.vertex_at(pa);
+        let b = self.vertex_at(pb);
+        // Wall-side direction `pa → pb` matches the lid loop traversal; the cap arc
+        // reverses it. The edge's own parameters are the section conic parameters
+        // because the rim circle/ellipse lies in the cut plane.
+        self.section_arcs.push(SectionArc {
+            b,
+            pa,
+            pb,
+            curve: out_curve,
+            ta: boundary[0],
+            tb: boundary[1],
+        });
     }
 
     // ── coplanar face rule ────────────────────────────────────────────────
@@ -2110,13 +2169,18 @@ impl<'a> Cutter<'a> {
         let cap_cycles: Vec<CapCycle> = cycles
             .into_iter()
             .map(|ring| {
-                CapCycle::new(ring, &frame, |c| match self.out.geom.curve(c) {
-                    Some(CurveGeom::Circle(circle)) => Some(circle.radius()),
-                    _ => None,
-                })
+                CapCycle::new(
+                    ring,
+                    &frame,
+                    |c| match self.out.geom.curve(c) {
+                        Some(CurveGeom::Circle(circle)) => Some(circle.radius()),
+                        _ => None,
+                    },
+                    |c, t| self.out.geom.curve(c).map(|g| g.point_at(t)),
+                )
             })
             .collect();
-        let nested = nest_cap_cycles(&cap_cycles);
+        let nested = nest_cap_cycles(&cap_cycles, &frame);
 
         // Cap surface: cut plane inserted canonically; sense so its outward normal
         // faces away from the kept material.
@@ -2196,11 +2260,39 @@ impl<'a> Cutter<'a> {
                 });
             }
         }
-        // Section arcs: every recorded arc is a genuine cap boundary. Dedup by the
-        // directed endpoint key so a doubly-recorded arc is not duplicated.
+        // Section arcs. Most arcs (from a transverse cylinder cut) are genuine cap
+        // boundaries recorded once. But a coplanar lid whose rim circle abuts a
+        // kept cylindrical side face records the *same* rim arc twice in opposite
+        // directions (lid wall-side `pa → pb`, side face `pb → pa`), which must
+        // cancel just like an internal straight edge. Tally signed multiplicity per
+        // *directed conic arc* — keyed on the curve and the quantised angular
+        // interval — so a reversed pair cancels while the two distinct semicircles
+        // of a full circle (same endpoints, different boundaries, so different
+        // intervals) both survive.
+        let mut arc_signed: HashMap<(CurveId, i64, i64), i32> = HashMap::new();
         for a in &self.section_arcs {
-            let (ka, kb) = (key(a.pa), key(a.pb));
-            if emitted.insert((ka, kb)) {
+            let (qa, qb) = (quantize(a.ta), quantize(a.tb));
+            let (uk, dir) = if (qa, qb) <= (qb, qa) {
+                ((a.curve, qa, qb), 1)
+            } else {
+                ((a.curve, qb, qa), -1)
+            };
+            *arc_signed.entry(uk).or_insert(0) += dir;
+        }
+        let mut arc_emitted: std::collections::HashSet<(CurveId, i64, i64)> =
+            std::collections::HashSet::new();
+        for a in &self.section_arcs {
+            let (qa, qb) = (quantize(a.ta), quantize(a.tb));
+            let uk = if (qa, qb) <= (qb, qa) {
+                (a.curve, qa, qb)
+            } else {
+                (a.curve, qb, qa)
+            };
+            if arc_signed.get(&uk).copied().unwrap_or(0) == 0 {
+                continue; // arc shared by two kept faces: cancels, not a boundary.
+            }
+            // One survivor per directed arc, preserving its wall-side direction.
+            if arc_emitted.insert((a.curve, qa, qb)) {
                 edges.push(CapEdge::Arc {
                     pa: a.pa,
                     pb: a.pb,
@@ -2759,8 +2851,12 @@ fn chain_cap_edges(edges: &[CapEdge]) -> Vec<Vec<CapEdge>> {
 #[derive(Debug, Clone)]
 struct CapCycle {
     edges: Vec<CapEdge>,
-    /// Projected 2-D chord ring (each edge's `pb`) for nesting / area.
-    proj: Vec<[f64; 2]>,
+    /// Arc-sampled 2-D polygon: the chord ring with every arc edge subdivided at
+    /// interior parameters so the boundary's *curved* shape is represented. Used
+    /// for containment nesting — a circular cap whose chord ring is only two points
+    /// (two semicircular arcs) becomes a real polygon here, so `point_in_polygon`
+    /// works and the inner hole nests inside the outer rim.
+    fill: Vec<[f64; 2]>,
     /// Per-arc `(radius, signed_sweep)` corrections in cap-loop direction, for the
     /// arc-corrected loop area; straight edges contribute nothing.
     arc_terms: Vec<(f64, f64)>,
@@ -2772,13 +2868,29 @@ impl CapCycle {
     /// The 2-D chord ring uses each edge's start point `pb` (the cap half-edge's
     /// start). `radius_of` resolves an arc curve's radius for the segment-area
     /// correction; `None` (e.g. an ellipse) drops the correction for that arc.
+    /// `point_on` evaluates a cap arc's 3-D point at a given parameter so the
+    /// `fill` polygon can sample the curved boundary.
     fn new(
         edges: Vec<CapEdge>,
         frame: &PlaneFrame,
         radius_of: impl Fn(CurveId) -> Option<f64>,
+        point_on: impl Fn(CurveId, f64) -> Option<Point3>,
     ) -> Self {
-        // In cap-loop order each cap half-edge runs pb → pa; its start point is pb.
-        let proj: Vec<[f64; 2]> = edges.iter().map(|e| frame.project(e.pb())).collect();
+        // Arc-sampled outline: emit each edge's start (`pb`) then, for an arc,
+        // interior samples along the cap arc (which sweeps tb → ta).
+        let mut fill: Vec<[f64; 2]> = Vec::with_capacity(edges.len());
+        for e in &edges {
+            fill.push(frame.project(e.pb()));
+            if let CapEdge::Arc { curve, ta, tb, .. } = *e {
+                let steps = 8;
+                for i in 1..steps {
+                    let t = tb + (ta - tb) * (i as f64) / (steps as f64);
+                    if let Some(p) = point_on(curve, t) {
+                        fill.push(frame.project(p));
+                    }
+                }
+            }
+        }
         let arc_terms: Vec<(f64, f64)> = edges
             .iter()
             .filter_map(|e| match *e {
@@ -2791,7 +2903,7 @@ impl CapCycle {
             .collect();
         Self {
             edges,
-            proj,
+            fill,
             arc_terms,
         }
     }
@@ -2813,21 +2925,25 @@ struct CapGroup {
 }
 
 /// Nest cap cycles into outer + holes by exact 2-D containment.
-fn nest_cap_cycles(cycles: &[CapCycle]) -> Vec<CapGroup> {
+///
+/// Areas and containment both account for arc edges: the area uses the
+/// arc-corrected loop area (so a circular cap, whose chord ring is only two
+/// points, has its true πr² and not the degenerate 0 of a 2-gon), and
+/// containment tests the arc-sampled `fill` polygon with an interior
+/// representative point taken from that polygon (so an inner hole circle nests
+/// inside an outer rim circle).
+fn nest_cap_cycles(cycles: &[CapCycle], frame: &PlaneFrame) -> Vec<CapGroup> {
     let n = cycles.len();
-    let areas: Vec<f64> = cycles
-        .iter()
-        .map(|c| signed_area_2d(&c.proj).abs())
-        .collect();
+    let areas: Vec<f64> = cycles.iter().map(|c| c.signed_area(frame).abs()).collect();
     let mut parent: Vec<Option<usize>> = vec![None; n];
     for i in 0..n {
-        let rep = representative_point(&cycles[i].proj);
+        let rep = representative_point(&cycles[i].fill);
         let mut best: Option<usize> = None;
         for j in 0..n {
             if i == j {
                 continue;
             }
-            if areas[j] > areas[i] && point_in_polygon(rep, &cycles[j].proj) {
+            if areas[j] > areas[i] && point_in_polygon(rep, &cycles[j].fill) {
                 match best {
                     Some(b) if areas[j] < areas[b] => best = Some(j),
                     None => best = Some(j),
