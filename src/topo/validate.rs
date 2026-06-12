@@ -113,6 +113,23 @@ pub enum Defect {
         /// The empty loop.
         loop_id: Id<Loop>,
     },
+    /// A shell has no faces.
+    ///
+    /// A face-less shell cannot enclose any volume and is always invalid
+    /// regardless of the Euler characteristic (which would pass because
+    /// `two_g = 2·S − 0 = 2` is non-negative and even).
+    EmptyShell {
+        /// The empty shell.
+        shell_id: Id<Shell>,
+    },
+    /// A solid has no shells.
+    ///
+    /// A shell-less solid is structurally degenerate; like `EmptyShell` it
+    /// bypasses the Euler check silently (`two_g = 0`).
+    EmptySolid {
+        /// The empty solid.
+        solid_id: Id<Solid>,
+    },
     /// A vertex lies off the surface of a face it bounds (geometric, Full only).
     VertexOffSurface {
         /// The point that is off-surface.
@@ -265,6 +282,11 @@ fn gather(store: &TopoStore, solids: &[Id<Solid>], defects: &mut Vec<Defect>) ->
             ok = false;
             continue;
         };
+        if solid.shells.is_empty() {
+            defects.push(Defect::EmptySolid { solid_id });
+            ok = false;
+            continue;
+        }
         for &shell_id in &solid.shells {
             if !shells.insert(shell_id) {
                 continue;
@@ -279,6 +301,11 @@ fn gather(store: &TopoStore, solids: &[Id<Solid>], defects: &mut Vec<Defect>) ->
                 ok = false;
                 continue;
             };
+            if shell.faces.is_empty() {
+                defects.push(Defect::EmptyShell { shell_id });
+                ok = false;
+                continue;
+            }
             for &face_id in &shell.faces {
                 if !faces.insert(face_id) {
                     continue;
@@ -428,6 +455,18 @@ fn pair_siblings(
                         candidates: n,
                     });
                     matched[i] = true;
+                    // Mark every ambiguous candidate as consumed so that later
+                    // iterations do not form a spurious unique-match pair from
+                    // the leftovers.  Without this, the first candidate for
+                    // `i` gets reported as MultipleSiblings and matched[i] is
+                    // set, but matched[candidates[j]] remains false.  The next
+                    // unmatched `i` then sees exactly one remaining candidate
+                    // and falsely pairs them, producing a wrong sibling_map
+                    // entry and inflating the edge count `E` in the Euler
+                    // characteristic.
+                    for &j in &candidates {
+                        matched[j] = true;
+                    }
                 }
             }
         }

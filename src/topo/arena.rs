@@ -181,13 +181,31 @@ impl<T> Arena<T> {
     ///
     /// The slot's generation is bumped so that the freed handle (and any copy
     /// of it) no longer resolves.
+    ///
+    /// If the generation counter would overflow `u32::MAX` (after ~4 billion
+    /// remove+insert cycles on the same slot), the slot is **retired** rather
+    /// than wrapped back to zero.  A retired slot stays `Dead` forever and is
+    /// never returned to the free list, which ensures that the original gen-0
+    /// handle cannot silently alias a future occupant.  In practice the
+    /// retirement threshold is unreachable in any B-rep workload; the guard is
+    /// present for correctness, not performance.
     pub fn remove(&mut self, id: Id<T>) -> Option<T> {
         let slot = self.slots.get_mut(id.idx as usize)?;
         match slot {
             Slot::Live { gen, .. } if *gen == id.gen => {
-                let next_gen = gen.wrapping_add(1);
-                let old = std::mem::replace(slot, Slot::Dead { gen: next_gen });
-                self.free.push(id.idx);
+                // Use checked_add: if the generation would overflow u32::MAX we
+                // retire the slot permanently (do not push back to `free`).
+                // This prevents the gen-0 aliasing hazard while keeping the
+                // public API panic-free.
+                let next_gen = gen.checked_add(1);
+                let dead_gen = next_gen.unwrap_or(*gen); // stay at MAX when retiring
+                let old = std::mem::replace(slot, Slot::Dead { gen: dead_gen });
+                if next_gen.is_some() {
+                    // Normal case: slot can be recycled.
+                    self.free.push(id.idx);
+                }
+                // If next_gen is None the slot is silently retired; it will
+                // never be handed out again, preventing generation wraparound.
                 match old {
                     Slot::Live { value, .. } => Some(value),
                     Slot::Dead { .. } => unreachable!(),
@@ -299,5 +317,96 @@ mod tests {
         vals.sort_unstable();
         assert_eq!(vals, vec![2_i32, 3_i32]);
         assert!(arena.contains(c));
+    }
+
+    /// After ~2^32 remove+insert cycles on the same slot the generation counter
+    /// would have wrapped back to 0, making the original gen-0 handle silently
+    /// alias the new occupant.  The fix retires the slot when `checked_add`
+    /// overflows (i.e. gen == u32::MAX): `remove()` does not push the slot back
+    /// onto `free`, so it can never be reused again.
+    ///
+    /// We fast-forward the slot to `Live { gen: u32::MAX }` to avoid running
+    /// ~4 billion real cycles; everything after that uses only the public API.
+    #[test]
+    fn slot_is_retired_at_generation_max_not_wrapped() {
+        let mut arena: Arena<i32> = Arena::new();
+
+        // Obtain the first handle (gen == 0, slot 0).
+        let id0 = arena.insert(10_i32);
+        assert_eq!(id0.index(), 0u32);
+        assert_eq!(id0.generation(), 0u32);
+
+        // Fast-forward: put slot 0 into the state it would have after
+        // u32::MAX - 1 remove+insert cycles, i.e. Live { gen: u32::MAX }.
+        arena.slots[0] = Slot::Live {
+            gen: u32::MAX,
+            value: 10_i32,
+        };
+        // Clear the free list so slot 0 is treated as currently live.
+        arena.free.clear();
+        let id_max = Id::<i32> {
+            idx: 0u32,
+            gen: u32::MAX,
+            _marker: PhantomData,
+        };
+
+        // The 2^32-th remove: without the fix, wrapping_add(1) would produce
+        // Dead { gen: 0 } and the slot would go back onto `free`.  With the
+        // fix, checked_add overflows → slot is retired (stays Dead { gen:
+        // u32::MAX }) and is NOT added to `free`.
+        assert_eq!(arena.remove(id_max), Some(10_i32));
+
+        // Slot must be Dead with gen == u32::MAX (retired, not wrapped to 0).
+        assert!(
+            matches!(arena.slots[0], Slot::Dead { gen: u32::MAX }),
+            "retired slot must keep gen == u32::MAX, not wrap to 0: {:?}",
+            arena.slots[0]
+        );
+
+        // The free list must NOT contain slot 0 — it has been permanently
+        // retired and must never be handed out again.
+        assert!(
+            !arena.free.contains(&0u32),
+            "retired slot must not be on the free list"
+        );
+
+        // insert() must allocate a fresh slot (index 1) rather than reusing
+        // the retired slot 0.
+        let id_new = arena.insert(777_i32);
+        assert_eq!(
+            id_new.index(),
+            1u32,
+            "insert after retirement must use a new slot, not the retired one"
+        );
+        assert_eq!(id_new.generation(), 0u32);
+
+        // The original gen-0 handle must still be stale (returns None).
+        assert_eq!(
+            arena.get(id0),
+            None,
+            "stale gen-0 handle must not resolve after slot retirement"
+        );
+    }
+
+    /// Verify the cycle-counting premise independently: each remove+insert on
+    /// the same slot bumps the generation by exactly 1, confirming that 2^32
+    /// cycles would be needed to cause a wraparound (which is now prevented).
+    #[test]
+    fn generation_increments_by_one_per_remove_insert_cycle() {
+        let mut arena: Arena<i32> = Arena::new();
+        let mut id = arena.insert(0_i32);
+        assert_eq!(id.index(), 0u32);
+        assert_eq!(id.generation(), 0u32);
+
+        for expected_gen in 1u32..=1000u32 {
+            arena.remove(id);
+            id = arena.insert(0_i32);
+            assert_eq!(id.index(), 0u32, "slot is reused every cycle");
+            assert_eq!(
+                id.generation(),
+                expected_gen,
+                "generation must increment by exactly 1 per cycle"
+            );
+        }
     }
 }
