@@ -1,9 +1,12 @@
 //! The per-member cache and lazy-evaluation machinery.
 
 use crate::brep::Brep;
+use crate::build::extrude;
 use crate::csg::node::CsgNode;
+use crate::error::KernelError;
+use crate::primitives::Line3;
 use crate::tolerance::Tol;
-use crate::topo::validate::Defect;
+use crate::topo::validate::{Defect, ValidateLevel};
 
 /// A machine-readable evaluation failure.
 ///
@@ -23,8 +26,19 @@ pub enum EvalError {
     /// Evaluation produced a structurally invalid B-rep; the defects are
     /// carried for diagnosis.
     InvalidResult(Vec<Defect>),
+    /// A constructor rejected the inputs (e.g. a non-positive extrusion length
+    /// or a degenerate profile). The error's diagnostic message is carried as a
+    /// string; the structured [`KernelError`] is not stored because it holds a
+    /// `&'static str` field that cannot round-trip through `serde`.
+    Construction(String),
     /// This operation is not implemented in the current phase.
     NotYetImplemented,
+}
+
+impl From<KernelError> for EvalError {
+    fn from(e: KernelError) -> Self {
+        EvalError::Construction(e.to_string())
+    }
 }
 
 /// A building member: its CSG tree plus the cached lazily-evaluated B-rep.
@@ -108,8 +122,28 @@ impl Member {
         }
     }
 
-    /// The actual evaluation. A stub until the build/boolean phases land.
-    fn evaluate(&self, _tol: &Tol) -> Result<Brep, EvalError> {
-        Err(EvalError::NotYetImplemented)
+    /// Evaluate the CSG tree into a B-rep.
+    ///
+    /// Only the [`CsgNode::Extrude`] leaf is evaluated for real in this phase:
+    /// it builds the extruded solid, validates it at
+    /// [`ValidateLevel::Full`](crate::topo::ValidateLevel::Full), and yields the
+    /// validated B-rep (or the defects, as [`EvalError::InvalidResult`]). Every
+    /// other node returns [`EvalError::NotYetImplemented`].
+    fn evaluate(&self, tol: &Tol) -> Result<Brep, EvalError> {
+        match &self.csg {
+            CsgNode::Extrude {
+                profile,
+                origin,
+                axis,
+                length,
+            } => {
+                let line = Line3::new(*origin, *axis)?;
+                let brep = extrude(profile, &line, *length, tol)?;
+                brep.validate(tol, ValidateLevel::Full)
+                    .map_err(EvalError::InvalidResult)?;
+                Ok(brep)
+            }
+            _ => Err(EvalError::NotYetImplemented),
+        }
     }
 }

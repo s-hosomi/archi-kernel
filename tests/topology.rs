@@ -511,20 +511,27 @@ fn distinct_planes_get_distinct_ids() {
 // ── CSG container smoke test ─────────────────────────────────────────────────
 
 #[test]
-fn member_brep_is_not_yet_implemented() {
+fn member_extrude_evaluates_and_non_extrude_is_not_yet_implemented() {
     let tol = Tol::default();
+    // An Extrude leaf now evaluates for real (Phase 2).
     let profile = Profile2d::rect(0.15_f64, 0.3_f64).expect("valid rect");
     let node = CsgNode::Extrude {
+        origin: Point3::origin(),
         profile,
         axis: Vec3::Z,
         length: 3.0_f64,
     };
     let mut member = Member::new(node);
+    member.brep(&tol).expect("extrude member must evaluate");
+    assert!(member.last_valid().is_some());
+
+    // A non-Extrude node is still unimplemented.
+    let mut other = Member::new(CsgNode::Union(Vec::new()));
     assert!(matches!(
-        member.brep(&tol),
+        other.brep(&tol),
         Err(EvalError::NotYetImplemented)
     ));
-    assert!(member.last_valid().is_none());
+    assert!(other.last_valid().is_none());
 }
 
 // Keep the surface module reachable from tests without an unused import warning.

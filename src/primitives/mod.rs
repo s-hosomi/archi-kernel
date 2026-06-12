@@ -10,6 +10,7 @@ mod cylinder;
 mod line;
 mod plane;
 
+pub(crate) use curve::plane_basis;
 pub use curve::{Circle3, Ellipse3};
 pub use cylinder::Cylinder;
 pub use line::Line3;

@@ -60,6 +60,16 @@ impl Brep {
         }
     }
 
+    /// Signed volume of this B-rep, in cubic metres (`DESIGN.md` §6-4).
+    ///
+    /// Computed by the divergence theorem in closed form per surface kind (see
+    /// [`crate::mass::signed_volume`]). The surface is assumed closed and
+    /// outward-oriented; a positive result confirms that orientation, which is
+    /// the orientation check used by the Phase 2 extrusion tests.
+    pub fn signed_volume(&self) -> f64 {
+        crate::mass::signed_volume(self)
+    }
+
     /// Run the geometric consistency checks (Full only).
     fn check_geometry(&self, tol: &Tol, defects: &mut Vec<Defect>) {
         for solid_id in &self.solids {

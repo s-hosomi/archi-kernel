@@ -69,7 +69,13 @@ impl Circle3 {
 
 /// Build a deterministic orthonormal basis `(u, v)` of the plane with the given
 /// unit `normal`, such that `u × v = normal`.
-fn plane_basis(normal: Unit3) -> (Vec3, Vec3) {
+///
+/// This is the single source of truth for the "seed" rule that maps a planar
+/// angle parameter to a 3-D direction. [`Circle3::point_at`] uses it, and the
+/// extrusion builder reuses it (via this `pub(crate)` re-export) so that the
+/// angle parameters it writes onto circular-edge boundaries are consistent with
+/// the circle's own parameterisation (`DESIGN.md` §6-1).
+pub(crate) fn plane_basis(normal: Unit3) -> (Vec3, Vec3) {
     let n = normal.as_vec();
     // Pick the axis least aligned with `n` to avoid a near-zero cross product.
     let seed = if n.x.abs() <= n.y.abs() && n.x.abs() <= n.z.abs() {

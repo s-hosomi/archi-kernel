@@ -2,7 +2,7 @@
 
 use crate::csg::ids::{OpeningId, StableId};
 use crate::csg::profile::Profile2d;
-use crate::math::Vec3;
+use crate::math::{Point3, Vec3};
 
 /// A node in a member's CSG tree.
 ///
@@ -17,6 +17,10 @@ pub enum CsgNode {
     Extrude {
         /// The cross-section.
         profile: Profile2d,
+        /// Where the extrusion starts (the bottom-cap centre). Members are
+        /// placed in world coordinates so that inter-member booleans
+        /// (priority clips, clash checks) see real positions.
+        origin: Point3,
         /// The extrusion direction (need not be unit; length is separate).
         axis: Vec3,
         /// The extrusion length in metres.
