@@ -235,7 +235,7 @@ impl Arrangement {
             .filter(|e| e.wind_a != 0 || e.wind_b != 0)
             .collect();
 
-        let halfs = build_dcel(&store, &arr_edges)?;
+        let halfs = build_dcel(&store, &arr_edges, tol)?;
         let faces = trace_faces(&store, halfs);
 
         Ok(Self {
@@ -826,7 +826,11 @@ fn accumulate_edge(
 }
 
 /// Build the DCEL half-edge graph from undirected arrangement edges.
-fn build_dcel(store: &VertexStore, edges: &[ArrEdge]) -> Result<Vec<HalfEdge>, Poly2Error> {
+fn build_dcel(
+    store: &VertexStore,
+    edges: &[ArrEdge],
+    tol: &Tol,
+) -> Result<Vec<HalfEdge>, Poly2Error> {
     let mut halfs: Vec<HalfEdge> = Vec::with_capacity(edges.len() * 2);
     let mut outgoing: HashMap<VertexId, Vec<usize>> = HashMap::new();
 
@@ -867,13 +871,16 @@ fn build_dcel(store: &VertexStore, edges: &[ArrEdge]) -> Result<Vec<HalfEdge>, P
     }
 
     // Sort outgoing half-edges by *tangent* angle at the vertex (so an arc orders
-    // by the direction it leaves the vertex, not by its far endpoint).
+    // by the direction it leaves the vertex, not by its far endpoint), breaking
+    // ties between collinear-tangent edges by signed curvature so a tangent pinch
+    // (an arc that leaves a shared vertex collinear with a segment or another arc)
+    // gets a well-defined ring order instead of an arbitrary one.
     for (&v, outs) in &mut outgoing {
         let vp = store.point(v);
         outs.sort_by(|&x, &y| {
-            let ax = leave_angle(store, &halfs[x], vp);
-            let ay = leave_angle(store, &halfs[y], vp);
-            ax.partial_cmp(&ay).unwrap_or(std::cmp::Ordering::Equal)
+            let kx = leave_key(store, &halfs[x], vp);
+            let ky = leave_key(store, &halfs[y], vp);
+            kx.cmp_ring(&ky, tol)
         });
     }
 
@@ -899,23 +906,93 @@ fn build_dcel(store: &VertexStore, edges: &[ArrEdge]) -> Result<Vec<HalfEdge>, P
     Ok(halfs)
 }
 
-/// Angle at which a half-edge **leaves** its origin vertex (tangent direction),
-/// so arcs and straight edges order consistently in the DCEL ring.
-fn leave_angle(store: &VertexStore, h: &HalfEdge, vp: Point2) -> f64 {
-    let dir = match h.geom {
-        EdgeGeom::Seg => vp.to(store.point(h.dest)),
-        EdgeGeom::Arc { center, ccw, .. } => {
-            // Tangent of the circle at vp, in the traversal direction.
-            let rad = center.to(vp); // outward radial
+/// Ring-ordering key for a half-edge leaving its origin vertex: the **tangent
+/// angle** (the direction it departs) plus a **signed curvature** tie-break.
+///
+/// Two half-edges that depart a shared vertex with the *same* tangent direction
+/// (a tangent pinch — e.g. an arc tangent to a segment, or two circles tangent at
+/// a vertex) are indistinguishable by tangent angle alone, which leaves the DCEL
+/// ring order undefined and makes face tracing drop a bounded face. The signed
+/// curvature `kappa` resolves the tie: an arc bends toward its centre, so just
+/// past the vertex it deviates from the common tangent line to the side the
+/// centre lies on. `kappa > 0` means it veers to the **left** of the tangent
+/// (toward higher angle), `kappa < 0` to the right; a segment has `kappa = 0`.
+/// Ordering ties by ascending `kappa` therefore matches the ascending-angle
+/// (CCW) order of the actual departing curves, and larger `|kappa|` (sharper
+/// curve) orders further from the straight edge when several curves share both
+/// tangent and bend side.
+#[derive(Debug, Clone, Copy)]
+struct LeaveKey {
+    angle: f64,
+    kappa: f64,
+}
+
+impl LeaveKey {
+    /// Compare two leave keys for the outgoing ring ordering. Primary key is the
+    /// tangent angle; when the two tangents are parallel and same-sense (within
+    /// the angular tolerance) the signed curvature breaks the tie.
+    fn cmp_ring(&self, other: &Self, tol: &Tol) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        // Tangent directions that differ by more than the angular tolerance are
+        // ordered by angle alone. Genuine distinct directions in this (building-
+        // scale, mostly axis-aligned) domain are O(1) radians apart, far above
+        // `tol.angular`; only a true tangent pinch falls into the curvature branch.
+        let da = self.angle - other.angle;
+        if da.abs() > tol.angular {
+            return self
+                .angle
+                .partial_cmp(&other.angle)
+                .unwrap_or(Ordering::Equal);
+        }
+        self.kappa
+            .partial_cmp(&other.kappa)
+            .unwrap_or(Ordering::Equal)
+    }
+}
+
+/// The [`LeaveKey`] (tangent angle + signed curvature) of a half-edge departing
+/// `vp`, so arcs and straight edges order consistently in the DCEL ring even at a
+/// tangent pinch.
+fn leave_key(store: &VertexStore, h: &HalfEdge, vp: Point2) -> LeaveKey {
+    match h.geom {
+        EdgeGeom::Seg => {
+            let dir = vp.to(store.point(h.dest));
+            LeaveKey {
+                angle: dir.y.atan2(dir.x),
+                kappa: 0.0,
+            }
+        }
+        EdgeGeom::Arc {
+            center,
+            radius,
+            ccw,
+        } => {
+            let rad = center.to(vp); // outward radial (centre → vp)
                                      // CCW tangent is the radial rotated +90°; CW is −90°.
-            if ccw {
+            let dir = if ccw {
                 Vec2::new(-rad.y, rad.x)
             } else {
                 Vec2::new(rad.y, -rad.x)
+            };
+            // Unit inward normal (vp → centre). The arc curves toward the centre,
+            // so the sign of cross(tangent, inward_normal) gives the bend side:
+            // `+1` when the centre lies to the left of the tangent. Scaling by the
+            // curvature `1/radius` lets sharper curves order further from straight.
+            let inward = vp.to(center);
+            let inward_len = inward.len();
+            let kappa = if radius > 0.0 && inward_len > 0.0 {
+                let dir_len = dir.len().max(f64::MIN_POSITIVE);
+                let side = (dir.x * inward.y - dir.y * inward.x) / (dir_len * inward_len);
+                side / radius
+            } else {
+                0.0
+            };
+            LeaveKey {
+                angle: dir.y.atan2(dir.x),
+                kappa,
             }
         }
-    };
-    dir.y.atan2(dir.x)
+    }
 }
 
 /// Trace all face loops by following `next` pointers.
