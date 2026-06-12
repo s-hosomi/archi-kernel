@@ -9,15 +9,25 @@
 //!    plane, as a matter of design intent?" The `On` band is a first-class
 //!    answer, because coincident geometry (a slab face on a wall face) is the
 //!    common case in buildings. This is the layer implemented now.
-//! 2. **Exact sign** (Phase 3a). Guards against true round-off mistakes
-//!    *outside* the `On` band, by introducing Shewchuk's `orient3d` via the
-//!    `robust` crate. The non-transitivity of `ε` comparison is inherent to the
-//!    tolerant layer and does not disappear, but the exact layer keeps the
-//!    ground under the classification from shifting. Not yet implemented.
+//! 2. **Exact sign** (Phase 3a, [`orient2d_exact`]). Guards against true
+//!    round-off mistakes *outside* the `On` band, by routing through Shewchuk's
+//!    adaptive predicates (the `robust` crate). The non-transitivity of `ε`
+//!    comparison is inherent to the tolerant layer and does not disappear, but
+//!    the exact layer keeps the ground under the classification from shifting.
+//!    It is used by the half-space cut to orient cap loops and to decide 2-D
+//!    containment of one loop in another.
+//!
+//! The `robust` dependency is **confined to this module** (`synthesis.md` §1):
+//! no other part of the kernel imports it. Inputs and outputs at the module
+//! boundary are plain `f64` and the kernel's own [`Sign3`].
 //!
 //! The argument type is [`VertexGeom`] (not a bare `[f64; 3]`) so that the
 //! signature is already compatible with the future symbolic / implicit-point
 //! representations; only `Explicit` is handled today (`synthesis.md` §2-5).
+
+mod exact;
+
+pub use exact::orient2d_exact;
 
 use crate::geom::{GeomStore, VertexGeom};
 use crate::primitives::Plane;

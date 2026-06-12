@@ -8,6 +8,7 @@
 //! All lengths are in metres (SI), all angles in radians. See `DESIGN.md`
 //! for the architecture roadmap and verification strategy.
 
+pub mod boolean;
 pub mod brep;
 pub mod build;
 pub mod csg;
@@ -19,6 +20,7 @@ pub mod math;
 pub mod predicate;
 pub mod primitives;
 pub mod profile;
+pub mod section;
 pub mod tolerance;
 pub mod topo;
 

@@ -8,6 +8,7 @@ repository = "https://github.com/s-hosomi/archi-kernel"
 description = "Domain-specific B-rep geometry kernel for building simulation: analytic surfaces (planes + cylinders) with closed-form intersections"
 
 [dependencies]
+robust = "1"
 serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
