@@ -9,11 +9,11 @@
 A domain-specific B-rep geometry kernel for building simulation, written in Rust with zero runtime dependencies (one exception: Shewchuk's exact predicates via the `robust` crate, isolated behind a single predicate facade). Runs natively and in the browser via WebAssembly.
 
 <p align="center">
-  <img src="assets/hero.png" alt="A three-storey RC office block — set-back roof terrace with a steel pergola, round-column colonnade, window-grid facades, core walls — modelled as kernel CSG and rendered in the Three.js viewer" width="850">
+  <img src="assets/hero.png?v=2" alt="A three-storey RC office block — set-back roof terrace with a steel pergola, round-column colonnade, window-grid facades, core walls — modelled as kernel CSG and rendered in the Three.js viewer" width="850">
 </p>
 
 <p align="center">
-  <img src="assets/section-sweep.gif" alt="The section plane sweeping down through the model: every frame's vermilion caps and outlines are recomputed by the kernel's closed-form section() — wall windows, the round column and slab voids appear and vanish as the plane passes them" width="850">
+  <img src="assets/section-sweep.gif?v=2" alt="The section plane sweeping down through the model: every frame's vermilion caps and outlines are recomputed by the kernel's closed-form section() — wall windows, the round column and slab voids appear and vanish as the plane passes them" width="850">
 </p>
 
 *Both images are the bundled Three.js viewer rendering the kernel's own output: watertight tessellation for the solids, and closed-form `section()` profiles (vermilion caps and outlines) recomputed live as the plane moves — every opening, notch and round face you see was produced by the kernel's booleans.*
