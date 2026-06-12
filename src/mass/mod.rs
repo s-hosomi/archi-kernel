@@ -9,4 +9,4 @@
 
 mod volume;
 
-pub use volume::signed_volume;
+pub use volume::{signed_volume, signed_volume_checked, VolumeError};

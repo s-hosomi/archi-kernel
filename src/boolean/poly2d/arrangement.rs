@@ -26,12 +26,12 @@
 //! snap (coincidence collapse). Float coordinates are used only for *where*,
 //! never for *whether*.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::boolean::poly2d::error::Poly2Error;
-use crate::boolean::poly2d::geom::{orient2d, Edge2, Orient, Point2};
+use crate::boolean::poly2d::geom::{eps_sq, orient2d, Edge2, Orient, Point2};
 use crate::boolean::poly2d::intersect::intersect;
-use crate::boolean::poly2d::region::Region;
+use crate::boolean::poly2d::region::{Contour, Region};
 use crate::boolean::poly2d::snap::{VertexId, VertexStore};
 use crate::tolerance::Tol;
 
@@ -136,9 +136,23 @@ impl Arrangement {
         let mut store = VertexStore::new(*tol);
         let mut inputs: Vec<InputSeg> = Vec::new();
 
+        // ── 0. vertex-on-edge pre-snap ─────────────────────────────────────
+        // Vertex-to-vertex snapping (the store's merge) never pulls a vertex
+        // that grazes the *interior of the other operand's edge* onto that edge.
+        // Left as-is, a sub-tolerance gap between a corner and an edge survives
+        // as a thin wedge that splits a face across the other operand's boundary
+        // (the face ends up partly inside, partly outside that operand — an
+        // ill-defined classification, and the source of a lost overlap/hole that
+        // also flipped run-to-run). We therefore *project* every vertex within
+        // `tol` of the other operand's edge onto that edge before ingesting, so
+        // the two become exactly collinear/coincident and the arrangement splits
+        // cleanly. The shift is at most `tol`, within the tolerance contract.
+        let a = project_grazing_vertices(a, b, tol);
+        let b = project_grazing_vertices(b, &a, tol);
+
         // ── 1. snap endpoints, collect input segments ──────────────────────
-        ingest(a, Operand::A, &mut store, &mut inputs, tol)?;
-        ingest(b, Operand::B, &mut store, &mut inputs, tol)?;
+        ingest(&a, Operand::A, &mut store, &mut inputs, tol)?;
+        ingest(&b, Operand::B, &mut store, &mut inputs, tol)?;
 
         // ── 2. intersect every pair, snap crossings, collect split points ──
         // split_points[i] holds the parameter-ordered vertex ids that split
@@ -158,9 +172,42 @@ impl Arrangement {
             }
         }
 
+        // ── 2b. vertex-on-edge snapping ────────────────────────────────────
+        // Snapping in step 1 is vertex-to-vertex only: a vertex lying within
+        // `tol` of the *interior of an edge* (but not near either endpoint) is
+        // never registered on that edge, so a contained operand whose corner
+        // grazes the other operand's edge sub-tolerance leaves a gap that the
+        // classifier's sample point can slip through (the hole is lost, and the
+        // failure is order-dependent). Here we split every edge at any existing
+        // vertex within `tol` of its interior, so the edge passes exactly
+        // through that shared vertex and the topology closes.
+        let vcount = store.len();
+        for i in 0..inputs.len() {
+            let (sa, sb) = (inputs[i].a, inputs[i].b);
+            let a = store.point(sa);
+            let b = store.point(sb);
+            for vid in 0..vcount {
+                let v = VertexId(vid);
+                if v == sa || v == sb {
+                    continue;
+                }
+                let p = store.point(v);
+                if point_on_segment_interior(a, b, p, tol) {
+                    push_split(&mut split_points[i], v, &inputs[i]);
+                }
+            }
+        }
+
         // ── 3. split each input into unit segments between consecutive verts ─
         // ── 4. dedup into arrangement edges keyed by unordered vertex pair ──
-        let mut arr_map: HashMap<(VertexId, VertexId), ArrEdge> = HashMap::new();
+        // A `BTreeMap` keyed on the canonical (min,max) vertex-id pair makes the
+        // arrangement-edge order **deterministic** (sorted by vertex id), not
+        // dependent on `HashMap`'s RandomState seed. That order flows into the
+        // half-edge indices, the DCEL trace order, and ultimately the longest-
+        // edge tie-break in `face_sample_point`, so a `HashMap` here made the
+        // result nondeterministic for identical input (observed area flipping
+        // run-to-run on sub-tol configurations).
+        let mut arr_map: BTreeMap<(VertexId, VertexId), ArrEdge> = BTreeMap::new();
         for (i, seg) in inputs.iter().enumerate() {
             let chain = ordered_chain(&store, seg, &split_points[i], tol);
             for w in chain.windows(2) {
@@ -209,6 +256,79 @@ impl Arrangement {
     #[inline]
     pub fn store(&self) -> &VertexStore {
         &self.store
+    }
+
+    /// The `(in_a, in_b)` winding classification of the **face to the left** of
+    /// a directed loop, robust against thin neighbouring features.
+    ///
+    /// [`FaceLoop::face_sample_point`] offsets the longest edge's midpoint by a
+    /// fixed fraction of that edge. That fixed step overshoots a thin
+    /// neighbouring face — a sub-tolerance gap between a contained hole and the
+    /// outer boundary, or a legitimate sliver — so the sample lands in the wrong
+    /// face and the loop misclassifies (the hole is lost; the result was also
+    /// order-dependent). Here the **winding signature** is the arbiter: start
+    /// from the standard (large) offset and halve it only while the operand
+    /// windings keep *changing* between consecutive steps. Once two successive
+    /// halvings agree, the sample has settled inside the minimal face adjacent to
+    /// the chosen edge and the signature is its limit value as the step → 0⁺.
+    ///
+    /// Seeding from the large step preserves the "the all-enclosing outer wrap
+    /// classifies as outside both and is dropped" invariant: the wrap's windings
+    /// are already stable far outside, so it is never shrunk inward into a
+    /// bounded face it does not actually bound.
+    pub fn loop_sample_point(&self, face: &FaceLoop) -> (i32, i32) {
+        let classify = |p: Point2| (self.winding(p, Operand::A), self.winding(p, Operand::B));
+        let n = face.vertices.len();
+        if n < 2 {
+            return classify(face.face_sample_point());
+        }
+        // Longest edge for a numerically stable normal.
+        let mut best_i = 0usize;
+        let mut best_len = -1.0_f64;
+        for i in 0..n {
+            let l = face.vertices[i].dist(face.vertices[(i + 1) % n]);
+            if l > best_len {
+                best_len = l;
+                best_i = i;
+            }
+        }
+        let a = face.vertices[best_i];
+        let b = face.vertices[(best_i + 1) % n];
+        let d = a.to(b);
+        let len = d.len();
+        if len <= 0.0 {
+            return classify(face.centroid());
+        }
+        let mid = Point2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+        // Left normal of a→b is (-dy, dx)/len.
+        let nx = -d.y / len;
+        let ny = d.x / len;
+        let sample = |s: f64| Point2::new(mid.x + nx * s, mid.y + ny * s);
+
+        // Offset the midpoint along the left normal by a tiny step and classify.
+        // The step must land in the face immediately to the left of the chosen
+        // edge for any face thicker than the step, so it is taken **absolute and
+        // sub-tolerance** (a small multiple of `f64` noise at building
+        // coordinates, far below `eps = 1e-6` m). A fraction of the longest edge
+        // (the old rule) is the wrong scale: it is huge compared to a thin face's
+        // perpendicular thickness, so it overshoots into a neighbour. The
+        // winding is read with the exact `orient2d`, so a sample 1e-9 m off the
+        // edge classifies on the correct side without a round-off flip.
+        //
+        // We confirm the classification is stable: shrink the step while two
+        // successive samples disagree (the larger one still straddled an edge of
+        // a sub-`eps` sliver), and accept once they settle.
+        let mut step = 1.0e-9_f64;
+        let mut cur = classify(sample(step));
+        for _ in 0..30 {
+            step *= 0.25;
+            let next = classify(sample(step));
+            if next == cur {
+                return next;
+            }
+            cur = next;
+        }
+        cur
     }
 }
 
@@ -267,6 +387,93 @@ fn ingest(
     Ok(())
 }
 
+/// Return a copy of `region` with every vertex that lies within `tol` of the
+/// interior of one of `other`'s edges moved onto that edge (orthogonal
+/// projection). This collapses a sub-tolerance vertex-on-edge gap to an exact
+/// incidence so the arrangement splits cleanly, instead of leaving a thin wedge
+/// that straddles `other`'s boundary. Arc edges are left untouched (unsupported
+/// elsewhere already).
+fn project_grazing_vertices(region: &Region, other: &Region, tol: &Tol) -> Region {
+    let edges: Vec<(Point2, Point2)> = other
+        .contours
+        .iter()
+        .flat_map(|c| c.edges.iter())
+        .filter_map(|e| match e {
+            Edge2::Seg { start, end } => Some((*start, *end)),
+            Edge2::Arc(_) => None,
+        })
+        .collect();
+
+    let project = |p: Point2| -> Point2 {
+        for &(a, b) in &edges {
+            if let Some(proj) = project_if_on_segment_interior(a, b, p, tol) {
+                return proj;
+            }
+        }
+        p
+    };
+
+    let contours = region
+        .contours
+        .iter()
+        .map(|c| {
+            let pts: Vec<Point2> = c.vertices().into_iter().map(project).collect();
+            Contour::from_points(&pts)
+        })
+        .collect();
+    Region::new(contours)
+}
+
+/// If `p` lies within `tol` of segment `(a, b)`, return the point on the segment
+/// it should snap to: its orthogonal projection when that falls in the interior,
+/// or the **nearer endpoint** when the projection lands at (or just past) an end.
+/// Returns `None` if `p` is farther than `tol` from the whole segment.
+///
+/// Snapping a near-*corner* vertex to the endpoint (rather than refusing to move
+/// it) is essential: a vertex in the "dead zone" — beyond the vertex-merge
+/// radius of the corner, yet within `tol` of *two* edges meeting there — would
+/// otherwise be projected by one edge and left by the other, slanting a shared
+/// edge and inventing area. Clamping the projection to the segment makes such a
+/// vertex land exactly on the corner, consistently.
+fn project_if_on_segment_interior(a: Point2, b: Point2, p: Point2, tol: &Tol) -> Option<Point2> {
+    let d = a.to(b);
+    let len_sq = d.len_sq();
+    if len_sq <= eps_sq(tol) {
+        return None;
+    }
+    let t_raw = a.to(p).dot(d) / len_sq;
+    let t = t_raw.clamp(0.0, 1.0);
+    let foot = Point2::new(a.x + d.x * t, a.y + d.y * t);
+    // Distance from `p` to the (clamped) closest point on the segment.
+    if foot.dist_sq(p) > eps_sq(tol) {
+        return None;
+    }
+    Some(foot)
+}
+
+/// `true` if `p` lies within `tol` of the *interior* of segment `(a, b)`: the
+/// perpendicular distance is at most `tol.length` and the foot of the
+/// perpendicular falls strictly between the endpoints (endpoint coincidences are
+/// already handled by vertex-to-vertex snapping). Used to split an edge at a
+/// vertex that grazes it sub-tolerance.
+fn point_on_segment_interior(a: Point2, b: Point2, p: Point2, tol: &Tol) -> bool {
+    let d = a.to(b);
+    let len_sq = d.len_sq();
+    if len_sq <= eps_sq(tol) {
+        return false; // degenerate base segment
+    }
+    let t = a.to(p).dot(d) / len_sq;
+    // Keep the foot strictly interior, with a margin so a near-endpoint vertex
+    // is left to vertex snapping rather than producing a near-zero fragment.
+    let margin = tol.length / len_sq.sqrt();
+    if t <= margin || t >= 1.0 - margin {
+        return false;
+    }
+    // Perpendicular distance: |(p − a) × d| / |d|.
+    let cross = a.to(p).cross(d);
+    (cross * cross) <= eps_sq(tol) * len_sq
+}
+
 /// Reconstruct the [`Edge2`] of an input segment from snapped coordinates.
 #[inline]
 fn seg_edge(store: &VertexStore, s: &InputSeg) -> Edge2 {
@@ -311,7 +518,7 @@ fn ordered_chain(
 /// Add a directed unit segment `u → v` to the arrangement-edge map, folding the
 /// winding into the canonical (min,max) key.
 fn accumulate_edge(
-    map: &mut HashMap<(VertexId, VertexId), ArrEdge>,
+    map: &mut BTreeMap<(VertexId, VertexId), ArrEdge>,
     u: VertexId,
     v: VertexId,
     operand: Operand,
@@ -495,12 +702,30 @@ impl FaceLoop {
         // Left normal of edge a→b is (-dy, dx)/len. Step a tiny fraction inward.
         let nx = -d.y / len;
         let ny = d.x / len;
-        // 1e-4 of the edge length keeps us inside any face thicker than that,
-        // which covers all non-degenerate building faces (eps = 1e-6).
-        let step = 1e-4 * len;
         let mx = (a.x + b.x) * 0.5;
         let my = (a.y + b.y) * 0.5;
-        Point2::new(mx + nx * step, my + ny * step)
+        // A fixed `1e-4 · edge` step overshoots a face thinner than that — e.g. a
+        // legitimate 0.5 mm residual strip over a 10 m wall, where the step is
+        // 1 mm and lands in the neighbouring face — and the face is then
+        // misclassified. For a CCW loop (a face boundary, its own interior on the
+        // left) we verify the candidate is *inside the loop polygon* with the
+        // exact predicate and shrink the step geometrically until it is, so a
+        // sliver of any thickness above `eps` still classifies in its own face.
+        // A CW loop (a hole boundary) has the surrounding face on its left, not
+        // its own polygon, so the tiny-step heuristic is kept for it.
+        let mut step = 1e-4 * len;
+        let candidate = |s: f64| Point2::new(mx + nx * s, my + ny * s);
+        if signed_area_of(&self.vertices) > 0.0 {
+            for _ in 0..60 {
+                let p = candidate(step);
+                if point_in_polygon_exact(&self.vertices, p) {
+                    return p;
+                }
+                step *= 0.5;
+            }
+            return self.centroid();
+        }
+        candidate(step)
     }
 
     fn centroid(&self) -> Point2 {
@@ -513,6 +738,49 @@ impl FaceLoop {
         let k = self.vertices.len().max(1) as f64;
         Point2::new(cx / k, cy / k)
     }
+}
+
+/// Signed area of a polygon ring (positive = CCW). Used only to pick the
+/// sample-point strategy (own-interior vs surrounding face); the float sign is
+/// adequate here because a CCW face traced by the DCEL has strictly positive
+/// area well above round-off.
+fn signed_area_of(pts: &[Point2]) -> f64 {
+    let n = pts.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut acc = 0.0_f64;
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        acc += a.x * b.y - b.x * a.y;
+    }
+    0.5 * acc
+}
+
+/// `true` if `p` is strictly inside the simple polygon `ring`, decided with the
+/// exact [`orient2d`] predicate for every edge crossing so a near-edge point is
+/// classified without a round-off flip.
+fn point_in_polygon_exact(ring: &[Point2], p: Point2) -> bool {
+    let n = ring.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let a = ring[i];
+        let b = ring[j];
+        if (a.y > p.y) != (b.y > p.y) {
+            let upward = b.y > a.y;
+            let left = orient2d(a, b, p) == Orient::Left;
+            if left == upward {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
 }
 
 #[cfg(test)]

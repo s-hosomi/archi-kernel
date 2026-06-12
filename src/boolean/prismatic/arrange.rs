@@ -26,7 +26,7 @@
 //! from the proven 2-D engine ([`crate::boolean::poly2d`]), so this module only
 //! adds the DCEL trace and the cell adjacency it needs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::boolean::poly2d::geom::{orient2d, Edge2, Orient, Point2};
 use crate::boolean::poly2d::intersect::intersect;
@@ -45,13 +45,21 @@ struct InputSeg {
     operand: usize,
 }
 
-/// An atomic cell of the arrangement: a traced bounded face and its residency.
+/// An atomic cell of the arrangement: a traced bounded face (with any inner hole
+/// rings) and its residency.
 #[derive(Debug, Clone)]
 pub(super) struct Cell {
-    /// Vertex ids of the cell's boundary loop, in CCW order.
+    /// Vertex ids of the cell's outer boundary loop, in CCW order.
     pub vertex_ids: Vec<VertexId>,
-    /// `inside[i]` is `true` if an interior point of the cell lies inside the
-    /// `i`-th operand region.
+    /// Inner hole rings (CW), each a loop of vertex ids. A cell that strictly
+    /// contains another operand's cross-section (a slab with an interior shaft,
+    /// a column piercing a slab) is an *annulus*: its outer ring is the
+    /// enclosing boundary and each inner ring is a contained void. Without this,
+    /// the contained tool was silently ignored and a phantom solid emitted
+    /// (`DESIGN.md` §4.2).
+    pub inner_rings: Vec<Vec<VertexId>>,
+    /// `inside[i]` is `true` if an interior point of the cell (in the annulus,
+    /// not in any hole) lies inside the `i`-th operand region.
     pub inside: Vec<bool>,
 }
 
@@ -107,8 +115,12 @@ impl Arrangement {
             }
         }
 
-        // Dedup the split fragments into undirected arrangement edges.
-        let mut edge_set: HashMap<(VertexId, VertexId), ()> = HashMap::new();
+        // Dedup the split fragments into undirected arrangement edges. A
+        // `BTreeSet` keeps the edge order deterministic (sorted by vertex-id
+        // pair) so the DCEL trace, cell order, and every downstream tie-break are
+        // reproducible for identical input — a `HashMap` here would leak its
+        // RandomState seed into the result.
+        let mut edge_set: BTreeSet<(VertexId, VertexId)> = BTreeSet::new();
         for (i, seg) in inputs.iter().enumerate() {
             let chain = ordered_chain(&store, seg, &split_points[i]);
             for w in chain.windows(2) {
@@ -117,25 +129,29 @@ impl Arrangement {
                     continue;
                 }
                 let key = if u <= v { (u, v) } else { (v, u) };
-                edge_set.insert(key, ());
+                edge_set.insert(key);
             }
         }
-        let undirected: Vec<(VertexId, VertexId)> = edge_set.into_keys().collect();
+        let undirected: Vec<(VertexId, VertexId)> = edge_set.into_iter().collect();
 
         // Build the DCEL and trace its cells, recording cell adjacency per edge.
         let (cells_raw, edges) = trace(&store, &undirected)?;
 
         // Tag each cell with its residency in every operand by exact winding at
-        // an interior point.
+        // an interior point. The sample is taken in the annulus (the outer ring
+        // minus the holes); `face_sample_point` offsets just inside the outer
+        // boundary, which is always annulus material, so a contained hole never
+        // contaminates the residency of its parent cell.
         let n_ops = regions.len();
         let mut cells = Vec::with_capacity(cells_raw.len());
-        for verts in cells_raw {
-            let sample = face_sample_point(&store, &verts);
+        for raw in cells_raw {
+            let sample = face_sample_point(&store, &raw.outer);
             let inside: Vec<bool> = (0..n_ops)
                 .map(|op| winding(&store, &inputs, op, sample) != 0)
                 .collect();
             cells.push(Cell {
-                vertex_ids: verts,
+                vertex_ids: raw.outer,
+                inner_rings: raw.inners,
                 inside,
             });
         }
@@ -215,12 +231,18 @@ struct Half {
     cell: Option<usize>,
 }
 
+/// A traced cell: its CCW outer ring plus any CW inner hole rings.
+struct RawCell {
+    outer: Vec<VertexId>,
+    inners: Vec<Vec<VertexId>>,
+}
+
 /// Build the DCEL from undirected edges, trace cells, and return the cells'
-/// CCW vertex loops plus the edge adjacency.
+/// outer/inner vertex loops plus the edge adjacency.
 fn trace(
     store: &VertexStore,
     undirected: &[(VertexId, VertexId)],
-) -> Result<(Vec<Vec<VertexId>>, Vec<ArrEdge>), PrismError> {
+) -> Result<(Vec<RawCell>, Vec<ArrEdge>), PrismError> {
     let mut halfs: Vec<Half> = Vec::with_capacity(undirected.len() * 2);
     let mut outgoing: HashMap<VertexId, Vec<usize>> = HashMap::new();
     for &(a, b) in undirected.iter() {
@@ -273,10 +295,18 @@ fn trace(
         halfs[h_in].next = outs[(pos + k - 1) % k];
     }
 
-    // Trace every directed loop; a positive-area loop bounds an atomic cell.
-    let mut cells: Vec<Vec<VertexId>> = Vec::new();
-    // half-edge index -> cell index for the cell on its left, if bounded.
-    let mut half_cell: Vec<Option<usize>> = vec![None; n];
+    // Trace every directed loop. A positive-area (CCW) loop is the outer
+    // boundary of a cell; a negative-area (CW) loop is an inner hole boundary
+    // that must be attached to the cell whose interior contains it. Both kinds
+    // of loop's half-edges must resolve to the same cell so the build's wall and
+    // interface generation sees the annulus on the hole side (not `None`).
+    struct Loop {
+        ring: Vec<VertexId>,
+        pts: Vec<Point2>,
+        chain: Vec<usize>,
+        area: f64,
+    }
+    let mut loops: Vec<Loop> = Vec::new();
     for start in 0..n {
         if halfs[start].cell.is_some() || halfs[start].next == usize::MAX {
             continue;
@@ -298,12 +328,89 @@ fn trace(
                 break;
             }
         }
-        if signed_area(&pts) > 0.0 {
+        let area = signed_area(&pts);
+        loops.push(Loop {
+            ring,
+            pts,
+            chain,
+            area,
+        });
+    }
+
+    // half-edge index -> cell index for the cell on its left, if bounded.
+    let mut half_cell: Vec<Option<usize>> = vec![None; n];
+
+    // Positive loops define cells (their index is their position in `cells`).
+    let mut cells: Vec<RawCell> = Vec::new();
+    let mut pos_loops: Vec<usize> = Vec::new();
+    for (li, lp) in loops.iter().enumerate() {
+        if lp.area > 0.0 {
             let cid = cells.len();
-            for &h in &chain {
+            for &h in &lp.chain {
                 half_cell[h] = Some(cid);
             }
-            cells.push(ring);
+            cells.push(RawCell {
+                outer: lp.ring.clone(),
+                inners: Vec::new(),
+            });
+            pos_loops.push(li);
+        }
+    }
+
+    // A sorted vertex-id key identifies a loop's boundary regardless of start /
+    // orientation.
+    let ring_key = |ring: &[VertexId]| {
+        let mut k: Vec<usize> = ring.iter().map(|v| v.0).collect();
+        k.sort_unstable();
+        k
+    };
+    let pos_keys: Vec<Vec<usize>> = pos_loops
+        .iter()
+        .map(|&li| ring_key(&loops[li].ring))
+        .collect();
+
+    // Determine which negative loops are genuine **holes** and attach each to the
+    // cell that encloses it.
+    //
+    // A genuine hole's boundary is exactly the reverse of some *positive* cell's
+    // ring — the cell that fills the void (the shaft / inner column is itself an
+    // atomic cell, traced CCW). So a negative loop is a hole iff its vertex key
+    // matches a positive cell `V` (the void cell); the hole then belongs to the
+    // smallest *other* cell whose outer ring encloses `V`'s interior (the
+    // enclosing annulus). A negative loop matching *no* cell is a complex
+    // unbounded wrap (the outline around protruding / multi-component material),
+    // never a hole — skip it so its half-edges stay `None` (the exterior). This
+    // is robust where geometric containment alone is not: a wrap's non-convex
+    // outline could otherwise probe into an unrelated cell.
+    for lp in &loops {
+        if lp.area >= 0.0 {
+            continue;
+        }
+        let lp_key = ring_key(&lp.ring);
+        // The void cell `V`: a positive cell with this exact boundary.
+        let Some(void_ci) = pos_keys.iter().position(|k| *k == lp_key) else {
+            continue; // not any cell's boundary ⇒ unbounded wrap, not a hole
+        };
+        // Probe a point strictly inside the void (i.e. inside `V`), then find the
+        // smallest enclosing cell other than `V`.
+        let probe = hole_probe_point(&lp.pts);
+        let mut parent: Option<usize> = None;
+        let mut parent_area = f64::INFINITY;
+        for (ci, &li) in pos_loops.iter().enumerate() {
+            if ci == void_ci {
+                continue;
+            }
+            let outer = &loops[li];
+            if outer.area < parent_area && point_in_ring(&outer.pts, probe) {
+                parent = Some(ci);
+                parent_area = outer.area;
+            }
+        }
+        if let Some(cid) = parent {
+            cells[cid].inners.push(lp.ring.clone());
+            for &h in &lp.chain {
+                half_cell[h] = Some(cid);
+            }
         }
     }
 
@@ -326,6 +433,79 @@ fn trace(
     }
 
     Ok((cells, edges))
+}
+
+/// A point strictly **inside** a CW loop (its enclosed void), used to find which
+/// cell encloses the hole: the parent is the smallest cell whose outer ring
+/// contains this interior point (excluding the cell whose own ring *is* this
+/// loop). For a CW loop the interior is to the *right* of each directed edge, so
+/// the right-normal offset of an edge midpoint points inward; the step is shrunk
+/// until the point is verified inside the loop, so a thin or non-convex loop is
+/// still sampled correctly.
+fn hole_probe_point(pts: &[Point2]) -> Point2 {
+    let n = pts.len();
+    if n < 3 {
+        return pts.first().copied().unwrap_or(Point2::new(0.0, 0.0));
+    }
+    // Longest edge for a stable normal.
+    let mut best_i = 0usize;
+    let mut best_len = -1.0_f64;
+    for i in 0..n {
+        let l = pts[i].dist(pts[(i + 1) % n]);
+        if l > best_len {
+            best_len = l;
+            best_i = i;
+        }
+    }
+    let a = pts[best_i];
+    let b = pts[(best_i + 1) % n];
+    let d = a.to(b);
+    let len = d.len().max(f64::MIN_POSITIVE);
+    // Right normal of a→b is (dy, -dx)/len; for a CW loop this points inward
+    // (into the enclosed void).
+    let nx = d.y / len;
+    let ny = -d.x / len;
+    let mx = (a.x + b.x) * 0.5;
+    let my = (a.y + b.y) * 0.5;
+    let mut step = 1e-4_f64 * len;
+    for _ in 0..60 {
+        let p = Point2::new(mx + nx * step, my + ny * step);
+        if point_in_ring(pts, p) {
+            return p;
+        }
+        step *= 0.5;
+    }
+    // Fallback: centroid (correct for convex loops).
+    let (mut cx, mut cy) = (0.0_f64, 0.0_f64);
+    for p in pts {
+        cx += p.x;
+        cy += p.y;
+    }
+    Point2::new(cx / n as f64, cy / n as f64)
+}
+
+/// `true` if `p` is strictly inside the polygon ring `pts`, by the exact
+/// [`orient2d`] crossing rule.
+fn point_in_ring(pts: &[Point2], p: Point2) -> bool {
+    let n = pts.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[j];
+        if (a.y > p.y) != (b.y > p.y) {
+            let upward = b.y > a.y;
+            let left = orient2d(a, b, p) == Orient::Left;
+            if left == upward {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
 }
 
 #[inline]
@@ -376,8 +556,48 @@ fn face_sample_point(store: &VertexStore, ring: &[VertexId]) -> Point2 {
     }
     let nx = -d.y / len;
     let ny = d.x / len;
-    let step = 1e-4_f64 * len;
-    Point2::new((a.x + b.x) * 0.5 + nx * step, (a.y + b.y) * 0.5 + ny * step)
+    let mx = (a.x + b.x) * 0.5;
+    let my = (a.y + b.y) * 0.5;
+    // Every traced cell here is CCW (only positive-area loops become cells), so
+    // the cell's own polygon *is* its interior. A fixed `1e-4 · edge` step
+    // overshoots a thin cell (a 0.5 mm residual strip over a 10 m wall, step
+    // 1 mm) and lands in the neighbouring cell, dropping legitimate geometry.
+    // Verify the candidate is inside the cell with the exact predicate and
+    // shrink the step until it is.
+    let pts: Vec<Point2> = ring.iter().map(|&v| store.point(v)).collect();
+    let mut step = 1e-4_f64 * len;
+    for _ in 0..60 {
+        let p = Point2::new(mx + nx * step, my + ny * step);
+        if point_in_cell(&pts, p) {
+            return p;
+        }
+        step *= 0.5;
+    }
+    centroid(store, ring)
+}
+
+/// `true` if `p` is strictly inside the simple polygon `ring`, decided with the
+/// exact [`orient2d`] predicate for every edge crossing.
+fn point_in_cell(ring: &[Point2], p: Point2) -> bool {
+    let n = ring.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let a = ring[i];
+        let b = ring[j];
+        if (a.y > p.y) != (b.y > p.y) {
+            let upward = b.y > a.y;
+            let left = orient2d(a, b, p) == Orient::Left;
+            if left == upward {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
 }
 
 fn centroid(store: &VertexStore, ring: &[VertexId]) -> Point2 {

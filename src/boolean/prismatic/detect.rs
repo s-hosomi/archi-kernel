@@ -115,17 +115,28 @@ pub(crate) struct Leaf {
 
 impl Leaf {
     /// Describe an extruded leaf from its CSG fields.
-    pub(crate) fn new(profile: Profile2d, origin: Point3, axis: Vec3, length: f64) -> Self {
-        let unit = axis.try_unit().map(|u| u.as_vec()).unwrap_or(Vec3::Z);
-        let (u, v) = plane_basis(unit.try_unit().unwrap_or(crate::math::Unit3::Z));
-        Self {
+    ///
+    /// Rejects a zero (or sub-`MIN_POSITIVE`) extrusion axis with
+    /// [`PrismError::DegenerateAxis`] instead of silently defaulting it to `+Z`:
+    /// a degenerate axis is malformed input, and the prismatic path must surface
+    /// it (the CSG `Extrude` path rejects it via `Line3::new`, so the two entry
+    /// points agree).
+    pub(crate) fn new(
+        profile: Profile2d,
+        origin: Point3,
+        axis: Vec3,
+        length: f64,
+    ) -> Result<Self, PrismError> {
+        let unit = axis.try_unit().ok_or(PrismError::DegenerateAxis)?;
+        let (u, v) = plane_basis(unit);
+        Ok(Self {
             origin,
-            axis: unit,
+            axis: unit.as_vec(),
             length,
             profile,
             u,
             v,
-        }
+        })
     }
 
     /// `true` if the profile is circular (round column / void).
@@ -184,9 +195,11 @@ impl Leaf {
     /// Reprofile this leaf onto `frame`: produce its 2-D region and axial
     /// interval along the frame direction `d`.
     ///
-    /// Requires `d` to be one of this leaf's prismatic directions (the caller
-    /// guarantees it via [`common_direction`]).
-    fn reprofile(&self, frame: &Frame, tol: &Tol) -> Result<PrismOperand, PrismError> {
+    /// `l_max` is the global largest dimension in play (across both operands),
+    /// used for the length-based along-axis decision so it stays consistent with
+    /// [`detect`]'s direction agreement. Requires `d` to be one of this leaf's
+    /// prismatic directions (the caller guarantees it via [`detect`]).
+    fn reprofile(&self, frame: &Frame, l_max: f64, tol: &Tol) -> Result<PrismOperand, PrismError> {
         // Axial interval: project every corner onto d and take min/max. For a
         // circular section viewed along its own axis the corner list is empty, so
         // fall back to the two cap centres.
@@ -211,13 +224,13 @@ impl Leaf {
         // invariant along d, so the t0 face is the section. We build it as the
         // convex hull-free explicit ring of the solid face whose outward normal is
         // most anti-aligned with d.
-        let region = self.section_region(frame, tol)?;
+        let region = self.section_region(frame, l_max, tol)?;
         Ok(PrismOperand { region, t0, t1 })
     }
 
     /// The cross-section region of this solid perpendicular to `frame.d`,
     /// expressed in the frame's 2-D coordinates.
-    fn section_region(&self, frame: &Frame, _tol: &Tol) -> Result<Region, PrismError> {
+    fn section_region(&self, frame: &Frame, l_max: f64, tol: &Tol) -> Result<Region, PrismError> {
         match self.profile.outline() {
             Ok(ProfileGeom::Polygon(ring)) => {
                 // The solid's eight (box) / 2N (prism) corners; project them and
@@ -231,7 +244,7 @@ impl Leaf {
                 // prisms) the section is exactly the set of projected corners with
                 // duplicate (collapsed-along-d) points merged, traced as a convex
                 // ring. We compute it as the 2-D outline of the projected corners.
-                let pts3 = self.section_face_points(frame, &ring);
+                let pts3 = self.section_face_points(frame, l_max, tol, &ring)?;
                 let ring2: Vec<[f64; 2]> = pts3.iter().map(|&p| frame.project(p)).collect();
                 let contour = Contour::from_points(
                     &ring2
@@ -260,15 +273,36 @@ impl Leaf {
     /// * Otherwise `d` is a box axis (only rectangles reach here with a non-axis
     ///   `d`); the section is the box's side face perpendicular to `d`, whose four
     ///   corners are two profile-ring corners at both extrusion ends.
-    fn section_face_points(&self, frame: &Frame, ring: &[[f64; 2]]) -> Vec<Point3> {
+    fn section_face_points(
+        &self,
+        frame: &Frame,
+        l_max: f64,
+        tol: &Tol,
+        ring: &[[f64; 2]],
+    ) -> Result<Vec<Point3>, PrismError> {
+        // Along-axis decision uses the *same* length-based agreement as
+        // `detect`: `|axis × d| · L_max ≤ tol.length`. Using the tight cross ≤
+        // 1e-9·max_dim threshold here (the old code) left a gap where a tilt
+        // that `detect` accepts as parallel still fell into the convex-hull
+        // branch, which destroys profile concavity (an H-section becomes its
+        // bounding rectangle). Tying the two thresholds together closes that.
         let cross = self.axis.cross(frame.d).norm();
-        let along_axis = cross <= 1e-9_f64 * self.max_dimension().max(1.0);
+        let along_axis = cross * l_max <= tol.length;
         if along_axis {
-            // Section == profile ring lifted at the bottom cap.
-            ring.iter()
+            // Section == profile ring lifted at the bottom cap (concavity kept).
+            Ok(ring
+                .iter()
                 .map(|&p| self.origin + self.u * p[0] + self.v * p[1])
-                .collect()
+                .collect())
         } else {
+            // `d` is a non-axis prismatic direction. Only a rectangle is prismatic
+            // along an in-plane axis, so only a rectangle may legitimately reach
+            // the convex-hull (bounding-rectangle) branch. A non-rectangular
+            // profile here would be silently convex-hulled — losing its concavity
+            // and over-cutting — so reject it as not reducible to 2.5-D instead.
+            if !matches!(self.profile, Profile2d::Rect { .. }) {
+                return Err(PrismError::NoCommonDirection);
+            }
             // d is a profile axis (rectangle only). The section is the box face
             // perpendicular to d: pick the profile edge whose direction is
             // perpendicular to d, and sweep it along the extrusion. Concretely,
@@ -289,7 +323,7 @@ impl Leaf {
             // Project to (e1, e2), then trace the convex outline (a rectangle).
             let proj: Vec<[f64; 2]> = corners.iter().map(|&c| frame.project(c)).collect();
             let hull = convex_hull(&proj);
-            hull.iter().map(|&xy| frame.lift(xy, 0.0)).collect()
+            Ok(hull.iter().map(|&xy| frame.lift(xy, 0.0)).collect())
         }
     }
 }
@@ -349,44 +383,91 @@ pub(crate) fn detect(
     b: &Leaf,
     tol: &Tol,
 ) -> Result<(Frame, PrismOperand, PrismOperand), PrismError> {
-    let l_max = a.max_dimension().max(b.max_dimension()).max(1.0);
-    let cands_a = a.candidate_directions();
-    let cands_b = b.candidate_directions();
+    let (frame, mut ops) = detect_many(&[a.clone(), b.clone()], tol)?;
+    let pb = ops.pop().expect("two operands");
+    let pa = ops.pop().expect("two operands");
+    Ok((frame, pa, pb))
+}
 
-    // Search for the first agreeing direction pair (length-based agreement).
+/// `true` if two unit directions agree under the length-based criterion
+/// `|da × db| · L_max ≤ tol.length` (`DESIGN.md` §2.2).
+#[inline]
+fn dirs_agree(da: Vec3, db: Vec3, l_max: f64, tol: &Tol) -> bool {
+    da.cross(db).norm() * l_max <= tol.length
+}
+
+/// Find one prismatic direction common to **every** leaf, build the shared
+/// frame, and reprofile all operands onto it.
+///
+/// The common direction is chosen by intersecting the candidate-direction sets
+/// of all leaves up front, rather than greedily fixing the first pair's choice:
+/// a base box offers all three axes, and if the first opening happens to agree
+/// on `X` while a later opening only agrees on `Y`, the greedy choice of `X`
+/// would wrongly reject the set even though `Y` is common to all. We therefore
+/// take a candidate from the **first** leaf that every other leaf also matches.
+///
+/// Returns [`PrismError::NoCommonDirection`] when no such direction exists, and
+/// [`PrismError::CircularInvolved`] (labelled by index) if any leaf is circular.
+pub(crate) fn detect_many(
+    leaves: &[Leaf],
+    tol: &Tol,
+) -> Result<(Frame, Vec<PrismOperand>), PrismError> {
+    if leaves.is_empty() {
+        return Err(PrismError::NoCommonDirection);
+    }
+    let l_max = leaves
+        .iter()
+        .map(|l| l.max_dimension())
+        .fold(1.0_f64, f64::max);
+
+    // A direction common to all is a candidate of the first leaf that agrees
+    // with at least one candidate of every other leaf.
     let mut chosen: Option<Vec3> = None;
-    'outer: for &da in &cands_a {
-        for &db in &cands_b {
-            // sinθ · L_max ≤ tol.length, with sinθ = |da × db| for unit vectors.
-            if da.cross(db).norm() * l_max <= tol.length {
-                chosen = Some(da);
-                break 'outer;
+    'outer: for &d0 in &leaves[0].candidate_directions() {
+        for other in &leaves[1..] {
+            if !other
+                .candidate_directions()
+                .iter()
+                .any(|&dk| dirs_agree(d0, dk, l_max, tol))
+            {
+                continue 'outer;
             }
         }
+        chosen = Some(d0);
+        break;
     }
     let d = chosen.ok_or(PrismError::NoCommonDirection)?;
 
     // A circular section is only prismatic along its own axis; if a circle is
     // involved at all, the 2-D side carries an arc → Phase 3c.
-    if a.is_circular() {
-        return Err(PrismError::CircularInvolved {
-            operand: Operand::A,
-        });
-    }
-    if b.is_circular() {
-        return Err(PrismError::CircularInvolved {
-            operand: Operand::B,
-        });
+    for (i, leaf) in leaves.iter().enumerate() {
+        if leaf.is_circular() {
+            return Err(PrismError::CircularInvolved {
+                operand: operand_of(i),
+            });
+        }
     }
 
     let frame = Frame::new(d);
-    let pa = a
-        .reprofile(&frame, tol)
-        .map_err(|e| relabel(e, Operand::A))?;
-    let pb = b
-        .reprofile(&frame, tol)
-        .map_err(|e| relabel(e, Operand::B))?;
-    Ok((frame, pa, pb))
+    let mut ops = Vec::with_capacity(leaves.len());
+    for (i, leaf) in leaves.iter().enumerate() {
+        let op = leaf
+            .reprofile(&frame, l_max, tol)
+            .map_err(|e| relabel(e, operand_of(i)))?;
+        ops.push(op);
+    }
+    Ok((frame, ops))
+}
+
+/// Map an operand index to the coarse `Operand` label used in diagnostics
+/// (index 0 → A, everything else → B; the binary path only ever has two).
+#[inline]
+fn operand_of(i: usize) -> Operand {
+    if i == 0 {
+        Operand::A
+    } else {
+        Operand::B
+    }
 }
 
 /// Re-tag a [`PrismError::CircularInvolved`] with the correct operand side

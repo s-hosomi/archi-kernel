@@ -82,6 +82,9 @@ impl From<PrismError> for EvalError {
             PrismError::NoCommonDirection => EvalError::Unsupported3dBoolean {
                 reason: UnsupportedReason::NoCommonDirection,
             },
+            PrismError::DegenerateAxis => {
+                EvalError::Construction("extrusion axis is degenerate (zero direction)".to_string())
+            }
             PrismError::CircularInvolved { operand } => EvalError::Unsupported3dBoolean {
                 reason: UnsupportedReason::CircularOperand { operand },
             },

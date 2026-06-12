@@ -78,7 +78,7 @@ pub use geom::{Arc, Edge2, Orient, Point2, Vec2};
 pub use region::{Contour, Region};
 
 use crate::tolerance::Tol;
-use arrangement::{Arrangement, Operand};
+use arrangement::Arrangement;
 use classify::inside;
 
 /// Compute `A − B` (the part of `a` not covered by `b`).
@@ -128,9 +128,9 @@ fn boolean(a: &Region, b: &Region, op: Op, tol: &Tol) -> Result<Region, Poly2Err
         // kept CCW loop is an outer boundary; a kept CW loop is a hole boundary
         // of the same selected face. The unbounded outer wrap classifies as
         // outside both operands and is never kept.
-        let p = face.face_sample_point();
-        let in_a = inside(arr.winding(p, Operand::A));
-        let in_b = inside(arr.winding(p, Operand::B));
+        let (wa, wb) = arr.loop_sample_point(face);
+        let in_a = inside(wa);
+        let in_b = inside(wb);
         if op.keep(in_a, in_b) {
             selected.push(face.vertex_ids.clone());
         }

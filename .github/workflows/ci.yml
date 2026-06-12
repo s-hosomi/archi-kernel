@@ -23,5 +23,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all-features
+      - name: Check without features
+        run: cargo check --no-default-features
       - name: Topology isolation check
         run: "! grep -rE 'crate::(math|primitives)' src/topo/"

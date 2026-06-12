@@ -45,6 +45,7 @@
 use std::collections::HashMap;
 
 use crate::boolean::poly2d::Op;
+use crate::boolean::support::{key, CoordKey};
 use crate::brep::Brep;
 use crate::geom::{CurveGeom, CurveId, VertexGeom};
 use crate::math::{Point3, Vec3};
@@ -94,9 +95,29 @@ pub(super) fn build_combined(
     budget: usize,
 ) -> Result<Brep, PrismError> {
     let regions: Vec<&_> = operands.iter().map(|o| &o.region).collect();
+
+    // First-line budget guard on the raw input size, *before* the arrangement is
+    // built. A pathological operand set (e.g. thousands of openings) can blow up
+    // the O(n²) pairwise split inside the arrangement; checking the input edge
+    // total up front isolates it without first paying that quadratic cost. The
+    // arrangement's own output measure is still checked below.
+    let bands = bands(operands, tol);
+    let input_edges: usize = regions
+        .iter()
+        .map(|r| r.contours.iter().map(|c| c.edges.len()).sum::<usize>())
+        .sum();
+    let input_measure = input_edges
+        .saturating_mul(input_edges)
+        .saturating_mul(bands.len().max(1));
+    if input_measure > budget {
+        return Err(PrismError::ComplexityLimit {
+            measure: input_measure,
+            budget,
+        });
+    }
+
     let arr = Arrangement::build(&regions, tol)?;
 
-    let bands = bands(operands, tol);
     let measure = arr.edges.len().saturating_mul(bands.len().max(1))
         + arr.cells.len().saturating_mul(bands.len() + 1);
     if measure > budget {
@@ -127,6 +148,43 @@ pub(super) fn build_combined(
         })
         .collect();
 
+    // ── connected components over resident voxels (cell × band) ────────────
+    // A voxel is `(cell, band)`. Two resident voxels belong to the same solid
+    // only when they are genuinely **face-adjacent**: they share an arrangement
+    // edge in the same band (a 2-D edge with both cells resident), or they are
+    // the same cell in vertically-adjacent resident bands. Two voxels meeting at
+    // only a 2-D *vertex* (the checkerboard corner touch) are NOT adjacent, so
+    // they land in different components — and are then interned independently,
+    // so their shared corner edge does not become a non-manifold 4-way edge.
+    let ncells = arr.cells.len();
+    let voxel_id = |ci: usize, k: usize| ci * nbands_for(&bands) + k;
+    let nvox = ncells * nbands_for(&bands);
+    let mut vparent: Vec<usize> = (0..nvox).collect();
+    // Horizontal adjacency: cells sharing an arrangement edge, both resident.
+    for e in &arr.edges {
+        let (Some(lc), Some(rc)) = (e.left, e.right) else {
+            continue;
+        };
+        // `k` indexes `resident` *and* drives `voxel_id`; an index loop is clear.
+        #[allow(clippy::needless_range_loop)]
+        for k in 0..bands.len() {
+            if resident[lc][k] && resident[rc][k] {
+                uf_union(&mut vparent, voxel_id(lc, k), voxel_id(rc, k));
+            }
+        }
+    }
+    // Vertical adjacency: same cell, consecutive resident bands. The index `ci`
+    // also drives `voxel_id`, so an index loop is clearer than an enumerate.
+    #[allow(clippy::needless_range_loop)]
+    for ci in 0..ncells {
+        for k in 1..bands.len() {
+            if resident[ci][k] && resident[ci][k - 1] {
+                uf_union(&mut vparent, voxel_id(ci, k), voxel_id(ci, k - 1));
+            }
+        }
+    }
+    let comp_of = |ci: usize, k: usize, vp: &mut Vec<usize>| uf_find(vp, voxel_id(ci, k));
+
     // ── walls: per arrangement edge, per band ──────────────────────────────
     for e in &arr.edges {
         let pa = arr.point(e.a);
@@ -137,10 +195,17 @@ pub(super) fn build_combined(
             if left == right {
                 continue;
             }
+            // The wall belongs to the resident (material) side's voxel.
+            let comp = if left {
+                comp_of(e.left.unwrap(), k, &mut vparent)
+            } else {
+                comp_of(e.right.unwrap(), k, &mut vparent)
+            };
             // Material is on the side that is resident; the wall faces the void.
             // Edge a→b has its `left` cell on the left. Build the quad so its
             // outward normal points away from the material.
             builder.wall(
+                comp,
                 [pa.x, pa.y],
                 [pb.x, pb.y],
                 bd.z0,
@@ -152,14 +217,19 @@ pub(super) fn build_combined(
 
     // ── interfaces: per cell, per level (band boundaries, incl. bottom/top) ─
     let nbands = bands.len();
+    let to_xy = |v| {
+        let p = arr.point(v);
+        [p.x, p.y]
+    };
     for (ci, cell) in arr.cells.iter().enumerate() {
-        let ring2: Vec<[f64; 2]> = cell
-            .vertex_ids
+        let ring2: Vec<[f64; 2]> = cell.vertex_ids.iter().copied().map(to_xy).collect();
+        // Inner hole rings of the cell (an annulus interface), so a contained
+        // tool's cap is the parent's polygon *with the hole*, not the full
+        // polygon (which would re-cover the void).
+        let inner2: Vec<Vec<[f64; 2]>> = cell
+            .inner_rings
             .iter()
-            .map(|&v| {
-                let p = arr.point(v);
-                [p.x, p.y]
-            })
+            .map(|ring| ring.iter().copied().map(to_xy).collect())
             .collect();
         for k in 0..=nbands {
             let below = if k == 0 { false } else { resident[ci][k - 1] };
@@ -168,9 +238,16 @@ pub(super) fn build_combined(
                 continue;
             }
             let z = level_z(&bands, k);
+            // The cap belongs to the resident voxel it bounds: the band below
+            // (k−1) when material is below, else the band above (k).
+            let comp = if below {
+                comp_of(ci, k - 1, &mut vparent)
+            } else {
+                comp_of(ci, k, &mut vparent)
+            };
             // below && !above: top of lower material, outward normal +d (up).
             // above && !below: bottom of upper material, outward normal −d.
-            builder.interface(&ring2, z, /* up = */ below && !above);
+            builder.interface(comp, &ring2, &inner2, z, /* up = */ below && !above);
         }
     }
 
@@ -228,24 +305,50 @@ fn level_z(bands: &[Band], k: usize) -> f64 {
     }
 }
 
-/// Integer-quantised 3-D coordinate key (matches the extruder / cut scale 1e9).
-type CoordKey = (i64, i64, i64);
-
-fn key(p: Point3) -> CoordKey {
-    let q = |x: f64| (x * 1.0e9_f64).round() as i64;
-    (q(p.x), q(p.y), q(p.z))
+/// A deferred planar face: its outer ring, inner hole rings, and outward normal,
+/// all in 3-D world coordinates. Faces are collected first, grouped into
+/// connected components, and only *then* turned into B-rep topology — each
+/// component interning its own vertices and curves. This keeps two solids that
+/// merely touch at a corner (a checkerboard subtraction) geometrically
+/// **independent**: their shared corner edge is interned twice (once per solid),
+/// so no curve carries the four half-edges that would otherwise make the corner
+/// non-manifold and trip the validator's sibling pairing.
+struct FaceSpec {
+    /// The connected component (solid) this face belongs to.
+    comp: usize,
+    outer: Vec<Point3>,
+    holes: Vec<Vec<Point3>>,
+    n_out: Vec3,
 }
 
-/// Accumulates the 3-D faces with shared vertex / curve interning.
+/// Number of axial bands, clamped to at least one for voxel indexing.
+#[inline]
+fn nbands_for(bands: &[Band]) -> usize {
+    bands.len().max(1)
+}
+
+/// Union-find find with path halving.
+fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+/// Union-find union.
+fn uf_union(parent: &mut [usize], a: usize, b: usize) {
+    let (ra, rb) = (uf_find(parent, a), uf_find(parent, b));
+    if ra != rb {
+        parent[ra] = rb;
+    }
+}
+
+/// Accumulates deferred face specs from the wall / interface pass.
 struct Builder {
     frame: Frame,
     tol: Tol,
-    brep: Brep,
-    vert_by_key: HashMap<CoordKey, Id<Vertex>>,
-    coord_by_key: HashMap<CoordKey, Point3>,
-    /// Shared straight curves keyed on the unordered endpoint key pair.
-    line_by_key: HashMap<(CoordKey, CoordKey), (CurveId, CoordKey)>,
-    faces: Vec<Id<Face>>,
+    specs: Vec<FaceSpec>,
 }
 
 impl Builder {
@@ -253,11 +356,7 @@ impl Builder {
         Self {
             frame: *frame,
             tol,
-            brep: Brep::new(),
-            vert_by_key: HashMap::new(),
-            coord_by_key: HashMap::new(),
-            line_by_key: HashMap::new(),
-            faces: Vec::new(),
+            specs: Vec::new(),
         }
     }
 
@@ -265,6 +364,165 @@ impl Builder {
     #[inline]
     fn lift(&self, xy: [f64; 2], t: f64) -> Point3 {
         self.frame.lift(xy, t)
+    }
+
+    /// Record a planar face from an ordered 3-D ring with the given outward
+    /// normal (deferred; built per-component in [`finish`]).
+    fn planar_face(&mut self, comp: usize, ring: &[Point3], n_out: Vec3) {
+        self.planar_face_with_holes(comp, ring, &[], n_out);
+    }
+
+    /// Record a planar face with an outer ring and any inner hole rings
+    /// (deferred). Holes are already wound opposite to the outer ring for
+    /// `n_out`.
+    fn planar_face_with_holes(
+        &mut self,
+        comp: usize,
+        ring: &[Point3],
+        holes: &[Vec<Point3>],
+        n_out: Vec3,
+    ) {
+        if ring.len() < 3 {
+            return;
+        }
+        self.specs.push(FaceSpec {
+            comp,
+            outer: ring.to_vec(),
+            holes: holes.iter().filter(|h| h.len() >= 3).cloned().collect(),
+            n_out,
+        });
+    }
+
+    /// Emit a vertical wall quad on the 2-D segment `p0→p1` spanning `[z0, z1]`.
+    ///
+    /// `material_on_left` says the resident cell is to the left of `p0→p1`; the
+    /// wall's outward normal must point to the void (right) side.
+    #[allow(clippy::too_many_arguments)]
+    fn wall(
+        &mut self,
+        comp: usize,
+        p0: [f64; 2],
+        p1: [f64; 2],
+        z0: f64,
+        z1: f64,
+        material_on_left: bool,
+    ) {
+        let b0 = self.lift(p0, z0);
+        let b1 = self.lift(p1, z0);
+        let t1 = self.lift(p1, z1);
+        let t0 = self.lift(p0, z1);
+        // Quad b0→b1→t1→t0 has, with d the up axis, an outward normal of
+        // (edge × d) for the right side of p0→p1. If material is on the left,
+        // the void is on the right and that is the correct outward direction;
+        // otherwise reverse the loop so the normal flips.
+        let edge = b1 - b0;
+        let right_normal = edge.cross(self.frame.d);
+        if material_on_left {
+            self.planar_face(comp, &[b0, b1, t1, t0], right_normal);
+        } else {
+            self.planar_face(comp, &[b0, t0, t1, b1], -right_normal);
+        }
+    }
+
+    /// Emit a horizontal interface face for a cell ring at axial level `z`.
+    ///
+    /// `up` selects an outward normal of `+d` (material below, face is the lid)
+    /// versus `−d` (material above, face is the floor). The CCW ring is wound so
+    /// its normal matches.
+    fn interface(
+        &mut self,
+        comp: usize,
+        ring2: &[[f64; 2]],
+        inner2: &[Vec<[f64; 2]>],
+        z: f64,
+        up: bool,
+    ) {
+        let ring: Vec<Point3> = ring2.iter().map(|&xy| self.lift(xy, z)).collect();
+        // The cell's inner rings arrive CW in the (e1, e2) frame (hole
+        // boundaries), which is the correct *opposite-to-outer* hole sense for an
+        // outer-CCW / normal-+d face — so the inner-ring edges are
+        // reversed-coincident with the hole's vertical wall edges and sibling
+        // pairing closes (the watertightness contract).
+        let holes: Vec<Vec<Point3>> = inner2
+            .iter()
+            .map(|h| h.iter().map(|&xy| self.lift(xy, z)).collect())
+            .collect();
+        // ring2 is CCW in the (e1, e2) frame, whose normal is +d. So a CCW lift
+        // has outward normal +d (up). For a down-facing floor, reverse every
+        // ring so the outer is CW and the holes CCW, matching the −d normal.
+        if up {
+            self.planar_face_with_holes(comp, &ring, &holes, self.frame.d);
+        } else {
+            let rev: Vec<Point3> = ring.iter().rev().copied().collect();
+            let rev_holes: Vec<Vec<Point3>> = holes
+                .iter()
+                .map(|h| h.iter().rev().copied().collect())
+                .collect();
+            self.planar_face_with_holes(comp, &rev, &rev_holes, -self.frame.d);
+        }
+    }
+
+    /// Build the B-rep from the deferred face specs, one independent solid per
+    /// connected component, and validate the result at `Full`.
+    ///
+    /// Each component interns its **own** vertices and curves, so two solids that
+    /// touch at a corner (a checkerboard subtraction) do not share the corner
+    /// curve: every curve carries exactly two half-edges within its component,
+    /// and sibling pairing closes per solid.
+    fn finish(self, tol: &Tol) -> Result<Brep, PrismError> {
+        if self.specs.is_empty() {
+            return Ok(Brep::new());
+        }
+        // Group spec indices by their component id (deterministic order).
+        let mut comp_ids: Vec<usize> = self.specs.iter().map(|s| s.comp).collect();
+        comp_ids.sort_unstable();
+        comp_ids.dedup();
+
+        let mut brep = Brep::new();
+        let mut solids: Vec<Id<Solid>> = Vec::new();
+        for comp in comp_ids {
+            let mut cb = ComponentBuilder::new(&mut brep, self.tol);
+            for spec in self.specs.iter().filter(|s| s.comp == comp) {
+                cb.add_face(&spec.outer, &spec.holes, spec.n_out);
+            }
+            let faces = cb.faces;
+            if faces.is_empty() {
+                continue;
+            }
+            let shell = brep.topo.add_shell(Shell { faces });
+            let solid = brep.topo.add_solid(Solid {
+                shells: vec![shell],
+            });
+            solids.push(solid);
+        }
+        brep.solids = solids;
+        brep.validate(tol, ValidateLevel::Full)
+            .map_err(PrismError::InvalidResult)?;
+        Ok(brep)
+    }
+}
+
+/// Builds one connected component's faces into a shared [`Brep`], interning its
+/// own vertices and curves (a fresh namespace per component).
+struct ComponentBuilder<'a> {
+    brep: &'a mut Brep,
+    tol: Tol,
+    vert_by_key: HashMap<CoordKey, Id<Vertex>>,
+    coord_by_key: HashMap<CoordKey, Point3>,
+    line_by_key: HashMap<(CoordKey, CoordKey), (CurveId, CoordKey)>,
+    faces: Vec<Id<Face>>,
+}
+
+impl<'a> ComponentBuilder<'a> {
+    fn new(brep: &'a mut Brep, tol: Tol) -> Self {
+        Self {
+            brep,
+            tol,
+            vert_by_key: HashMap::new(),
+            coord_by_key: HashMap::new(),
+            line_by_key: HashMap::new(),
+            faces: Vec::new(),
+        }
     }
 
     fn vertex(&mut self, p: Point3) -> Id<Vertex> {
@@ -279,8 +537,6 @@ impl Builder {
         v
     }
 
-    /// Get-or-create the shared line curve through `a`, `b`, returning the curve
-    /// and the coord key chosen as its parameter origin.
     fn line_curve(&mut self, a: Point3, b: Point3) -> (CurveId, CoordKey) {
         let (ka, kb) = (key(a), key(b));
         let unordered = if ka <= kb { (ka, kb) } else { (kb, ka) };
@@ -295,7 +551,6 @@ impl Builder {
         entry
     }
 
-    /// Add a straight half-edge from `a` to `b` on its shared line.
     fn half_edge(&mut self, a: Point3, b: Point3) -> Id<HalfEdge> {
         let start = self.vertex(a);
         let _ = self.vertex(b);
@@ -314,9 +569,7 @@ impl Builder {
         })
     }
 
-    /// Build a planar face from an ordered 3-D ring with the given outward
-    /// normal, registering the plane canonically.
-    fn planar_face(&mut self, ring: &[Point3], n_out: Vec3) {
+    fn add_face(&mut self, ring: &[Point3], holes: &[Vec<Point3>], n_out: Vec3) {
         let n = ring.len();
         if n < 3 {
             return;
@@ -325,6 +578,17 @@ impl Builder {
             .map(|i| self.half_edge(ring[i], ring[(i + 1) % n]))
             .collect();
         let lp = self.brep.topo.add_loop(Loop { half_edges: hes });
+        let mut inner_loops: Vec<Id<Loop>> = Vec::with_capacity(holes.len());
+        for hole in holes {
+            let m = hole.len();
+            if m < 3 {
+                continue;
+            }
+            let hhes: Vec<Id<HalfEdge>> = (0..m)
+                .map(|i| self.half_edge(hole[i], hole[(i + 1) % m]))
+                .collect();
+            inner_loops.push(self.brep.topo.add_loop(Loop { half_edges: hhes }));
+        }
         let plane = match Plane::new(ring[0], n_out) {
             Ok(p) => p,
             Err(_) => return,
@@ -339,124 +603,8 @@ impl Builder {
             surface,
             sense,
             outer: lp,
-            inners: Vec::new(),
+            inners: inner_loops,
         });
         self.faces.push(f);
-    }
-
-    /// Emit a vertical wall quad on the 2-D segment `p0→p1` spanning `[z0, z1]`.
-    ///
-    /// `material_on_left` says the resident cell is to the left of `p0→p1`; the
-    /// wall's outward normal must point to the void (right) side.
-    fn wall(&mut self, p0: [f64; 2], p1: [f64; 2], z0: f64, z1: f64, material_on_left: bool) {
-        let b0 = self.lift(p0, z0);
-        let b1 = self.lift(p1, z0);
-        let t1 = self.lift(p1, z1);
-        let t0 = self.lift(p0, z1);
-        // Quad b0→b1→t1→t0 has, with d the up axis, an outward normal of
-        // (edge × d) for the right side of p0→p1. If material is on the left,
-        // the void is on the right and that is the correct outward direction;
-        // otherwise reverse the loop so the normal flips.
-        let edge = b1 - b0;
-        let right_normal = edge.cross(self.frame.d);
-        if material_on_left {
-            self.planar_face(&[b0, b1, t1, t0], right_normal);
-        } else {
-            self.planar_face(&[b0, t0, t1, b1], -right_normal);
-        }
-    }
-
-    /// Emit a horizontal interface face for a cell ring at axial level `z`.
-    ///
-    /// `up` selects an outward normal of `+d` (material below, face is the lid)
-    /// versus `−d` (material above, face is the floor). The CCW ring is wound so
-    /// its normal matches.
-    fn interface(&mut self, ring2: &[[f64; 2]], z: f64, up: bool) {
-        let ring: Vec<Point3> = ring2.iter().map(|&xy| self.lift(xy, z)).collect();
-        // ring2 is CCW in the (e1, e2) frame, whose normal is +d. So a CCW lift
-        // has outward normal +d (up). For a down-facing floor, reverse it.
-        if up {
-            self.planar_face(&ring, self.frame.d);
-        } else {
-            let rev: Vec<Point3> = ring.iter().rev().copied().collect();
-            self.planar_face(&rev, -self.frame.d);
-        }
-    }
-
-    /// Group the accumulated faces into connected components (by shared edge),
-    /// wrap each as its own solid, and validate the result at `Full`.
-    fn finish(mut self, tol: &Tol) -> Result<Brep, PrismError> {
-        if self.faces.is_empty() {
-            return Ok(Brep::new());
-        }
-        let groups = self.connected_components();
-        let mut solids: Vec<Id<Solid>> = Vec::new();
-        for group in groups {
-            let shell = self.brep.topo.add_shell(Shell { faces: group });
-            let solid = self.brep.topo.add_solid(Solid {
-                shells: vec![shell],
-            });
-            solids.push(solid);
-        }
-        self.brep.solids = solids;
-        let brep = std::mem::take(&mut self.brep);
-        brep.validate(tol, ValidateLevel::Full)
-            .map_err(PrismError::InvalidResult)?;
-        Ok(brep)
-    }
-
-    /// Partition the faces into connected components by shared (sibling) edge.
-    ///
-    /// Two faces are adjacent when they share an undirected curve segment — i.e.
-    /// a half-edge of one pairs with a sibling half-edge of the other. Walls and
-    /// interfaces that border the same voxel share an edge, so a face set that
-    /// bounds several disjoint solids splits cleanly here.
-    fn connected_components(&self) -> Vec<Vec<Id<Face>>> {
-        let nf = self.faces.len();
-        // Map an undirected edge (curve, unordered boundary params) to the faces
-        // that use it.
-        let mut edge_faces: HashMap<(CurveId, i64, i64), Vec<usize>> = HashMap::new();
-        for (fi, &face_id) in self.faces.iter().enumerate() {
-            let Some(face) = self.brep.topo.faces.get(face_id) else {
-                continue;
-            };
-            let Some(lp) = self.brep.topo.loops.get(face.outer) else {
-                continue;
-            };
-            for &he_id in &lp.half_edges {
-                let Some(he) = self.brep.topo.half_edges.get(he_id) else {
-                    continue;
-                };
-                let q = |x: f64| (x * 1.0e9_f64).round() as i64;
-                let (a, b) = (q(he.boundary[0]), q(he.boundary[1]));
-                let key = (he.curve, a.min(b), a.max(b));
-                edge_faces.entry(key).or_default().push(fi);
-            }
-        }
-
-        // Union-find over faces.
-        let mut parent: Vec<usize> = (0..nf).collect();
-        fn find(parent: &mut [usize], mut x: usize) -> usize {
-            while parent[x] != x {
-                parent[x] = parent[parent[x]];
-                x = parent[x];
-            }
-            x
-        }
-        for faces in edge_faces.values() {
-            for w in faces.windows(2) {
-                let (a, b) = (find(&mut parent, w[0]), find(&mut parent, w[1]));
-                if a != b {
-                    parent[a] = b;
-                }
-            }
-        }
-
-        let mut groups: HashMap<usize, Vec<Id<Face>>> = HashMap::new();
-        for fi in 0..nf {
-            let root = find(&mut parent, fi);
-            groups.entry(root).or_default().push(self.faces[fi]);
-        }
-        groups.into_values().collect()
     }
 }

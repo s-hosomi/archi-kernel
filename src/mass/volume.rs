@@ -61,13 +61,71 @@ fn outward_normal(plane: &Plane, sense: Sense) -> Vec3 {
     }
 }
 
+/// A face configuration the closed-form volume integral does not yet cover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VolumeError {
+    /// A cylindrical face whose boundary is not the two circular rim arcs the
+    /// closed-form patch integral expects (e.g. an oblique cut leaving an
+    /// elliptical rim). The elliptical-rim integral is a Phase 5 item; until then
+    /// such a face cannot be integrated and is reported rather than silently
+    /// contributing zero.
+    UnsupportedCylinderFace,
+    /// A face with a surface kind the volume integral does not handle.
+    UnsupportedSurface,
+}
+
 /// The signed volume of a [`Brep`], in cubic metres.
 ///
 /// The surface is assumed closed and outward-oriented (as produced by the
 /// extrusion builder); a positive result confirms that orientation. The
-/// computation is exact closed-form for planar and cylindrical faces.
+/// computation is exact closed-form for planar faces (polygonal or with circular
+/// arcs / a chord — a circular segment) and for the half-cylinder patches the
+/// extruder and the cut produce.
+///
+/// This is the lenient entry point used as an orientation check: a face the
+/// integral cannot evaluate in closed form (an oblique elliptical cylinder rim,
+/// a surface kind not yet supported) contributes **zero** rather than erroring.
+/// Use [`signed_volume_checked`] when an unsupported face must be surfaced
+/// instead of silently skipped.
 pub fn signed_volume(brep: &Brep) -> f64 {
     let mut vol = 0.0_f64;
+    for_each_face_contribution(brep, |c| {
+        vol += c.unwrap_or(0.0);
+    });
+    vol / 3.0_f64
+}
+
+/// The signed volume of a [`Brep`], failing if any face cannot be integrated in
+/// closed form.
+///
+/// Identical to [`signed_volume`] except that an unsupported face configuration
+/// (an oblique elliptical cylinder rim, a surface kind not yet handled) yields
+/// [`VolumeError`] instead of contributing zero.
+///
+/// # Errors
+///
+/// Returns [`VolumeError`] for the first unsupported face encountered.
+pub fn signed_volume_checked(brep: &Brep) -> Result<f64, VolumeError> {
+    let mut vol = 0.0_f64;
+    let mut err: Option<VolumeError> = None;
+    for_each_face_contribution(brep, |c| match c {
+        Ok(v) => vol += v,
+        Err(e) => {
+            if err.is_none() {
+                err = Some(e);
+            }
+        }
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(vol / 3.0_f64),
+    }
+}
+
+/// Drive `f` with each face's `∫ x · n̂ dA` contribution (or the reason it could
+/// not be computed), so the lenient and checked entry points share one walk.
+fn for_each_face_contribution(brep: &Brep, mut f: impl FnMut(Result<f64, VolumeError>)) {
     for solid_id in &brep.solids {
         let Some(solid) = brep.topo.solids.get(*solid_id) else {
             continue;
@@ -83,50 +141,100 @@ pub fn signed_volume(brep: &Brep) -> f64 {
                 match brep.geom.surface(face.surface) {
                     Some(SurfaceGeom::Plane(plane)) => {
                         let n_out = outward_normal(plane, face.sense);
-                        vol += planar_loop_integral(brep, face.outer, n_out);
+                        let mut v = planar_loop_integral(brep, face.outer, n_out);
                         for inner in &face.inners {
-                            vol -= planar_loop_integral(brep, *inner, n_out);
+                            // Inner (hole) loops are wound *opposite* to the outer
+                            // boundary in a valid B-rep (outer CCW ⇒ hole CW for
+                            // the same `n_out`), so their `n_out`-oriented planar
+                            // integral is already negative and is *added* — summing
+                            // every loop with its natural sign yields
+                            // `outer − hole`. (Subtracting would instead require
+                            // CCW holes, which break sibling pairing.)
+                            v += planar_loop_integral(brep, *inner, n_out);
                         }
+                        f(Ok(v));
                     }
                     Some(SurfaceGeom::Cylinder(_)) => {
-                        vol += cylinder_face_integral(brep, face.outer);
+                        f(cylinder_face_integral(brep, face.outer)
+                            .ok_or(VolumeError::UnsupportedCylinderFace));
                     }
-                    None => {}
+                    None => f(Err(VolumeError::UnsupportedSurface)),
                 }
             }
         }
     }
-    vol / 3.0_f64
 }
 
 /// `∫ x · n̂ dA` over a planar boundary loop (`= 3·V` contribution).
 ///
-/// A loop bounded by circular arcs (a round cap) is a disk: the integral is
-/// `(centre · n̂) · πr²`, since `x · n̂` is constant on the plane. Otherwise the
-/// loop is a polygon and we fan-triangulate from the first vertex `q0` into
-/// triangles `(q0, qi, qi₊₁)`, summing the tetra-to-origin determinants
-/// `Σ q0 · (qi × qi₊₁)`. Using origin-shifted edges `a = qi − q0`,
-/// `b = qi₊₁ − q0` is numerically gentler and gives the identical value, since
-/// `q0 · (a × b) = q0 · (qi × qi₊₁)`. That sum equals `6·V`, so the polygon
-/// integral is `acc / 2`.
+/// On a planar face `x · n̂ = d` is constant (the plane's signed origin distance),
+/// so the integral is `d · Area`, with `Area` the loop's signed planar area
+/// oriented to `n̂`. A loop bounded entirely by arcs of one circle (a round cap)
+/// is a disk, `Area = πr²`. Otherwise we take the polygon area through the
+/// boundary vertices (fan triangulation, exact for any simple polygon) and add a
+/// **circular-segment correction** for every arc edge — the signed lens area
+/// `½r²(Δθ − sinΔθ)` between the arc and its chord — so a planar face whose
+/// boundary mixes straight edges and arcs (e.g. a chord-cut cylinder's
+/// circular-segment cap) integrates exactly.
 fn planar_loop_integral(brep: &Brep, loop_id: crate::topo::arena::Id<Loop>, n_out: Vec3) -> f64 {
     if let Some((centre, radius)) = disk_loop(brep, loop_id) {
         let d = (centre - Point3::origin()).dot(n_out);
         return d * std::f64::consts::PI * radius * radius;
     }
     let verts = loop_vertices(brep, loop_id);
-    if verts.len() < 3 {
-        return 0.0_f64;
+    // Polygon part: Σ q0 · (qi × qi₊₁) / 2 = d · PolyArea (the planar integral
+    // over the chord polygon). A loop with fewer than three vertices encloses no
+    // polygon area, but its arc edges may still bound a circular segment (a
+    // half-disk: one arc + one chord, only two vertices), so we still run the
+    // arc-correction pass below rather than returning early.
+    let mut integral = 0.0_f64;
+    if verts.len() >= 3 {
+        let q0 = verts[0];
+        let q0v = q0 - Point3::origin();
+        let mut acc = 0.0_f64;
+        for i in 1..verts.len() - 1 {
+            let a = verts[i] - q0;
+            let b = verts[i + 1] - q0;
+            acc += q0v.dot(a.cross(b));
+        }
+        integral = acc / 2.0_f64;
     }
-    let q0 = verts[0];
-    let q0v = q0 - Point3::origin();
-    let mut acc = 0.0_f64;
-    for i in 1..verts.len() - 1 {
-        let a = verts[i] - q0;
-        let b = verts[i + 1] - q0;
-        acc += q0v.dot(a.cross(b));
+
+    // Arc corrections: each arc edge bulges off its chord by a circular segment.
+    // The segment's signed area in the n̂-oriented plane is ½r²(Δθ − sinΔθ) with
+    // Δθ the arc's signed central angle measured about +n̂ (the arc's own
+    // boundary params run about the circle normal). The planar integral gains
+    // `d · segment_area`, with d the constant plane offset `x · n̂`.
+    for &he_id in &lp_half_edges(brep, loop_id) {
+        let Some(he) = brep.topo.half_edges.get(he_id) else {
+            continue;
+        };
+        if let Some(CurveGeom::Circle(c)) = brep.geom.curve(he.curve) {
+            let r = c.radius();
+            // Signed central angle of the arc as traversed (boundary[0]→[1]),
+            // about the circle's own normal.
+            let dtheta = he.boundary[1] - he.boundary[0];
+            // Orient about n̂: the circle normal may agree or oppose n_out.
+            let about = c.normal().as_vec().dot(n_out);
+            let sign = if about >= 0.0 { 1.0 } else { -1.0 };
+            let seg = 0.5 * r * r * (dtheta - dtheta.sin());
+            let d = (c.center() - Point3::origin()).dot(n_out);
+            integral += d * sign * seg;
+        }
     }
-    acc / 2.0_f64
+    integral
+}
+
+/// The half-edge ids of a loop (helper for the arc-correction pass).
+fn lp_half_edges(
+    brep: &Brep,
+    loop_id: crate::topo::arena::Id<Loop>,
+) -> Vec<crate::topo::arena::Id<crate::topo::HalfEdge>> {
+    brep.topo
+        .loops
+        .get(loop_id)
+        .map(|lp| lp.half_edges.clone())
+        .unwrap_or_default()
 }
 
 /// If `loop_id` is bounded entirely by circular arcs of one shared circle (a
@@ -156,24 +264,31 @@ fn disk_loop(brep: &Brep, loop_id: crate::topo::arena::Id<Loop>) -> Option<(Poin
 }
 
 /// `∫ x · n̂ dA` over a cylinder (half-)patch face, in closed form.
-fn cylinder_face_integral(brep: &Brep, loop_id: crate::topo::arena::Id<Loop>) -> f64 {
-    let Some(lp) = brep.topo.loops.get(loop_id) else {
-        return 0.0_f64;
-    };
+///
+/// Returns `None` for a cylinder face whose boundary is not the two circular rim
+/// arcs this closed form expects (e.g. an oblique cut's elliptical rim), so the
+/// caller can report it rather than silently treat it as zero.
+fn cylinder_face_integral(brep: &Brep, loop_id: crate::topo::arena::Id<Loop>) -> Option<f64> {
+    let lp = brep.topo.loops.get(loop_id)?;
     // Find the two circular-arc half-edges (the top and bottom rims) and the
-    // height L (from the vertical extent between the two circle centres).
+    // height L (from the vertical extent between the two circle centres). Any
+    // ellipse rim means an oblique cut this closed form cannot integrate.
     let mut arcs: Vec<(f64, f64, crate::primitives::Circle3)> = Vec::new();
     for &he_id in &lp.half_edges {
         let Some(he) = brep.topo.half_edges.get(he_id) else {
             continue;
         };
-        if let Some(CurveGeom::Circle(circle)) = brep.geom.curve(he.curve) {
-            arcs.push((he.boundary[0], he.boundary[1], *circle));
+        match brep.geom.curve(he.curve) {
+            Some(CurveGeom::Circle(circle)) => {
+                arcs.push((he.boundary[0], he.boundary[1], *circle));
+            }
+            Some(CurveGeom::Ellipse(_)) => return None,
+            _ => {}
         }
     }
     if arcs.len() != 2 {
-        // Not a half-cylinder face as built by the extruder; skip.
-        return 0.0_f64;
+        // Not a half-cylinder face as built by the extruder / cut: unsupported.
+        return None;
     }
     // The two rims share the same radius and axis; their centres differ by L·ẑ.
     let (c0, c1) = (arcs[0].2.center(), arcs[1].2.center());
@@ -196,7 +311,7 @@ fn cylinder_face_integral(brep: &Brep, loop_id: crate::topo::arena::Id<Loop>) ->
     let c = bottom_centre - Point3::origin();
     let term_c = c.dot(u * (phi1.sin() - phi0.sin()) + v * (phi0.cos() - phi1.cos()));
     let term_r = r * (phi1 - phi0);
-    r * length * (term_c + term_r)
+    Some(r * length * (term_c + term_r))
 }
 
 /// Collect a loop's vertices (the start vertex of each half-edge) as points.

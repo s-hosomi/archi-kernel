@@ -20,10 +20,23 @@ use crate::tolerance::Sign3;
 /// extruded input.
 pub(crate) type CoordKey = (i64, i64, i64);
 
+/// The single quantisation scale (1e9) shared by every coordinate-keying site
+/// (the extruder, the cut, and the prismatic builder), so identical points
+/// produce identical keys regardless of which subsystem created them. It is the
+/// one authoritative definition; all other modules import [`key`] /
+/// [`quantize`] from here rather than re-deriving the scale.
+pub(crate) const QUANT_SCALE: f64 = 1.0e9_f64;
+
+/// Quantise a single scalar coordinate (or curve parameter) to an integer key
+/// at the shared [`QUANT_SCALE`].
+#[inline]
+pub(crate) fn quantize(x: f64) -> i64 {
+    (x * QUANT_SCALE).round() as i64
+}
+
 /// Quantise a 3-D point to a [`CoordKey`].
 pub(crate) fn key(p: Point3) -> CoordKey {
-    let q = |x: f64| (x * 1.0e9_f64).round() as i64;
-    (q(p.x), q(p.y), q(p.z))
+    (quantize(p.x), quantize(p.y), quantize(p.z))
 }
 
 /// An orthonormal 2-D coordinate frame on the cutting plane.

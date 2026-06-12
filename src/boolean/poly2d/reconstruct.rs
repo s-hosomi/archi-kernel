@@ -45,8 +45,12 @@ pub fn reconstruct(store: &VertexStore, selected_loops: &[Vec<VertexId>], tol: &
     }
 
     // Surviving directed edges: those whose count exceeds their reverse count.
+    // Sort the keys so `adj` is populated in a deterministic order — the boolean
+    // result must not depend on `HashMap` iteration order (which is RandomState-
+    // seeded and otherwise leaks into the loop-trace tie-breaks).
     let mut adj: HashMap<VertexId, Vec<VertexId>> = HashMap::new();
-    let keys: Vec<DEdge> = count.keys().copied().collect();
+    let mut keys: Vec<DEdge> = count.keys().copied().collect();
+    keys.sort();
     for (u, v) in keys {
         let fwd = *count.get(&(u, v)).unwrap_or(&0);
         let rev = *count.get(&(v, u)).unwrap_or(&0);

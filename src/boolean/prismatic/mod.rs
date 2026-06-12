@@ -41,7 +41,7 @@ use crate::csg::Profile2d;
 use crate::math::{Point3, Vec3};
 use crate::tolerance::Tol;
 
-use detect::{detect, Leaf};
+use detect::{detect, detect_many, Leaf};
 
 /// Default boundary-complexity budget (`DESIGN.md` §4.5).
 ///
@@ -68,7 +68,7 @@ pub struct ExtrudeLeaf {
 }
 
 impl ExtrudeLeaf {
-    fn to_leaf(self) -> Leaf {
+    fn to_leaf(self) -> Result<Leaf, PrismError> {
         Leaf::new(self.profile, self.origin, self.axis, self.length)
     }
 }
@@ -94,8 +94,8 @@ pub fn difference_with_budget(
     tol: &Tol,
     budget: usize,
 ) -> Result<Brep, PrismError> {
-    let la = positive.to_leaf();
-    let lb = negative.to_leaf();
+    let la = positive.to_leaf()?;
+    let lb = negative.to_leaf()?;
     let (frame, pa, pb) = detect(&la, &lb, tol)?;
     build::build(&frame, &pa, &pb, Op::Difference, tol, budget)
 }
@@ -113,16 +113,29 @@ pub fn union_pair(a: &ExtrudeLeaf, b: &ExtrudeLeaf, tol: &Tol) -> Result<Brep, P
 /// `union(leaves)` of extruded leaves sharing a common prismatic direction.
 ///
 /// An empty input is an empty B-rep and a single input is that leaf extruded.
-/// The 2.5-D fast path covers the **two-leaf** union directly; three or more
-/// leaves would require a `Brep × Brep` boolean (the accumulator is no longer a
-/// single extruded leaf), which is outside this phase — reported as
-/// [`PrismError::NoCommonDirection`] so the caller falls back cleanly.
+/// Two or more leaves are unioned in **one** shared multi-band arrangement with
+/// the residency rule "material wherever *any* operand is present", so three or
+/// more operands no longer require a `Brep × Brep` boolean — they ride the same
+/// 2.5-D fast path as the binary case (`DESIGN.md` §4.2, §4.5). All operands
+/// must share a common prismatic direction, else [`PrismError::NoCommonDirection`].
 pub fn union(leaves: &[ExtrudeLeaf], tol: &Tol) -> Result<Brep, PrismError> {
     match leaves {
         [] => Ok(Brep::new()),
         [single] => single_leaf(single, tol),
-        [a, b] => union_pair(a, b, tol),
-        _ => Err(PrismError::NoCommonDirection),
+        _ => {
+            let ls: Vec<Leaf> = leaves
+                .iter()
+                .map(|l| l.to_leaf())
+                .collect::<Result<_, _>>()?;
+            let (frame, ops) = detect_many(&ls, tol)?;
+            build::build_combined(
+                &frame,
+                &ops,
+                |flags| flags.iter().any(|&f| f),
+                tol,
+                DEFAULT_BUDGET,
+            )
+        }
     }
 }
 
@@ -148,27 +161,59 @@ pub fn opening_subtraction(
         return difference(base, &openings[0], tol);
     }
 
-    let base_leaf = base.to_leaf();
-    let first = openings[0].to_leaf();
-    let (frame, base_op, first_op) = detect(&base_leaf, &first, tol)?;
-
-    // operands[0] = base; operands[1..] = each opening, all on the shared frame.
-    let mut operands = Vec::with_capacity(openings.len() + 1);
-    operands.push(base_op);
-    operands.push(first_op);
-    for opening in &openings[1..] {
-        let leaf = opening.to_leaf();
-        let (other_frame, _base_again, op) = detect(&base_leaf, &leaf, tol)?;
-        // Every opening must reduce along the same direction as the first; if a
-        // later opening picks a different common direction the set is not a
-        // single 2.5-D problem.
-        if frame.d.cross(other_frame.d).norm() > tol.angular {
-            return Err(PrismError::NoCommonDirection);
-        }
-        operands.push(op);
+    // Build one shared frame across the base and *all* openings at once. The
+    // common direction is taken from the intersection of every operand's
+    // candidate set (`detect_many`), not greedily from the base–first pair, so a
+    // box base that could reduce along several axes still finds the one axis all
+    // the openings agree on (the old greedy choice could pick an axis the first
+    // opening liked but a later one did not, and wrongly reject the set).
+    let mut leaves = Vec::with_capacity(openings.len() + 1);
+    leaves.push(base.to_leaf()?);
+    for opening in openings {
+        leaves.push(opening.to_leaf()?);
     }
+    let (frame, operands) = detect_many(&leaves, tol)?;
 
-    // Residency: keep where the base is present and no opening covers the voxel.
+    // Residency: keep where the base (operand 0) is present and no opening
+    // covers the voxel.
+    build::build_combined(
+        &frame,
+        &operands,
+        |flags| flags[0] && !flags[1..].iter().any(|&f| f),
+        tol,
+        DEFAULT_BUDGET,
+    )
+}
+
+/// Clip a base by openings and clippers in one shared prismatic pass.
+///
+/// This is the Phase-5 entry point for priority-based deduction (`DESIGN.md`
+/// §5.1, column → girder → beam → wall/slab): the kept region is
+/// `in_base ∧ ¬in_any_opening ∧ ¬in_any_clipper`. Openings and clippers are
+/// handled identically by the residency closure but kept as distinct argument
+/// groups so the caller's intent (semantic void vs priority deduction) is
+/// explicit at the call site. All operands must share one prismatic direction.
+///
+/// An empty `openings` *and* empty `clippers` reduces to extruding the base.
+pub fn clip(
+    base: &ExtrudeLeaf,
+    openings: &[ExtrudeLeaf],
+    clippers: &[ExtrudeLeaf],
+    tol: &Tol,
+) -> Result<Brep, PrismError> {
+    if openings.is_empty() && clippers.is_empty() {
+        return single_leaf(base, tol);
+    }
+    let mut leaves = Vec::with_capacity(openings.len() + clippers.len() + 1);
+    leaves.push(base.to_leaf()?);
+    for o in openings {
+        leaves.push(o.to_leaf()?);
+    }
+    for c in clippers {
+        leaves.push(c.to_leaf()?);
+    }
+    let (frame, operands) = detect_many(&leaves, tol)?;
+    // operand 0 = base; the rest (openings then clippers) all subtract.
     build::build_combined(
         &frame,
         &operands,
@@ -198,8 +243,8 @@ fn leak(_e: &crate::error::KernelError) -> &'static str {
 
 /// Shared binary driver: detect the common direction, then build for `op`.
 fn binary(a: &ExtrudeLeaf, b: &ExtrudeLeaf, op: Op, tol: &Tol) -> Result<Brep, PrismError> {
-    let la = a.to_leaf();
-    let lb = b.to_leaf();
+    let la = a.to_leaf()?;
+    let lb = b.to_leaf()?;
     let (frame, pa, pb) = detect(&la, &lb, tol)?;
     build::build(&frame, &pa, &pb, op, tol, DEFAULT_BUDGET)
 }

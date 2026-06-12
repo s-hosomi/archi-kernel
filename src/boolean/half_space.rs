@@ -311,20 +311,85 @@ impl<'a> Cutter<'a> {
             return Ok(CutResult::Empty);
         }
 
-        // Assemble the shell + solid.
-        let shell = self.out.topo.add_shell(Shell {
-            faces: self.faces.clone(),
-        });
-        let solid = self.out.topo.add_solid(Solid {
-            shells: vec![shell],
-        });
-        self.out.solids = vec![solid];
+        // Decompose the kept faces into connected components (a cut can split a
+        // member into several disjoint pieces — e.g. an H-prism notched into two
+        // flange strips), wrapping each as its own shell + solid.
+        let groups = self.connected_components();
+        let mut solids: Vec<Id<Solid>> = Vec::new();
+        for group in groups {
+            let shell = self.out.topo.add_shell(Shell { faces: group });
+            let solid = self.out.topo.add_solid(Solid {
+                shells: vec![shell],
+            });
+            solids.push(solid);
+        }
+        self.out.solids = solids;
 
         let brep = std::mem::take(&mut self.out);
         brep.validate(&self.tol, ValidateLevel::Full)
             .map_err(EvalError::InvalidResult)?;
 
         Ok(CutResult::Cut { brep, caps })
+    }
+
+    /// Partition the output faces into connected components by shared (sibling)
+    /// edge: two faces are adjacent when a half-edge of one pairs with a reversed
+    /// sibling of the other (same curve, reversed boundary). A kept side that is
+    /// geometrically disconnected (disjoint flange strips, separated pieces)
+    /// splits cleanly here into one solid per component.
+    ///
+    /// (Mirrors `prismatic/build.rs::connected_components`; kept local while the
+    /// shared refactor is deferred.)
+    fn connected_components(&self) -> Vec<Vec<Id<Face>>> {
+        let nf = self.faces.len();
+        // Map an undirected edge (curve, unordered boundary params) to its faces.
+        let mut edge_faces: HashMap<(CurveId, i64, i64), Vec<usize>> = HashMap::new();
+        for (fi, &face_id) in self.faces.iter().enumerate() {
+            let Some(face) = self.out.topo.faces.get(face_id) else {
+                continue;
+            };
+            let mut loops = vec![face.outer];
+            loops.extend(face.inners.iter().copied());
+            for lid in loops {
+                let Some(lp) = self.out.topo.loops.get(lid) else {
+                    continue;
+                };
+                for &he_id in &lp.half_edges {
+                    let Some(he) = self.out.topo.half_edges.get(he_id) else {
+                        continue;
+                    };
+                    let q = |x: f64| (x * 1.0e9_f64).round() as i64;
+                    let (a, b) = (q(he.boundary[0]), q(he.boundary[1]));
+                    let key = (he.curve, a.min(b), a.max(b));
+                    edge_faces.entry(key).or_default().push(fi);
+                }
+            }
+        }
+
+        // Union-find over faces.
+        let mut parent: Vec<usize> = (0..nf).collect();
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        for faces in edge_faces.values() {
+            for w in faces.windows(2) {
+                let (a, b) = (find(&mut parent, w[0]), find(&mut parent, w[1]));
+                if a != b {
+                    parent[a] = b;
+                }
+            }
+        }
+
+        let mut groups: HashMap<usize, Vec<Id<Face>>> = HashMap::new();
+        for fi in 0..nf {
+            let root = find(&mut parent, fi);
+            groups.entry(root).or_default().push(self.faces[fi]);
+        }
+        groups.into_values().collect()
     }
 
     // ── classification ──────────────────────────────────────────────────────
@@ -400,6 +465,12 @@ impl<'a> Cutter<'a> {
         if let Some(&c) = self.line_by_key.get(&unordered) {
             return c;
         }
+        // Reuse a section line already interned for this edge so a verbatim edge
+        // and a coincident cap edge share one curve (and pair as siblings).
+        if let Some(&c) = self.section_line_by_key.get(&unordered) {
+            self.line_by_key.insert(unordered, c);
+            return c;
+        }
         let cid = self.out.geom.insert_curve(CurveGeom::Line(line));
         self.line_by_key.insert(unordered, cid);
         cid
@@ -426,6 +497,15 @@ impl<'a> Cutter<'a> {
         let unordered = if ka <= kb { (ka, kb) } else { (kb, ka) };
         if let Some(&cid) = self.section_line_by_key.get(&unordered) {
             if let Some(CurveGeom::Line(l)) = self.out.geom.curve(cid) {
+                return Some((cid, *l));
+            }
+        }
+        // If a kept face already interned this exact edge verbatim (the On–On
+        // existing-edge case: the section edge coincides with a real edge of a
+        // kept face), reuse that curve so the wall- and cap-side half-edges pair.
+        if let Some(&cid) = self.line_by_key.get(&unordered) {
+            if let Some(CurveGeom::Line(l)) = self.out.geom.curve(cid) {
+                self.section_line_by_key.insert(unordered, cid);
                 return Some((cid, *l));
             }
         }
@@ -478,16 +558,42 @@ impl<'a> Cutter<'a> {
             }
         }
 
-        // Coplanar (On) face: governed by the coplanar rule.
-        if !kept && !dropped && on {
-            self.process_coplanar_face(&face, &surface, &loops);
+        // A planar face with curved (arc) edges can be crossed between its
+        // vertices — e.g. a disk cap whose circular rim bulges past the chord of
+        // an axis-parallel cut, or a full-circle disk cap whose only two vertices
+        // (the seam endpoints) both sit On the cut plane. Detect this first so an
+        // all-On *but straddling* arc face is split, not mistaken for coplanar.
+        let arc_crossed = self.face_has_arc_crossing(&loops);
+
+        // All-On face with no interior arc crossing: every vertex lies in the cut
+        // plane and the surface does not cross it in the interior.
+        if !kept && !dropped && on && !arc_crossed {
+            match &surface {
+                SurfaceGeom::Plane(face_plane) => {
+                    if self.is_coplanar_with_cut(face_plane) {
+                        // A face lying in the cut plane: the coplanar lid rule.
+                        self.process_coplanar_face(&face, &surface, &loops, class);
+                    } else {
+                        // A planar face whose every vertex lies on the cut plane
+                        // yet whose plane is *not* the cut plane straddles it
+                        // along a diameter through existing vertices (e.g. a
+                        // disk cap cut by a plane through its two seam points).
+                        // Split it on the planar walk; the section line runs
+                        // through the existing On vertices.
+                        self.split_planar_face(&face, *face_plane, &loops, class);
+                    }
+                }
+                SurfaceGeom::Cylinder(cyl) => {
+                    // A non-planar face whose boundary lies in the cut plane (e.g.
+                    // a half-cylinder whose two seam edges sit on the plane). Its
+                    // surface bulges to one side; an interior surface point's sign
+                    // decides keep/drop. (A face whose interior straddles is caught
+                    // earlier by `cylinder_face_crossed`.)
+                    self.process_on_cylinder_face(&face, *cyl, &loops, class);
+                }
+            }
             return;
         }
-
-        // A planar face with curved (arc) edges can also be crossed between its
-        // vertices — e.g. a disk cap whose circular rim bulges past the chord of
-        // an axis-parallel cut. Detect an interior arc crossing and split.
-        let arc_crossed = self.face_has_arc_crossing(&loops);
 
         if dropped && !kept && !arc_crossed {
             // Whole face on the dropped side: drop it. Its On boundary edges (if
@@ -496,8 +602,13 @@ impl<'a> Cutter<'a> {
         }
 
         if kept && !dropped && !arc_crossed {
-            // Whole face kept verbatim.
+            // Whole face kept verbatim. If its boundary has straight On–On edges
+            // (the cut grazes an existing edge — a mitre / coplanar-junction cut),
+            // register them as cap boundary: an edge shared by two kept faces is
+            // recorded in both directions and cancels in `build_straight_caps`,
+            // while one bordering removed material survives as a cap edge.
             self.copy_face_verbatim(&face, &surface, &loops);
+            self.register_on_boundary_caps(&loops, class);
             return;
         }
 
@@ -564,38 +675,26 @@ impl<'a> Cutter<'a> {
         if kept && dropped {
             return true; // vertices already straddle
         }
-        // Sample the surface across the face's angular span: if the signed
-        // distance to the cut plane changes sign, the plane crosses the face.
+        // Closed-form crossing test (DESIGN §2.1: all intersections closed form).
+        //
+        // A cylinder-surface point is `p(φ, z) = o + r(cosφ·û + sinφ·v̂) + z·ẑ`
+        // where (û, v̂) is the axis basis and ẑ the axis direction. Its signed
+        // distance to the cut plane is
+        //   sd(φ, z) = n·(p − plane.pt)
+        //            = [n·(o − plane.pt)] + r·(n·û)cosφ + r·(n·v̂)sinφ + z·(n·ẑ).
+        // For each fixed z this is `A cosφ + B sinφ + C(z)`, the same conic form
+        // `split_conic_param` solves. The plane crosses the face when sd changes
+        // sign over the face's φ-span at some z in its axial extent — equivalently
+        // when a root of sd(φ, z) = 0 lands strictly inside the φ-span for either
+        // axial extreme, or the span endpoints already straddle.
         let axis = cyl.axis();
         let (u, v) = plane_basis(axis.dir());
         let axis_dir = axis.dir().as_vec();
         let r = cyl.radius();
-        // Collect the face's vertex angles and axial heights to bound the span.
-        let mut angles: Vec<f64> = Vec::new();
-        let mut zs: Vec<f64> = Vec::new();
-        for &loop_id in loops {
-            let Some(lp) = self.input.topo.loops.get(loop_id) else {
-                continue;
-            };
-            for &he_id in &lp.half_edges {
-                let Some(he) = self.input.topo.half_edges.get(he_id) else {
-                    continue;
-                };
-                if let Some(p) = self.input_point(he.start) {
-                    let d = p - axis.origin();
-                    angles.push(d.dot(v).atan2(d.dot(u)));
-                    zs.push(d.dot(axis_dir));
-                }
-            }
-        }
-        if angles.is_empty() {
-            return false;
-        }
-        let z_lo = zs.iter().cloned().fold(f64::INFINITY, f64::min);
-        let z_hi = zs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        // The true angular span comes from the face's arc edges (their boundary
-        // is the φ interval); diametrically-opposite vertices alone are
-        // ambiguous. Take the union of arc intervals.
+
+        // Face axial extent (z range) and angular span (from the arc edges).
+        let mut z_lo = f64::INFINITY;
+        let mut z_hi = f64::NEG_INFINITY;
         let (mut span_lo, mut span_hi) = (f64::INFINITY, f64::NEG_INFINITY);
         for &loop_id in loops {
             let Some(lp) = self.input.topo.loops.get(loop_id) else {
@@ -605,27 +704,52 @@ impl<'a> Cutter<'a> {
                 let Some(he) = self.input.topo.half_edges.get(he_id) else {
                     continue;
                 };
+                if let Some(p) = self.input_point(he.start) {
+                    let z = (p - axis.origin()).dot(axis_dir);
+                    z_lo = z_lo.min(z);
+                    z_hi = z_hi.max(z);
+                }
                 if let Some(CurveGeom::Circle(_)) = self.input.geom.curve(he.curve) {
                     span_lo = span_lo.min(he.boundary[0]).min(he.boundary[1]);
                     span_hi = span_hi.max(he.boundary[0]).max(he.boundary[1]);
                 }
             }
         }
-        if !span_lo.is_finite() || !span_hi.is_finite() {
-            // No arc edges: fall back to the vertex-angle span.
-            let mut a: Vec<f64> = angles.clone();
-            a.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-            span_lo = a[0];
-            span_hi = a[a.len() - 1];
+        if !z_lo.is_finite() || !span_lo.is_finite() || !span_hi.is_finite() {
+            return false;
         }
+
+        // Evaluate sd at a (φ, z); `lo`/`hi` order the span for interior tests.
+        let sd_at = |phi: f64, z: f64| -> f64 {
+            let p = axis.origin() + u * (r * phi.cos()) + v * (r * phi.sin()) + axis_dir * z;
+            self.plane.signed_distance(p)
+        };
+        let (lo, hi) = if span_lo <= span_hi {
+            (span_lo, span_hi)
+        } else {
+            (span_hi, span_lo)
+        };
+        let interior = |t: f64| t > lo + 1e-9_f64 && t < hi - 1e-9_f64;
+
+        // Roots of `A cosφ + B sinφ + C(z) = 0` per axial extreme. C(z) folds the
+        // constant + z term into the conic's centre offset by shifting `c` along
+        // the axis by z (the plane equation already absorbs the offset).
+        let centre_at = |z: f64| axis.origin() + axis_dir * z;
+        for &z in &[z_lo, z_hi] {
+            let roots = split_conic_param(centre_at(z), u * r, v * r, &self.plane);
+            for root in roots {
+                let t = align_into_interval(root, lo, hi, std::f64::consts::TAU);
+                if interior(t) {
+                    return true;
+                }
+            }
+        }
+        // Fall back: do the span endpoints straddle at either axial extreme?
         let mut seen_pos = false;
         let mut seen_neg = false;
-        let steps = 24;
-        for i in 0..=steps {
-            let phi = span_lo + (span_hi - span_lo) * (i as f64) / (steps as f64);
-            for &z in &[z_lo, 0.5 * (z_lo + z_hi), z_hi] {
-                let p = axis.origin() + u * (r * phi.cos()) + v * (r * phi.sin()) + axis_dir * z;
-                let sd = self.plane.signed_distance(p);
+        for &phi in &[span_lo, span_hi] {
+            for &z in &[z_lo, z_hi] {
+                let sd = sd_at(phi, z);
                 if sd > self.tol.length {
                     seen_pos = true;
                 } else if sd < -self.tol.length {
@@ -727,6 +851,124 @@ impl<'a> Cutter<'a> {
         }
     }
 
+    /// `true` if `face_plane` is coplanar with the cut plane (parallel normals
+    /// and the cut plane's reference point lies on the face plane).
+    fn is_coplanar_with_cut(&self, face_plane: &Plane) -> bool {
+        let cross = face_plane
+            .normal()
+            .as_vec()
+            .cross(self.plane.normal().as_vec());
+        cross.norm() <= self.tol.angular
+            && face_plane.signed_distance(self.plane.point()).abs() <= self.tol.length
+    }
+
+    /// Handle a non-planar (cylinder) face whose whole boundary lies in the cut
+    /// plane. The surface bulges to one side; if that side is kept, the face is
+    /// kept verbatim and its boundary straight On–On edges (the seam edges) are
+    /// registered as wall-side cap edges so the opening seals.
+    fn process_on_cylinder_face(
+        &mut self,
+        face: &Face,
+        cyl: Cylinder,
+        loops: &[Id<Loop>],
+        class: &HashMap<Id<Vertex>, Sign3>,
+    ) {
+        // Interior surface point: middle angle of the face's arc span at mid-z.
+        let axis = cyl.axis();
+        let (u, v) = plane_basis(axis.dir());
+        let axis_dir = axis.dir().as_vec();
+        let r = cyl.radius();
+        let (mut span_lo, mut span_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut z_lo, mut z_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &loop_id in loops {
+            let Some(lp) = self.input.topo.loops.get(loop_id) else {
+                continue;
+            };
+            for &he_id in &lp.half_edges {
+                let Some(he) = self.input.topo.half_edges.get(he_id) else {
+                    continue;
+                };
+                if let Some(p) = self.input_point(he.start) {
+                    z_lo = z_lo.min((p - axis.origin()).dot(axis_dir));
+                    z_hi = z_hi.max((p - axis.origin()).dot(axis_dir));
+                }
+                if let Some(CurveGeom::Circle(_)) = self.input.geom.curve(he.curve) {
+                    span_lo = span_lo.min(he.boundary[0]).min(he.boundary[1]);
+                    span_hi = span_hi.max(he.boundary[0]).max(he.boundary[1]);
+                }
+            }
+        }
+        if !span_lo.is_finite() || !z_lo.is_finite() {
+            return;
+        }
+        let phi = 0.5 * (span_lo + span_hi);
+        let z = 0.5 * (z_lo + z_hi);
+        let p = axis.origin() + u * (r * phi.cos()) + v * (r * phi.sin()) + axis_dir * z;
+        let sd = self.plane.signed_distance(p);
+        let interior_kept = match self.keep {
+            KeepSide::Below => sd < -self.tol.length,
+            KeepSide::Above => sd > self.tol.length,
+        };
+        if !interior_kept {
+            return; // bulge is on the dropped side: face disappears.
+        }
+        // Keep verbatim and register the straight On–On boundary edges as cap
+        // boundary (wall-side direction = the kept face's traversal).
+        let surf = SurfaceGeom::Cylinder(cyl);
+        self.copy_face_verbatim(face, &surf, loops);
+        self.register_on_boundary_caps(loops, class);
+    }
+
+    /// Register a face's straight On–On boundary edges (both endpoints in the cut
+    /// plane, the connecting edge a straight line lying in it) as wall-side cap
+    /// edges. The cap half-edge is the reversed sibling, so the opening where this
+    /// kept face borders removed material is sealed. Curved (arc) On edges are not
+    /// registered here — those bound disk caps handled by the arc-cap path.
+    fn register_on_boundary_caps(
+        &mut self,
+        loops: &[Id<Loop>],
+        class: &HashMap<Id<Vertex>, Sign3>,
+    ) {
+        for &loop_id in loops {
+            let Some(lp) = self.input.topo.loops.get(loop_id).cloned() else {
+                continue;
+            };
+            let n = lp.half_edges.len();
+            for i in 0..n {
+                let he_id = lp.half_edges[i];
+                let next_id = lp.half_edges[(i + 1) % n];
+                let (Some(he), Some(next)) = (
+                    self.input.topo.half_edges.get(he_id).copied(),
+                    self.input.topo.half_edges.get(next_id).copied(),
+                ) else {
+                    continue;
+                };
+                // Only straight edges in the cut plane.
+                let Some(CurveGeom::Line(_)) = self.input.geom.curve(he.curve) else {
+                    continue;
+                };
+                let s_start = class.get(&he.start).copied().unwrap_or(Sign3::On);
+                let s_end = class.get(&next.start).copied().unwrap_or(Sign3::On);
+                if s_start != Sign3::On || s_end != Sign3::On {
+                    continue;
+                }
+                let (Some(pa), Some(pb)) =
+                    (self.input_point(he.start), self.input_point(next.start))
+                else {
+                    continue;
+                };
+                // Confirm both endpoints lie on the cut plane (guards against an
+                // On classification that is actually a near-miss).
+                if self.plane.signed_distance(pa).abs() > self.tol.length
+                    || self.plane.signed_distance(pb).abs() > self.tol.length
+                {
+                    continue;
+                }
+                self.add_section_edge(pa, pb);
+            }
+        }
+    }
+
     // ── coplanar face rule ────────────────────────────────────────────────
 
     /// Handle a face lying wholly in the cut plane (`DESIGN.md` §4.3 for a cut).
@@ -735,7 +977,13 @@ impl<'a> Cutter<'a> {
     /// cap is the face whose outward normal points along `+normal`: such a face
     /// is the lid of the kept material and is kept (and feeds the cap). The
     /// opposite-facing coplanar face is dropped. `Above` is symmetric.
-    fn process_coplanar_face(&mut self, face: &Face, surface: &SurfaceGeom, loops: &[Id<Loop>]) {
+    fn process_coplanar_face(
+        &mut self,
+        face: &Face,
+        surface: &SurfaceGeom,
+        loops: &[Id<Loop>],
+        class: &HashMap<Id<Vertex>, Sign3>,
+    ) {
         let SurfaceGeom::Plane(face_plane) = surface else {
             // Only planar faces can be coplanar with the cut plane.
             return;
@@ -756,11 +1004,14 @@ impl<'a> Cutter<'a> {
         if !keep_this {
             return;
         }
-        // This coplanar face is the lid of the kept material and is already part
-        // of the watertight boundary — keep it verbatim. There is no separate
-        // opening to cap (the lid *is* the cap), so it is not routed to the cap
-        // pool; doing so would duplicate its boundary edges.
+        // This coplanar face is (part of) the lid of the kept material — keep it
+        // verbatim. Register its On–On boundary edges as cap candidates with the
+        // shared signed-multiplicity tally (`build_straight_caps`): where the lid
+        // borders a kept side face the edge is recorded from both and cancels (no
+        // duplicate cap), but where a *partial* lid borders removed material the
+        // edge survives once and seals the remaining open cross-section.
         self.copy_face_verbatim(face, surface, loops);
+        self.register_on_boundary_caps(loops, class);
     }
 
     // ── straddling face split (planar) ────────────────────────────────────
@@ -810,7 +1061,10 @@ impl<'a> Cutter<'a> {
                 continue;
             }
             // Record the full 2-D outline of this loop for point-in-face tests.
-            outline_2d.push(aug.iter().map(|n| frame.project(n.point)).collect());
+            // Arc edges are sampled at interior points so the polygon represents
+            // the curved boundary (a chord-collapsed arc would put the section
+            // midpoint exactly on a degenerate edge and fail the inside test).
+            outline_2d.push(self.loop_outline_2d(&aug, &frame));
 
             // Extract kept boundary fragments (maximal runs of kept-or-on edges
             // whose midpoint is kept), and the On portal vertices.
@@ -856,6 +1110,33 @@ impl<'a> Cutter<'a> {
             });
             self.faces.push(f);
         }
+        // The kept side of a split face can also carry pre-existing On–On boundary
+        // edges that lie in the cut plane (e.g. an H bottom face whose inner-flange
+        // edge runs along the junction plane). Register them with the same signed
+        // tally so they cancel against the coplanar lid that shares them, leaving
+        // only the genuinely open section edges to cap.
+        self.register_on_boundary_caps(loops, class);
+    }
+
+    /// Project an augmented loop to a 2-D polygon outline, sampling arc edges at
+    /// interior points so a curved boundary is represented faithfully (used only
+    /// for the point-in-face test, never for output geometry).
+    fn loop_outline_2d(&self, aug: &[BoundaryNode], frame: &PlaneFrame) -> Vec<[f64; 2]> {
+        let mut out: Vec<[f64; 2]> = Vec::with_capacity(aug.len());
+        for node in aug {
+            out.push(frame.project(node.point));
+            // Sample the (possibly arc) edge leaving this node at a few interior
+            // parameters; for a straight edge these are collinear and harmless.
+            if matches!(node.edge_geom, CurveGeom::Circle(_) | CurveGeom::Ellipse(_)) {
+                let (b0, b1) = (node.edge_b0, node.edge_b1);
+                let steps = 8;
+                for i in 1..steps {
+                    let t = b0 + (b1 - b0) * (i as f64) / (steps as f64);
+                    out.push(frame.project(node.edge_geom.point_at(t)));
+                }
+            }
+        }
+        out
     }
 
     fn intern_surface_plane(&mut self, plane: Plane, sense: Sense) -> (SurfaceId, Sense) {
@@ -1302,7 +1583,9 @@ impl<'a> Cutter<'a> {
                 }
             }
 
-            if closed && he_ids.len() >= 3 {
+            // A loop needs at least two edges: a curved sub-face can close with a
+            // single kept arc plus one section chord (a half-disk).
+            if closed && he_ids.len() >= 2 {
                 let loop_id = self.out.topo.add_loop(Loop { half_edges: he_ids });
                 built.push(BuiltLoop {
                     loop_id,
@@ -1503,21 +1786,61 @@ impl<'a> Cutter<'a> {
             return;
         }
 
-        // Connect portals by straight ruling segments. For a single half-cylinder
-        // chord cut there are exactly two portals; pair them directly.
+        // Connect portals by straight ruling segments. A chord cut crosses a
+        // half-cylinder face along the cut plane's *ruling lines* (vertical lines
+        // parallel to the axis, from `plane_cylinder`'s `TwoLines`/`TangentLine`).
+        // Each ruling carries a vertical pair of portals (its crossings on the
+        // bottom and top rim arcs); a face spanning both rulings of a deep chord
+        // has four portals (two rulings). Group portals by ruling — their shared
+        // horizontal position `w` along the in-plane direction perpendicular to
+        // the axis — then within a ruling pair consecutive portals by axial height
+        // (even-odd), keeping a segment when its midpoint lies inside the face.
         let mut uniq: HashMap<CoordKey, (Id<Vertex>, Point3)> = HashMap::new();
         for &(v, p) in &portals {
             uniq.entry(key(p)).or_insert((v, p));
         }
         let pts: Vec<(Id<Vertex>, Point3)> = uniq.into_values().collect();
+
+        // In-plane frame whose `w` axis is perpendicular to the axis: rulings are
+        // vertical lines of constant `w`. `h` is the axial height along the ruling.
+        let axis_dir = cyl.axis().dir().as_vec();
+        let n = self.plane.normal().as_vec();
+        let w_dir = axis_dir.cross(n);
+        let w_dir = w_dir.try_unit().map(|u| u.as_vec()).unwrap_or(axis_dir);
+        let w_of = |p: Point3| (p - self.plane.point()).dot(w_dir);
+        let h_of = |p: Point3| (p - self.plane.point()).dot(axis_dir);
+
+        // Bucket portals by ruling (quantised `w`).
+        let mut rulings: HashMap<i64, Vec<(Id<Vertex>, Point3)>> = HashMap::new();
+        for &(v, p) in &pts {
+            let wq = (w_of(p) * 1.0e9_f64).round() as i64;
+            rulings.entry(wq).or_default().push((v, p));
+        }
+        // 2-D outline of the face on the cut plane is not available (the face is
+        // curved); instead the kept-fragment midpoints give the kept side. A
+        // ruling segment is interior to the kept region when its midpoint's plane
+        // signed distance is ~0 (on the cut) AND it lies axially within the face.
         let mut segs: Vec<SectionSeg> = Vec::new();
-        if pts.len() == 2 {
-            segs.push(SectionSeg {
-                a: pts[0].0,
-                b: pts[1].0,
-                pa: pts[0].1,
-                pb: pts[1].1,
+        for group in rulings.values_mut() {
+            group.sort_by(|a, b| {
+                h_of(a.1)
+                    .partial_cmp(&h_of(b.1))
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
+            // Pair consecutive portals along the ruling (even-odd): the segment
+            // between an entry/exit pair spans kept material.
+            let mut i = 0;
+            while i + 1 < group.len() {
+                let (va, pa) = group[i];
+                let (vb, pb) = group[i + 1];
+                segs.push(SectionSeg {
+                    a: va,
+                    b: vb,
+                    pa,
+                    pb,
+                });
+                i += 2;
+            }
         }
 
         // Reuse the planar loop assembler (it walks fragments + straight section

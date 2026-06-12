@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 
+use crate::boolean::support::{key, CoordKey};
 use crate::brep::Brep;
 use crate::csg::Profile2d;
 use crate::error::KernelError;
@@ -84,16 +85,6 @@ struct ExtrudeBuilder {
     /// pair, mapping to the shared line curve and its parameter-origin key.
     lines: HashMap<(CoordKey, CoordKey), (CurveId, CoordKey)>,
     faces: Vec<Id<Face>>,
-}
-
-/// Integer-quantised coordinate so identical corners deduplicate despite `f64`
-/// not being `Hash`/`Eq`. The scale (1e9) resolves building dimensions
-/// (1e-3..1e2 m) comfortably without overflowing `i64`.
-type CoordKey = (i64, i64, i64);
-
-fn key(p: Point3) -> CoordKey {
-    let q = |x: f64| (x * 1.0e9_f64).round() as i64;
-    (q(p.x), q(p.y), q(p.z))
 }
 
 impl ExtrudeBuilder {

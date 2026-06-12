@@ -25,6 +25,6 @@ pub mod half_space;
 pub mod poly2d;
 pub mod prismatic;
 
-mod support;
+pub(crate) mod support;
 
 pub use half_space::{cut, CutResult, KeepSide};

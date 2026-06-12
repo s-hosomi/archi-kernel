@@ -48,6 +48,10 @@ pub enum PrismError {
     /// not reduce to 2.5-D. The caller surfaces this as
     /// [`EvalError::Unsupported3dBoolean`](crate::csg::EvalError).
     NoCommonDirection,
+    /// An operand's extrusion axis is zero (or below `MIN_POSITIVE`), i.e. it has
+    /// no direction. This is malformed input, not an unsupported configuration;
+    /// the caller surfaces it as a construction error.
+    DegenerateAxis,
     /// The operand involves a circular (cylindrical) cross-section whose curved
     /// boundary would land on the 2-D side as an arc; arc support in the 2-D
     /// engine arrives in Phase 3c. Reported with the offending operand.
@@ -83,6 +87,9 @@ impl fmt::Display for PrismError {
         match self {
             PrismError::NoCommonDirection => {
                 write!(f, "no common prismatic direction (not reducible to 2.5-D)")
+            }
+            PrismError::DegenerateAxis => {
+                write!(f, "extrusion axis is degenerate (zero direction)")
             }
             PrismError::CircularInvolved { operand } => {
                 write!(f, "{operand} has a circular cross-section (arc, Phase 3c)")

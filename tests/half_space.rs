@@ -12,7 +12,7 @@ use archi_kernel::brep::Brep;
 use archi_kernel::build::extrude;
 use archi_kernel::csg::Profile2d;
 use archi_kernel::geom::{CurveGeom, VertexGeom};
-use archi_kernel::section::section;
+use archi_kernel::section::{section, SectionEdge};
 use archi_kernel::topo::arena::Id;
 use archi_kernel::topo::{Face, HalfEdge, Loop, Sense, Shell, Solid, Vertex};
 use archi_kernel::{Line3, Plane, Point3, Tol, ValidateLevel, Vec3};
@@ -640,17 +640,12 @@ fn cylinder_oblique_cut_ellipse_cap() {
     assert!(found_ellipse, "cap must be bounded by ellipse arcs");
 }
 
-// KNOWN LIMITATION (reported): the axis-parallel chord cut of a cylinder is not
-// yet watertight. The cut correctly splits the bulging arcs along the ruling
-// lines, but the kept-verbatim half-cylinder face and the split faces do not
-// always reproduce matching sibling seam/rim arcs, so `validate(Full)` reports
-// MissingSibling. The other cylinder cuts (perpendicular → circle cap, oblique →
-// ellipse cap) and all planar cuts are watertight. This case is left as
-// `#[ignore]` until the verbatim/split seam reconciliation is finished; it does
-// not affect the Phase 3a foundation (the difference boolean and section drawing
-// build on the planar and perpendicular paths first).
+// The axis-parallel chord cut of a cylinder: the cut splits the bulging rim arcs
+// along the ruling lines (any number of ruling portals per face), keeps the
+// segment-side arcs and disk-cap segments, and seals the opening with a
+// rectangular bow-cap. The circular-segment disk caps integrate exactly via the
+// arc-corrected planar area in `mass/volume.rs`.
 #[test]
-#[ignore = "axis-parallel cylinder chord cut: seam reconciliation incomplete (known limitation)"]
 fn cylinder_axis_parallel_chord_cut() {
     let tol = Tol::default();
     let radius = 0.3_f64;
@@ -707,6 +702,42 @@ fn section_of_cube_is_single_square_loop() {
     // The 2-D area of the section equals the cross-section: 2 × 2 = 4.
     let area = shoelace(&outline.outer.points_2d).abs();
     assert!((area - 4.0_f64).abs() < VOL_EPS, "section area {area}");
+}
+
+#[test]
+fn section_of_circular_column_is_arc_loop() {
+    // A round member: a circular column sectioned perpendicular to its axis must
+    // yield a loop of circular arcs (not a silently-dropped None). The cut splits
+    // the rim at the seam, so the section is two semicircular arcs.
+    let tol = Tol::default();
+    let radius = 0.25_f64;
+    let profile = Profile2d::circle(radius).expect("circle");
+    let brep = extrude(&profile, &z_axis(), 2.0, &tol).expect("column");
+    let solid = brep.solids[0];
+
+    let sec_plane = plane(Point3::new(0.0, 0.0, 1.0), Vec3::Z);
+    let loops = section(&brep, solid, &sec_plane, &tol).expect("section");
+
+    assert_eq!(loops.outlines.len(), 1usize, "one outline");
+    assert_eq!(loops.loop_count(), 1usize, "one loop (the round outline)");
+    let outline = &loops.outlines[0];
+    assert!(outline.holes.is_empty(), "solid column has no holes");
+
+    // Every boundary edge is a circular arc of the column radius.
+    assert!(
+        !outline.outer.edges.is_empty(),
+        "the round section must expose its arc edges"
+    );
+    for e in &outline.outer.edges {
+        match e {
+            SectionEdge::Arc { radius: r, .. } => assert!(
+                (r - radius).abs() < VOL_EPS_CURVED,
+                "arc radius {r} should be the column radius {radius}"
+            ),
+            SectionEdge::Line { .. } => panic!("a circular section must be arcs, not segments"),
+            _ => panic!("unexpected section edge variant"),
+        }
+    }
 }
 
 #[test]
