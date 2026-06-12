@@ -1,8 +1,18 @@
 # archi-kernel
 
-A domain-specific B-rep geometry kernel for building simulation, written in Rust with zero runtime dependencies (one exception: Shewchuk's exact predicates via the `robust` crate, isolated behind a single predicate facade).
+**日本語版は [README.ja.md](README.ja.md) へ。** 設計方針・調査記録・ロードマップは [DESIGN.md](DESIGN.md)(日本語)。
 
-設計方針・調査記録・ロードマップは [DESIGN.md](DESIGN.md)(日本語)を参照。
+A domain-specific B-rep geometry kernel for building simulation, written in Rust with zero runtime dependencies (one exception: Shewchuk's exact predicates via the `robust` crate, isolated behind a single predicate facade). Runs natively and in the browser via WebAssembly.
+
+<p align="center">
+  <img src="assets/hero.png" alt="A two-storey RC frame — columns, clipped girders, slabs with openings and a round column — evaluated by the kernel and rendered in the Three.js viewer" width="850">
+</p>
+
+<p align="center">
+  <img src="assets/section.png" alt="The same model cut by a horizontal section plane: vermilion caps and outlines are computed by the kernel's closed-form section(), not by screen-space clipping tricks" width="850">
+</p>
+
+*Both images are the bundled Three.js viewer rendering the kernel's own output: watertight tessellation for the solids, and closed-form `section()` profiles (vermilion caps and outlines) for the cut — every opening, notch and round face you see was produced by the kernel's booleans.*
 
 ## The thesis
 
@@ -28,6 +38,9 @@ CSG tree (source of truth)         B-rep (derived, disposable)
    edits propagate                          │ Euler, sibling pairing,
    along the DAG                            ▼ watertight — first-class API
                                     sections / mass / tess / clash
+                                            │ flat arrays (wasm boundary)
+                                            ▼
+                                    Three.js viewer (viewer/)
 ```
 
 - **The CSG tree is the document; the B-rep is a cache.** Evaluation is push-dirty / pull-clean at member granularity, keyed by tolerance, with the previous valid B-rep retained for display fallback. A failed boolean is a member-local, machine-readable `EvalError` — never corrupted geometry, never a silent wrong answer. Anything the 2.5-D path cannot handle says so explicitly (`Unsupported3dBoolean`, `PotentialClash`, `UnsupportedArcDegeneracy`).
@@ -35,18 +48,33 @@ CSG tree (source of truth)         B-rep (derived, disposable)
 - **Validation is part of evaluation, not an afterthought.** `validate()` checks the Euler characteristic *with the ring term* (`V − E + F − (L − F) = 2(S − G)` — a wall with a window breaks the ring-free formula immediately), sibling-pair completeness (same curve, reversed parameter boundary), loop continuity, and geometric coherence. Volume identities (`V(A−B) + V(A∩B) = V(A)`) are property-tested across thousands of randomized configurations, including arcs and clip paths.
 - **Semantic nodes carry domain meaning.** `OpeningSubtraction` (an IFC `IfcRelVoidsElement` analogue) is distinct from generic `Difference` so formwork areas can be computed by tree walk; `Clip` expresses priority deduction (column over girder) and is evaluated as one flat set-theoretic expression `base ∧ ¬openings ∧ ¬clippers` in a single arrangement — idempotent, so no double deduction. The model-level DAG re-evaluates dependents when a clipped member moves and isolates dependency cycles to exactly the members involved.
 
-## Status (v0.3.0 — roadmap Phases 0–7 implemented)
+## The viewer (Three.js + wasm)
+
+`viewer/` is a no-build-step web app: the kernel compiled to WebAssembly (`wasm/`, thin `wasm-bindgen` adapter — flat typed arrays for geometry, the kernel's serde JSON for everything structured) plus an ES-module Three.js scene. The demo constructs a two-storey RC frame *as a CSG model in JavaScript* — columns, girders clipped to columns with priority rules, slabs deducted by girders with a stair opening and a round duct, a wall with windows, a round column, sleeved beams — and lets the kernel do the rest: evaluation, watertight meshing, live section planes with kernel-computed caps, and a running concrete-volume total in the HUD.
+
+```bash
+rustup target add wasm32-unknown-unknown   # once
+cargo install wasm-pack                    # once
+wasm-pack build wasm --target web --out-dir ../viewer/pkg --release
+cd viewer && python3 -m http.server 8741
+# open http://localhost:8741 — drag to orbit, toggle 断面 to cut the model live
+```
+
+The section slider is an honest demo of the kernel: every time you move it, the viewer calls `section_all()` and rebuilds the vermilion caps from the returned closed-form profiles (with holes and arcs), while Three.js clipping merely hides the geometry above the plane.
+
+## Status (v0.3.x — roadmap Phases 0–7 implemented)
 
 - Analytic primitives + closed-form intersections; self-contained math module; panic-free `Result` constructors; `#[non_exhaustive]` enums; optional `serde`
 - Half-edge topology on generational arenas; canonical plane store; first-class validation
 - Extrusion of rectangular / H-section / circular profiles along arbitrary axes
 - Solid × half-space cut (closed-form edge splitting, coplanar lid rules, multi-loop and annulus caps, connected-component splitting)
 - 2.5-D prismatic difference / union / intersection (segments + arcs), N-operand opening batching, priority clips, complexity budgets and local failure isolation
-- Sections: plan/elevation profiles with hole nesting, arc edges, fixed coplanar-face convention, per-member error isolation
+- Sections: plan/elevation profiles with hole nesting, arc edges (traversal-ordered signed sweeps), fixed coplanar-face convention, per-member error isolation
 - Mass & quantity take-off: exact volumes (incl. oblique elliptical cylinder patches), centroids, formwork side/bottom split with opening deduction and column-contact exclusion (公共建築数量積算基準)
 - Watertight tessellation (per-curve discretisation shared between siblings; every mesh edge verified to appear in exactly two opposite triangles); flat arrays for Three.js / FEM
-- Clash detection (AABB broad phase → exact prismatic intersection volume; honest `PotentialClash` degradation) and sleeve rule checks (diameter / end-distance / edge-distance against the member's CSG openings)
-- ~280 tests: hand-computed analytic references, adversarial degeneracy suites (32 regression tests born from an adversarial review that found and fixed 10 real defects), >1,000-case volume-identity property tests
+- Clash detection (AABB broad phase → exact prismatic intersection volume; honest `PotentialClash` degradation) and sleeve rule checks
+- wasm bindings + Three.js viewer (this page's screenshots)
+- ~290 tests: hand-computed analytic references, adversarial degeneracy suites (born from an adversarial review that found and fixed 10 real defects — and a viewer that immediately found two more), >1,000-case volume-identity property tests
 
 Out of scope, by design, until real data demands them: general 3-D booleans between non-prismatic pairs (explicit error today), cylinder × cylinder, exact plane arithmetic (the data structures reserve the seam — `VertexGeom` is an open enum and predicates accept implicit points — but the investment waits for measured failure rates).
 
@@ -90,7 +118,7 @@ assert!((q.concrete_volume - 5.5 * 0.4 * 0.6).abs() < 1e-9); // inner-clear 5.5 
 // the column-contact end faces carry no formwork.
 ```
 
-Sections (`section::section`), meshes (`tess::tessellate`) and clash reports (`clash::clash_check`) read off the same evaluated model.
+Sections (`section::section`), meshes (`tess::tessellate`) and clash reports (`clash::clash_check`) read off the same evaluated model — natively or through the wasm bindings.
 
 ## Development
 
