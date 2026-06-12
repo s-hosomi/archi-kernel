@@ -13,6 +13,10 @@ A domain-specific B-rep geometry kernel for building simulation, written in Rust
 </p>
 
 <p align="center">
+  <b><a href="https://s-hosomi.github.io/archi-kernel/">▶ Live demo</a></b> — the kernel running as wasm in your browser
+</p>
+
+<p align="center">
   <img src="assets/section-sweep.gif?v=2" alt="The section plane sweeping down through the model: every frame's vermilion caps and outlines are recomputed by the kernel's closed-form section() — wall windows, the round column and slab voids appear and vanish as the plane passes them" width="850">
 </p>
 
@@ -65,7 +69,7 @@ rustup target add wasm32-unknown-unknown   # once
 cargo install wasm-pack                    # once
 wasm-pack build wasm --target web --out-dir ../viewer/pkg --release
 cd viewer && python3 -m http.server 8741
-# open http://localhost:8741 — drag to orbit, toggle 断面 to cut the model live
+# open http://localhost:8741 — drag to orbit, toggle "section" to cut the model live
 ```
 
 The section slider is an honest demo of the kernel: every time you move it, the viewer calls `section_all()` and rebuilds the vermilion caps from the returned closed-form profiles (with holes and arcs), while Three.js clipping merely hides the geometry above the plane.

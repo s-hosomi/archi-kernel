@@ -13,6 +13,10 @@
 </p>
 
 <p align="center">
+  <b><a href="https://s-hosomi.github.io/archi-kernel/">▶ ライブデモ</a></b> — wasm 化したカーネルがブラウザ上でそのまま動きます
+</p>
+
+<p align="center">
   <img src="assets/section-sweep.gif?v=2" alt="断面平面を上から下へスイープする様子。朱色のキャップと輪郭は毎フレーム、カーネルの閉形式 section() で計算し直している" width="850">
 </p>
 
