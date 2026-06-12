@@ -15,7 +15,7 @@ v0.1.0 — Phase 0 of the roadmap:
 - Closed-form intersections: plane × plane, plane × cylinder (all five cases), line × plane
 - Verification tests against hand-computed analytic solutions
 
-Planned next (see [DESIGN.md](DESIGN.md) §6): half-edge topology → extruded solids → boolean difference → section cuts → mass properties → tessellation.
+Planned next (see [DESIGN.md](DESIGN.md) §10): API hygiene (v0.2.0) → half-edge topology → extruded solids → half-space cuts → boolean difference (2.5D-first) → section drawings → mass properties / quantity takeoff → tessellation.
 
 ## Usage
 
