@@ -29,10 +29,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::boolean::poly2d::geom::{orient2d, Arc, Edge2, Orient, Point2};
+use crate::boolean::poly2d::geom::{directed_sweep, orient2d, Arc, Edge2, Orient, Point2};
 use crate::boolean::poly2d::intersect::intersect;
 use crate::boolean::poly2d::snap::{VertexId, VertexStore};
 use crate::boolean::poly2d::{Contour, Poly2Error, Region};
+use crate::boolean::support::quantize;
 use crate::tolerance::Tol;
 
 use super::error::PrismError;
@@ -380,11 +381,11 @@ fn geom_key_for(pa: Point2, pb: Point2, geom: &EdgeGeom) -> GeomKey {
                 center.y + radius * (sa + 0.5 * sweep).sin(),
             );
             GeomKey::Arc {
-                cx: (center.x * 1e9).round() as i64,
-                cy: (center.y * 1e9).round() as i64,
-                r: (radius * 1e9).round() as i64,
-                mx: (mid.x * 1e9).round() as i64,
-                my: (mid.y * 1e9).round() as i64,
+                cx: quantize(center.x),
+                cy: quantize(center.y),
+                r: quantize(*radius),
+                mx: quantize(mid.x),
+                my: quantize(mid.y),
             }
         }
     }
@@ -404,17 +405,6 @@ fn canonical_geom(geom: EdgeGeom, forward: bool) -> EdgeGeom {
             radius,
             ccw: if forward { ccw } else { !ccw },
         },
-    }
-}
-
-/// Signed sweep from `pa` to `pb` about `center` in the `ccw` direction.
-fn directed_sweep(center: Point2, pa: Point2, pb: Point2, ccw: bool) -> f64 {
-    let aa = (pa.y - center.y).atan2(pa.x - center.x);
-    let ab = (pb.y - center.y).atan2(pb.x - center.x);
-    if ccw {
-        (ab - aa).rem_euclid(std::f64::consts::TAU)
-    } else {
-        -((aa - ab).rem_euclid(std::f64::consts::TAU))
     }
 }
 

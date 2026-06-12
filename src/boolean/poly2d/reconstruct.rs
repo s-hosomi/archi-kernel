@@ -26,6 +26,7 @@ use crate::boolean::poly2d::arrangement::FaceLoop;
 use crate::boolean::poly2d::geom::{Arc, Edge2, Point2, Vec2};
 use crate::boolean::poly2d::region::{Contour, Region};
 use crate::boolean::poly2d::snap::{VertexId, VertexStore};
+use crate::boolean::support::quantize;
 use crate::tolerance::Tol;
 
 /// A directed boundary edge of the result, carrying enough geometry to emit an
@@ -128,11 +129,11 @@ fn geom_key(edge: &Edge2) -> GeomKey {
         Edge2::Arc(a) => {
             let mid = a.mid_point();
             GeomKey::Arc {
-                cx: (a.center.x * 1e9).round() as i64,
-                cy: (a.center.y * 1e9).round() as i64,
-                r: (a.radius * 1e9).round() as i64,
-                mx: (mid.x * 1e9).round() as i64,
-                my: (mid.y * 1e9).round() as i64,
+                cx: quantize(a.center.x),
+                cy: quantize(a.center.y),
+                r: quantize(a.radius),
+                mx: quantize(mid.x),
+                my: quantize(mid.y),
             }
         }
     }

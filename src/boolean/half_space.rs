@@ -65,7 +65,8 @@ use crate::topo::validate::ValidateLevel;
 use crate::topo::{Face, HalfEdge, Loop, Sense, Shell, Solid, Vertex};
 
 use super::support::{
-    key, loop_signed_area_2d, point_in_polygon, quantize, signed_area_2d, CoordKey, PlaneFrame,
+    key, loop_signed_area_2d, point_in_polygon, quantize, signed_area_2d, uf_find, uf_union,
+    CoordKey, PlaneFrame,
 };
 
 /// A section connector leaving a vertex: `(far vertex, far point, near point)`.
@@ -384,8 +385,6 @@ impl<'a> Cutter<'a> {
     /// geometrically disconnected (disjoint flange strips, separated pieces)
     /// splits cleanly here into one solid per component.
     ///
-    /// (Mirrors `prismatic/build.rs::connected_components`; kept local while the
-    /// shared refactor is deferred.)
     fn connected_components(&self) -> Vec<Vec<Id<Face>>> {
         let nf = self.faces.len();
         // Map an undirected edge (curve, unordered boundary params) to its faces.
@@ -404,35 +403,24 @@ impl<'a> Cutter<'a> {
                     let Some(he) = self.out.topo.half_edges.get(he_id) else {
                         continue;
                     };
-                    let q = |x: f64| (x * 1.0e9_f64).round() as i64;
-                    let (a, b) = (q(he.boundary[0]), q(he.boundary[1]));
+                    let (a, b) = (quantize(he.boundary[0]), quantize(he.boundary[1]));
                     let key = (he.curve, a.min(b), a.max(b));
                     edge_faces.entry(key).or_default().push(fi);
                 }
             }
         }
 
-        // Union-find over faces.
+        // Union-find over faces (shared helper from support).
         let mut parent: Vec<usize> = (0..nf).collect();
-        fn find(parent: &mut [usize], mut x: usize) -> usize {
-            while parent[x] != x {
-                parent[x] = parent[parent[x]];
-                x = parent[x];
-            }
-            x
-        }
         for faces in edge_faces.values() {
             for w in faces.windows(2) {
-                let (a, b) = (find(&mut parent, w[0]), find(&mut parent, w[1]));
-                if a != b {
-                    parent[a] = b;
-                }
+                uf_union(&mut parent, w[0], w[1]);
             }
         }
 
         let mut groups: HashMap<usize, Vec<Id<Face>>> = HashMap::new();
         for fi in 0..nf {
-            let root = find(&mut parent, fi);
+            let root = uf_find(&mut parent, fi);
             groups.entry(root).or_default().push(self.faces[fi]);
         }
         groups.into_values().collect()
@@ -1953,7 +1941,7 @@ impl<'a> Cutter<'a> {
         // Bucket portals by ruling (quantised `w`).
         let mut rulings: HashMap<i64, Vec<(Id<Vertex>, Point3)>> = HashMap::new();
         for &(v, p) in &pts {
-            let wq = (w_of(p) * 1.0e9_f64).round() as i64;
+            let wq = quantize(w_of(p));
             rulings.entry(wq).or_default().push((v, p));
         }
         // 2-D outline of the face on the cut plane is not available (the face is
@@ -2358,7 +2346,12 @@ impl<'a> Cutter<'a> {
 
 use crate::geom::SurfaceId;
 
-/// `true` for a sign strictly on the kept side (On excluded).
+/// `true` for a sign strictly on the kept side (`Sign3::On` excluded).
+///
+/// Use this for classifying individual vertices or faces where the "on the
+/// cutting plane" case must be handled separately. For edge-keep decisions,
+/// prefer [`is_dropped`]: `!is_dropped(a) && !is_dropped(b)` admits `On`
+/// endpoints as kept (coincident boundary edges are preserved).
 fn is_strictly_kept(sign: Sign3, keep: KeepSide) -> bool {
     matches!(
         (keep, sign),
@@ -2610,7 +2603,13 @@ impl From<&BoundaryNode> for KeptNode {
     }
 }
 
-/// `true` for a sign strictly on the dropped side.
+/// `true` for a sign strictly on the dropped side (`Sign3::On` excluded).
+///
+/// This is **not** the negation of [`is_strictly_kept`]: `Sign3::On` is a
+/// neutral zone — neither strictly kept nor dropped. Using
+/// `!is_dropped(a) && !is_dropped(b)` for an edge test admits `On` endpoints
+/// as kept, so an On–On coincident-boundary edge is preserved rather than
+/// silently discarded.
 fn is_dropped(sign: Sign3, keep: KeepSide) -> bool {
     matches!(
         (keep, sign),

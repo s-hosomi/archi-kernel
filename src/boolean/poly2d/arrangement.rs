@@ -33,10 +33,13 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::boolean::poly2d::error::Poly2Error;
-use crate::boolean::poly2d::geom::{eps_sq, orient2d, Arc, Edge2, Orient, Point2, Vec2};
+use crate::boolean::poly2d::geom::{
+    directed_sweep, eps_sq, orient2d, Arc, Edge2, Orient, Point2, Vec2,
+};
 use crate::boolean::poly2d::intersect::intersect;
 use crate::boolean::poly2d::region::{Contour, Region};
 use crate::boolean::poly2d::snap::{VertexId, VertexStore};
+use crate::boolean::support::quantize;
 use crate::tolerance::Tol;
 
 /// Which operand an input edge came from.
@@ -469,30 +472,13 @@ fn geom_key_for(pa: Point2, pb: Point2, geom: &EdgeGeom) -> GeomKey {
                 center.y + radius * (sa + 0.5 * sweep).sin(),
             );
             GeomKey::Arc {
-                cx: (center.x * 1e9).round() as i64,
-                cy: (center.y * 1e9).round() as i64,
-                r: (radius * 1e9).round() as i64,
-                mx: (mid.x * 1e9).round() as i64,
-                my: (mid.y * 1e9).round() as i64,
+                cx: quantize(center.x),
+                cy: quantize(center.y),
+                r: quantize(*radius),
+                mx: quantize(mid.x),
+                my: quantize(mid.y),
             }
         }
-    }
-}
-
-/// The signed sweep (radians) from `pa` to `pb` about `center`, in the direction
-/// given by `ccw`, folded into `(−2π, 2π)` with the requested sign. The result
-/// is the arc's central angle as actually traversed.
-fn directed_sweep(center: Point2, pa: Point2, pb: Point2, ccw: bool) -> f64 {
-    let aa = (pa.y - center.y).atan2(pa.x - center.x);
-    let ab = (pb.y - center.y).atan2(pb.x - center.x);
-    if ccw {
-        let mut d = ab - aa;
-        d = d.rem_euclid(std::f64::consts::TAU);
-        d
-    } else {
-        let mut d = aa - ab;
-        d = d.rem_euclid(std::f64::consts::TAU);
-        -d
     }
 }
 

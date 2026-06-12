@@ -72,12 +72,13 @@ impl PlaneFrame {
     }
 }
 
-/// Exact signed area of a simple 2-D polygon given by its vertices.
+/// Signed area of a simple 2-D polygon given by its vertices (shoelace formula).
 ///
-/// Positive for counter-clockwise winding, negative for clockwise. The
-/// accumulation reuses the same fan decomposition as the volume integral, but
-/// each triangle's contribution is summed from `orient2d`'s exact determinant so
-/// the winding sign is never lost to round-off.
+/// Positive for counter-clockwise winding, negative for clockwise. This is a
+/// naive floating-point shoelace implementation — **not** an exact-arithmetic
+/// computation. Round-off can affect the result for nearly-degenerate polygons,
+/// but the sign is reliable for well-conditioned inputs encountered in practice
+/// (building-scale geometry in SI metres).
 pub(crate) fn signed_area_2d(poly: &[[f64; 2]]) -> f64 {
     let n = poly.len();
     if n < 3 {
@@ -90,6 +91,25 @@ pub(crate) fn signed_area_2d(poly: &[[f64; 2]]) -> f64 {
         acc += a[0] * b[1] - b[0] * a[1];
     }
     acc / 2.0_f64
+}
+
+/// Union-find: find with path halving.
+#[inline]
+pub(crate) fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+/// Union-find: union by root.
+#[inline]
+pub(crate) fn uf_union(parent: &mut [usize], a: usize, b: usize) {
+    let (ra, rb) = (uf_find(parent, a), uf_find(parent, b));
+    if ra != rb {
+        parent[ra] = rb;
+    }
 }
 
 /// `true` if the 2-D point `p` lies strictly inside the simple polygon `poly`.

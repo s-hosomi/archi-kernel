@@ -389,6 +389,23 @@ impl Edge2 {
     }
 }
 
+/// The signed sweep (radians) from `pa` to `pb` about `center`, in the direction
+/// given by `ccw`, folded into `(−2π, 2π)` with the requested sign. The result
+/// is the arc's central angle as actually traversed.
+///
+/// Positive for CCW arcs, negative for CW arcs. The magnitude equals the
+/// central angle in `[0, 2π)`.
+#[inline]
+pub(crate) fn directed_sweep(center: Point2, pa: Point2, pb: Point2, ccw: bool) -> f64 {
+    let aa = (pa.y - center.y).atan2(pa.x - center.x);
+    let ab = (pb.y - center.y).atan2(pb.x - center.x);
+    if ccw {
+        (ab - aa).rem_euclid(std::f64::consts::TAU)
+    } else {
+        -((aa - ab).rem_euclid(std::f64::consts::TAU))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

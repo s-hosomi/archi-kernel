@@ -46,7 +46,7 @@ use std::collections::HashMap;
 
 use crate::boolean::poly2d::snap::VertexId;
 use crate::boolean::poly2d::Op;
-use crate::boolean::support::{key, CoordKey};
+use crate::boolean::support::{key, quantize, uf_find, uf_union, CoordKey};
 use crate::brep::Brep;
 use crate::geom::{CurveGeom, CurveId, SurfaceGeom, VertexGeom};
 use crate::math::{Point3, Unit3, Vec3};
@@ -356,11 +356,12 @@ struct Band {
 
 /// Compute the axial bands.
 ///
-/// Breakpoints are every operand interval endpoint merged within `tol`; each
-/// resulting band records which operands it lies inside. Bands are kept whenever
-/// the first operand (the base / positive side) is present, since the combining
-/// rule only ever keeps material there — an empty band would emit no faces
-/// anyway, so this prune is just an optimisation.
+/// Breakpoints are every operand interval endpoint merged within `tol`. Between
+/// each pair of consecutive breakpoints a band `[z0, z1]` is created (zero-width
+/// bands are skipped). Each band records a `present[i]` flag for every operand:
+/// whether the band's midpoint lies inside that operand's axial interval. The
+/// keep/discard decision is made by the caller (`build_combined`'s `keep`
+/// closure) based on these flags; no pruning is done here.
 fn bands(operands: &[PrismOperand], tol: &Tol) -> Vec<Band> {
     let mut bps: Vec<f64> = Vec::with_capacity(operands.len() * 2);
     for o in operands {
@@ -468,23 +469,6 @@ struct FaceSpec {
 #[inline]
 fn nbands_for(bands: &[Band]) -> usize {
     bands.len().max(1)
-}
-
-/// Union-find find with path halving.
-fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
-    while parent[x] != x {
-        parent[x] = parent[parent[x]];
-        x = parent[x];
-    }
-    x
-}
-
-/// Union-find union.
-fn uf_union(parent: &mut [usize], a: usize, b: usize) {
-    let (ra, rb) = (uf_find(parent, a), uf_find(parent, b));
-    if ra != rb {
-        parent[ra] = rb;
-    }
 }
 
 /// Undirected key of an arrangement edge, by its endpoint vertex-id pair.
@@ -1232,10 +1216,7 @@ impl<'a> ComponentBuilder<'a> {
 
     /// Intern a circle curve by its centre + radius key.
     fn circle_curve(&mut self, circle: Circle3) -> CurveId {
-        let k: CircleKey = (
-            key(circle.center()),
-            (circle.radius() * 1.0e9_f64).round() as i64,
-        );
+        let k: CircleKey = (key(circle.center()), quantize(circle.radius()));
         if let Some(&cid) = self.circle_by_key.get(&k) {
             return cid;
         }
