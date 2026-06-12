@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>archi-kernel viewer</title>
+  <style>
+    :root {
+      --ink: #23262b;
+      --paper: #edebe6;
+      --accent: #e04f2e;
+    }
+    html, body { margin: 0; height: 100%; background: var(--paper); }
+    #view { width: 100%; height: 100%; display: block; }
+    .card {
+      position: absolute;
+      font-family: "Avenir Next", "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
+      color: var(--ink);
+      background: rgba(255, 255, 254, 0.72);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      border: 1px solid rgba(35, 38, 43, 0.08);
+      border-radius: 14px;
+      box-shadow: 0 6px 24px rgba(35, 38, 43, 0.08);
+      padding: 14px 18px;
+    }
+    #hud { top: 18px; left: 18px; max-width: 340px; opacity: 0; transition: opacity .6s; }
+    #hud.ready { opacity: 1; }
+    #hud h1 { font-size: 17px; margin: 0 0 2px; letter-spacing: .02em; }
+    #hud h1 .accent { color: var(--accent); }
+    #hud .sub { font-size: 11px; color: #6b6f76; margin-bottom: 8px; }
+    #hud-stats { font-size: 12px; line-height: 1.7; color: #3a3e45; }
+    #hud-hint { font-size: 11px; color: #8a8e95; margin-top: 8px; }
+    #panel { bottom: 18px; left: 50%; transform: translateX(-50%);
+             display: flex; gap: 14px; align-items: center; padding: 10px 18px; }
+    #panel label { font-size: 12.5px; display: flex; gap: 7px; align-items: center; cursor: pointer; }
+    #panel input[type="range"] { width: 180px; accent-color: var(--accent); }
+    #panel input[type="checkbox"] { accent-color: var(--accent); }
+    #section-z-label { font-size: 12px; color: #6b6f76; min-width: 76px; font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <canvas id="view"></canvas>
+
+  <div id="hud" class="card">
+    <h1>archi-kernel <span class="accent">viewer</span></h1>
+    <div class="sub">建築特化 B-rep カーネル — CSG 正本 / 閉形式交差 / watertight メッシュ</div>
+    <div id="hud-stats">loading wasm…</div>
+    <div id="hud-hint">drag: orbit / scroll: zoom — 断面は下のスライダーで(キャップと輪郭はカーネルの閉形式 section() の出力)</div>
+  </div>
+
+  <div id="panel" class="card">
+    <label><input type="checkbox" id="section-toggle" /> 断面 section</label>
+    <input type="range" id="section-z" min="0.2" max="6.9" step="0.05" value="1.5" />
+    <span id="section-z-label">z = 1.50 m</span>
+  </div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

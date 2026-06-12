@@ -1,0 +1,9 @@
+{
+  "name": "archi-kernel-viewer",
+  "private": true,
+  "type": "module",
+  "description": "Three.js viewer for archi-kernel (wasm). playwright is only used by shot.mjs to take README screenshots.",
+  "devDependencies": {
+    "playwright": "^1.60.0"
+  }
+}
