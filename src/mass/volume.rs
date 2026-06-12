@@ -256,17 +256,37 @@ fn planar_loop_integral(brep: &Brep, loop_id: crate::topo::arena::Id<Loop>, n_ou
         let Some(he) = brep.topo.half_edges.get(he_id) else {
             continue;
         };
-        if let Some(CurveGeom::Circle(c)) = brep.geom.curve(he.curve) {
-            let r = c.radius();
-            // Signed central angle of the arc as traversed (boundary[0]→[1]),
-            // about the circle's own normal.
-            let dtheta = he.boundary[1] - he.boundary[0];
-            // Orient about n̂: the circle normal may agree or oppose n_out.
-            let about = c.normal().as_vec().dot(n_out);
-            let sign = if about >= 0.0 { 1.0 } else { -1.0 };
-            let seg = 0.5 * r * r * (dtheta - dtheta.sin());
-            let d = (c.center() - Point3::origin()).dot(n_out);
-            integral += d * sign * seg;
+        match brep.geom.curve(he.curve) {
+            Some(CurveGeom::Circle(c)) => {
+                let r = c.radius();
+                // Signed central angle of the arc as traversed (boundary[0]→[1]),
+                // about the circle's own normal.
+                let dtheta = he.boundary[1] - he.boundary[0];
+                // Orient about n̂: the circle normal may agree or oppose n_out.
+                let about = c.normal().as_vec().dot(n_out);
+                let sign = if about >= 0.0 { 1.0 } else { -1.0 };
+                let seg = 0.5 * r * r * (dtheta - dtheta.sin());
+                let d = (c.center() - Point3::origin()).dot(n_out);
+                integral += d * sign * seg;
+            }
+            Some(CurveGeom::Ellipse(e)) => {
+                // An ellipse arc bulges off its chord by an *elliptical* segment.
+                // In the ellipse's own (a·cos t, b·sin t) frame the swept-minus-
+                // triangle area is ½ab(Δt − sinΔt), the affine image of the
+                // circular segment (the same correction `face_area` applies). The
+                // planar integral gains `d · segment_area`, `d` the plane offset
+                // `x · n̂`. A face with an *ellipse-arc* boundary (the oblique cut's
+                // `[E, L, E, L]` cap) would otherwise drop this lens area.
+                let a = e.semi_major();
+                let b = e.semi_minor();
+                let dt = he.boundary[1] - he.boundary[0];
+                let about = e.normal().as_vec().dot(n_out);
+                let sign = if about >= 0.0 { 1.0 } else { -1.0 };
+                let seg = 0.5 * a * b * (dt - dt.sin());
+                let d = (e.center() - Point3::origin()).dot(n_out);
+                integral += d * sign * seg;
+            }
+            _ => {}
         }
     }
     integral
@@ -384,6 +404,12 @@ fn ellipse_signed_sweep(brep: &Brep, loop_id: crate::topo::arena::Id<Loop>, n_ou
 ///   one *ellipse* rim (the cut). The ellipse's own plane is the cut plane, from
 ///   which the angle-dependent upper height `z₁(φ)` is recovered and the patch
 ///   integral [`oblique_patch_integral`] is evaluated.
+/// * **Steep oblique patch** — a steep cut digs past the bottom rim, clipping the
+///   bottom circle with an axial chord (a `Line` ruling) into *two* arcs, so the
+///   outer loop is `[Circle, Line, Circle, Ellipse]`. Both circle arcs rise to
+///   the same cut plane (the lone ellipse's plane); the axial line ruling has no
+///   angular extent and contributes nothing, so the patch integral is the sum of
+///   [`oblique_patch_integral`] over the two circle-arc intervals.
 ///
 /// Returns `None` for any other cylinder face (no recognisable rim pair), so the
 /// caller can report it rather than silently treat it as zero.
@@ -444,8 +470,83 @@ fn cylinder_face_integral(
             let cut_plane = Plane::new(ell.center(), ell.normal().as_vec()).ok()?;
             oblique_patch_integral(bottom_centre, u, v, axis_vec, r, phi0, phi1, &cut_plane)
         }
+        // ── Steep oblique patch: the cut plane is steep enough that only part of
+        // the patch reaches it; the rest still rises to the flat top rim. The
+        // outer loop is `[Circle(bottom), Line, Circle(top), Ellipse]` (`[C,L,C,E]`).
+        // The bottom circle is the shared lower rim (`z = 0`); the patch is split
+        // by the two axial `Line` rulings into an angular sub-region capped by the
+        // flat **top** circle (constant height `L`) and one capped by the
+        // **ellipse** (the oblique cut). Each `Line` ruling has zero angular extent
+        // and contributes nothing. Integrate each upper rim over its own angular
+        // span, anchored at the bottom circle, using that rim's own plane as the
+        // upper bound (the top circle's horizontal plane, or the ellipse's cut
+        // plane). The straight `(2,0)` and oblique `(1,1)` cases are the
+        // degenerate single-rim instances of this.
+        (2, 1) => {
+            // The lower of the two circles is the shared bottom rim; the other is
+            // the flat top rim that still caps part of the patch.
+            let (bottom, top) = if proj(circles[0].2.center()) <= proj(circles[1].2.center()) {
+                (circles[0], circles[1])
+            } else {
+                (circles[1], circles[0])
+            };
+            let bottom_centre = bottom.2.center();
+            // The bottom rim is the patch's full angular extent, traversed in its
+            // stored orientation `a_b → b_b` (the outward orientation the planar /
+            // single-rim cases also rely on). It is split by the two axial `Line`
+            // rulings into a part capped by the flat top circle and a part capped
+            // by the oblique ellipse cut. The circle rims share the cylinder's
+            // angle parameter, so the top circle's own `φ`-interval names the
+            // top-capped sub-range directly; the rest of the bottom arc is
+            // ellipse-capped. The split angle is the top-arc endpoint interior to
+            // the bottom arc.
+            let (a_b, b_b) = (bottom.0, bottom.1);
+            let (lo_b, hi_b) = (a_b.min(b_b), a_b.max(b_b));
+            let (lo_t, hi_t) = (top.0.min(top.1), top.0.max(top.1));
+            // The interior split angle: whichever top-arc end lies strictly inside
+            // the bottom arc (the other top end coincides with a bottom end).
+            let phi_split = if lo_t > lo_b + (hi_b - lo_b) * 1e-9 {
+                lo_t
+            } else {
+                hi_t
+            };
+
+            let top_plane = Plane::new(top.2.center(), axis_vec).ok()?;
+            let ell = ellipses[0].2;
+            let cut_plane = Plane::new(ell.center(), ell.normal().as_vec()).ok()?;
+
+            // Integrate each sub-interval of the bottom arc in its stored
+            // orientation, capped by the plane that bounds it (top circle vs cut
+            // ellipse), chosen by whether the sub-interval's midpoint lies within
+            // the top circle's angular span.
+            let mut total = 0.0_f64;
+            for (s, e) in oriented_split(a_b, b_b, phi_split) {
+                let mid = 0.5 * (s + e);
+                let plane = if mid >= lo_t && mid <= hi_t {
+                    &top_plane
+                } else {
+                    &cut_plane
+                };
+                total += oblique_patch_integral(bottom_centre, u, v, axis_vec, r, s, e, plane)?;
+            }
+            Some(total)
+        }
         _ => None,
     }
+}
+
+/// Split the oriented interval `a → b` at the interior angle `split`, preserving
+/// the traversal direction, into the two oriented sub-intervals `[a, split]` and
+/// `[split, b]`. If `split` is not strictly interior, the single interval
+/// `[a, b]` is returned unchanged.
+fn oriented_split(a: f64, b: f64, split: f64) -> Vec<(f64, f64)> {
+    let (lo, hi) = (a.min(b), a.max(b));
+    if split <= lo || split >= hi {
+        return vec![(a, b)];
+    }
+    // `[a, split]` then `[split, b]` preserves the `a → b` direction whether the
+    // interval increases or decreases.
+    vec![(a, split), (split, b)]
 }
 
 /// `∫ x · n̂ dA` over a cylinder patch with a circular bottom rim and an oblique

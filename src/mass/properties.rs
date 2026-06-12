@@ -2,8 +2,9 @@
 //! centroid, and the formwork-area take-off (`DESIGN.md` §6-4).
 
 use crate::brep::Brep;
-use crate::geom::SurfaceGeom;
+use crate::geom::{CurveGeom, SurfaceGeom};
 use crate::math::{Point3, Vec3};
+use crate::primitives::{plane_basis, Plane};
 use crate::tolerance::Tol;
 use crate::topo::arena::Id;
 use crate::topo::{Face, Loop};
@@ -139,9 +140,13 @@ pub struct FormworkArea {
 /// * `n·ẑ < −tol.angular` ⇒ the face faces down ⇒ `bottom`.
 /// * `n·ẑ > +tol.angular` ⇒ the face faces up ⇒ no formwork.
 ///
-/// A cylinder side face is always vertical when the cylinder axis is vertical (a
-/// round column); its area is added to `side`. The classification uses each
-/// face's *outward* normal, so [`Sense`] is honoured.
+/// A cylinder side face's outward normal is not constant, so it cannot be
+/// classified by a single value: a vertical-axis column wall is all `side`, while
+/// a horizontal-axis round beam's wall faces down on its lower half (a soffit ⇒
+/// `bottom`) and up on its upper half (no formwork). Such a face is split by the
+/// sign of the outward normal's `ẑ`-component, integrated over the patch (see
+/// [`cylinder_formwork_split`]). The classification uses each face's *outward*
+/// normal, so [`Sense`] is honoured.
 ///
 /// # Errors
 ///
@@ -161,11 +166,17 @@ pub fn formwork_area(brep: &Brep, tol: &Tol) -> Result<FormworkArea, AreaError> 
                 // nz > 0: upward face, no formwork.
             }
             None => {
-                // A cylinder face: vertical if its axis is vertical (a round
-                // column wall). Treat as side formwork in that case; otherwise
-                // its orientation varies and it is reported as unsupported via
-                // face_area already having succeeded — classify by the axis.
-                side += area;
+                // A cylinder side face. Its outward normal is not constant, so it
+                // cannot be classified by a single `nz`: a vertical column wall is
+                // all `side`, but a horizontal round beam's wall faces down on its
+                // lower half (a soffit ⇒ `bottom`) and up on its upper half (no
+                // formwork). Split the patch area by the sign of the outward
+                // normal's `ẑ`-component, integrated over the face, rather than
+                // silently dumping it all into `side`.
+                let (s, b) = cylinder_formwork_split(brep, face, area, tol)
+                    .ok_or(AreaError::UnsupportedCylinderFace)?;
+                side += s;
+                bottom += b;
             }
         }
         Ok(())
@@ -181,6 +192,170 @@ fn face_up_component(brep: &Brep, face: &Face) -> Option<f64> {
         SurfaceGeom::Plane(plane) => Some(planar_outward_normal(plane, face.sense).z),
         SurfaceGeom::Cylinder(_) => None,
     }
+}
+
+/// Split a cylinder side face's area into `(side, bottom)` formwork by the sign of
+/// its outward normal's `ẑ`-component, integrated over the patch.
+///
+/// The outward normal at angle `φ` about the cylinder's `(û, v̂)` basis is
+/// `n̂(φ) = cosφ û + sinφ v̂` (always perpendicular to the axis), so its
+/// `ẑ`-component is `nz(φ) = (û·ẑ) cosφ + (v̂·ẑ) sinφ`. The local axial height of
+/// the patch at angle `φ` is `h(φ)`: a constant `L` for a straight patch, or the
+/// cut-plane height `z₁(φ)` for an obliquely cut patch.
+///
+/// * **Vertical axis** — `û, v̂` are horizontal, so `nz ≡ 0`: the whole wall is
+///   vertical and counts as `side` (a round column).
+/// * **Non-vertical axis** — the down-facing part (`nz < 0`) of the wall is a
+///   soffit and its area `r ∫_{nz<0} h(φ) dφ` is `bottom`; the up-facing part
+///   needs no formwork; a tilted axis additionally contributes its horizontal
+///   `(nz ≈ 0)` extremes, but those are a measure-zero seam and fold into the
+///   dominant down/up split.
+///
+/// Returns `None` for a cylinder face whose rim pair is not one the closed form
+/// recognises (mirroring the area/volume integrals), so the caller reports it
+/// rather than silently misclassifying it.
+fn cylinder_formwork_split(brep: &Brep, face: &Face, area: f64, tol: &Tol) -> Option<(f64, f64)> {
+    let SurfaceGeom::Cylinder(cyl) = brep.geom.surface(face.surface)? else {
+        return None;
+    };
+    let lp = brep.topo.loops.get(face.outer)?;
+    let mut circles = Vec::new();
+    let mut ellipses = Vec::new();
+    for &he_id in &lp.half_edges {
+        let Some(he) = brep.topo.half_edges.get(he_id) else {
+            continue;
+        };
+        match brep.geom.curve(he.curve) {
+            Some(CurveGeom::Circle(c)) => circles.push((he.boundary[0], he.boundary[1], *c)),
+            Some(CurveGeom::Ellipse(e)) => ellipses.push((he.boundary[0], he.boundary[1], *e)),
+            _ => {}
+        }
+    }
+
+    let axis = cyl.axis().dir();
+    let axis_vec = axis.as_vec();
+    let r = cyl.radius();
+    let (u, v) = plane_basis(axis);
+    // nz(φ) = a_n cosφ + b_n sinφ, the outward normal's ẑ-component.
+    let a_n = u.z;
+    let b_n = v.z;
+
+    // Vertical axis: nz ≡ 0, the whole wall is vertical ⇒ all `side`. (A round
+    // column.) `nz`'s amplitude is √(a_n²+b_n²) = |sin(angle between axis and ẑ)|,
+    // so a near-zero amplitude within the angular tolerance means a vertical axis.
+    let amp = (a_n * a_n + b_n * b_n).sqrt();
+    if amp <= tol.angular {
+        return Some((area, 0.0_f64));
+    }
+
+    // Height profile h(φ) of the patch at angle φ:
+    //   straight (2 circular rims)     → constant L,
+    //   oblique  (1 circle + 1 ellipse, possibly clipped into 2 arcs) → z₁(φ).
+    enum Height {
+        Constant(f64),
+        /// z₁(φ) = k − r(p_u cosφ + p_v sinφ).
+        Oblique {
+            k: f64,
+            p_u: f64,
+            p_v: f64,
+        },
+    }
+    let (height, arcs): (Height, Vec<(f64, f64)>) = match (circles.len(), ellipses.len()) {
+        (2, 0) => {
+            let (c0, c1) = (circles[0].2.center(), circles[1].2.center());
+            let length = (c1 - c0).dot(axis_vec).abs();
+            // A straight patch's two rims share the same angular span; use either.
+            (Height::Constant(length), vec![(circles[0].0, circles[0].1)])
+        }
+        (1, 1) | (2, 1) => {
+            let ell = ellipses[0].2;
+            let cut_plane = Plane::new(ell.center(), ell.normal().as_vec()).ok()?;
+            let n_p = cut_plane.normal().as_vec();
+            let denom = n_p.dot(axis_vec);
+            if denom.abs() <= f64::EPSILON {
+                return None;
+            }
+            // All circle arcs here are arcs of the one bottom rim, so they share a
+            // centre; z₁ is anchored there.
+            let bottom_centre = circles[0].2.center();
+            let k = n_p.dot(cut_plane.point() - bottom_centre) / denom;
+            let p_u = n_p.dot(u) / denom;
+            let p_v = n_p.dot(v) / denom;
+            let spans = circles.iter().map(|&(p0, p1, _)| (p0, p1)).collect();
+            (Height::Oblique { k, p_u, p_v }, spans)
+        }
+        _ => return None,
+    };
+
+    // ∫ r·h(φ) dφ over [a, b], the patch area between angles a and b.
+    let height_integral = |a: f64, b: f64| -> f64 {
+        match &height {
+            Height::Constant(l) => r * l * (b - a),
+            Height::Oblique { k, p_u, p_v } => {
+                r * (k * (b - a) - r * (p_u * (b.sin() - a.sin()) + p_v * (a.cos() - b.cos())))
+            }
+        }
+    };
+
+    // nz(φ) = amp·cos(φ − ψ); it is < 0 exactly on (ψ + π/2, ψ + 3π/2). Integrate
+    // the patch area over each arc clipped to that down-facing band to get the
+    // soffit (`bottom`); the rest of the integrated area is up-facing (no
+    // formwork). The seam where nz = 0 has measure zero, so it needs no `side`
+    // bucket for a non-vertical axis.
+    let psi = b_n.atan2(a_n);
+    let down_lo = psi + std::f64::consts::FRAC_PI_2;
+    let down_hi = psi + 3.0_f64 * std::f64::consts::FRAC_PI_2;
+
+    let mut bottom = 0.0_f64;
+    let mut swept = 0.0_f64;
+    for &(phi0, phi1) in &arcs {
+        bottom += integrate_over_down_band(phi0, phi1, down_lo, down_hi, &height_integral);
+        swept += height_integral(phi0, phi1);
+    }
+
+    // For a non-vertical wall every patch point faces strictly up or down (the
+    // horizontal seam is a measure-zero curve), so there is **no** `side`
+    // contribution: the down-facing part is the soffit (`bottom`) and the
+    // up-facing part needs no formwork. The integrated `swept` area equals the
+    // exact `face_area` only up to closed-form rounding, so rescale `bottom` by
+    // the exact `area / swept` to anchor it to the true patch area.
+    if swept > 0.0_f64 {
+        bottom *= area / swept;
+    }
+    Some((0.0_f64, bottom))
+}
+
+/// Integrate `f` (a function returning `∫ r·h dφ` over an interval) over the part
+/// of `[phi0, phi1]` that lies in the down-facing angular band `[down_lo, down_hi]`
+/// (an interval of length `π`), accounting for the `2π` periodicity of the band.
+fn integrate_over_down_band(
+    phi0: f64,
+    phi1: f64,
+    down_lo: f64,
+    down_hi: f64,
+    f: &impl Fn(f64, f64) -> f64,
+) -> f64 {
+    use std::f64::consts::PI;
+    let two_pi = 2.0_f64 * PI;
+    // Slide the arc start into [down_lo, down_lo + 2π) and the band to the same
+    // origin, then clip [a, b] against the two band copies [down_lo, down_hi] and
+    // [down_lo + 2π, down_hi + 2π] that can overlap a ≤ 2π-long arc.
+    let shift = ((phi0 - down_lo) / two_pi).floor() * two_pi;
+    let a = phi0 - shift;
+    let b = phi1 - shift;
+    let lo = down_lo - shift; // == down_lo's representative ≤ a
+    let hi = down_hi - shift;
+    let mut total = 0.0_f64;
+    for band in [(lo, hi), (lo + two_pi, hi + two_pi)] {
+        let s = a.max(band.0);
+        let e = b.min(band.1);
+        if e > s {
+            // Map the clipped sub-interval back to the original angle frame for
+            // the height integral (which depends on absolute φ).
+            total += f(s + shift, e + shift);
+        }
+    }
+    total
 }
 
 // ── shared face walk ─────────────────────────────────────────────────────────
