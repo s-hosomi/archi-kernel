@@ -430,6 +430,43 @@ fn missing_face_breaks_watertightness() {
 }
 
 #[test]
+fn located_defect_attaches_a_coordinate() {
+    // The B-rep layer augments a topological defect with a representative world
+    // coordinate (`docs/design/progress.md`: Defect への座標付加). A missing
+    // sibling must come back with the offending half-edge's start position, and
+    // that position must be a real corner of the unit cube.
+    let tol = Tol::default();
+    let (mut brep, solid) = build_cube();
+    let shell_id = brep.topo.solids.get(solid).unwrap().shells[0];
+    let dropped = brep.topo.shells.get(shell_id).unwrap().faces[0];
+    brep.topo
+        .shells
+        .get_mut(shell_id)
+        .unwrap()
+        .faces
+        .retain(|&f| f != dropped);
+    brep.solids = vec![solid];
+
+    let located = brep
+        .validate_located(&tol, ValidateLevel::Full)
+        .expect_err("missing sibling must be located");
+    let with_coord = located
+        .iter()
+        .find(|d| matches!(d.defect, Defect::MissingSibling { .. }))
+        .expect("a MissingSibling located defect");
+    let p = with_coord
+        .location
+        .expect("MissingSibling carries a representative coordinate");
+    // Every coordinate of a unit-cube corner is 0 or 1.
+    for c in p {
+        assert!(
+            c.abs() <= tol.length || (c - 1.0).abs() <= tol.length,
+            "located coordinate {c} is not a unit-cube corner"
+        );
+    }
+}
+
+#[test]
 fn unreversed_boundary_breaks_sibling_pairing() {
     let tol = Tol::default();
     let (mut brep, solid) = build_cube();

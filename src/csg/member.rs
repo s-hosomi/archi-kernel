@@ -41,6 +41,23 @@ pub enum EvalError {
     /// string; the structured [`KernelError`] is not stored because it holds a
     /// `&'static str` field that cannot round-trip through `serde`.
     Construction(String),
+    /// A [`Clip`](crate::csg::CsgNode::Clip) referenced a clipper
+    /// [`StableId`](crate::csg::StableId) that is not present in the model, so
+    /// the deduction cannot be resolved. The missing id is carried.
+    UnknownClipper {
+        /// The `u64` payload of the clipper id that did not resolve.
+        clipper: u64,
+    },
+    /// This member is part of a dependency cycle (e.g. two members each clip the
+    /// other), so it cannot be placed in topological order. Every member in the
+    /// cycle is isolated with this error while members outside the cycle still
+    /// evaluate normally (`DESIGN.md` §5.1, local failure isolation). The ids of
+    /// the members forming the cycle are carried for diagnosis.
+    CyclicDependency {
+        /// The `u64` payloads of the [`StableId`](crate::csg::StableId)s that
+        /// form the dependency cycle this member belongs to, sorted ascending.
+        members: Vec<u64>,
+    },
     /// This operation is not implemented in the current phase.
     NotYetImplemented,
 }
@@ -110,8 +127,12 @@ impl From<PrismError> for EvalError {
 /// retained so display can continue across a failed re-evaluation.
 #[derive(Debug, Clone)]
 pub struct Member {
-    /// The CSG tree — the source of truth for this member.
-    pub csg: CsgNode,
+    /// The CSG tree — the source of truth for this member. Private so a mutation
+    /// cannot bypass the dirty flag: read it through [`csg`](Self::csg) and
+    /// mutate it through [`csg_mut`](Self::csg_mut), which marks the cache stale
+    /// automatically (the old `pub csg` field was a `mark_dirty`-forgetting
+    /// footgun, `docs/design/progress.md`).
+    csg: CsgNode,
     /// Whether the cache is stale.
     dirty: bool,
     /// The cached evaluation result (B-rep or error).
@@ -134,9 +155,28 @@ impl Member {
         }
     }
 
-    /// Mark the cache stale (call after mutating [`csg`](Self::csg)).
+    /// Mark the cache stale.
+    ///
+    /// Usually unnecessary — [`csg_mut`](Self::csg_mut) marks it for you — but
+    /// exposed for the model layer, which marks dependents dirty when a member
+    /// they clip changes.
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    /// Borrow the CSG tree (the source of truth for this member).
+    pub fn csg(&self) -> &CsgNode {
+        &self.csg
+    }
+
+    /// Mutably borrow the CSG tree, marking the cache stale.
+    ///
+    /// Any change reached through this borrow invalidates the cached B-rep, so a
+    /// re-`brep` re-evaluates. This is the only mutable access to `csg`, which is
+    /// why a `mark_dirty` can never be forgotten.
+    pub fn csg_mut(&mut self) -> &mut CsgNode {
+        self.dirty = true;
+        &mut self.csg
     }
 
     /// `true` if the cache is stale or absent for the given tolerance.

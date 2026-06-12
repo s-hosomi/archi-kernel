@@ -17,6 +17,7 @@ pub mod geom;
 pub mod intersect;
 pub mod mass;
 pub mod math;
+pub mod model;
 pub mod predicate;
 pub mod primitives;
 pub mod profile;
@@ -24,7 +25,7 @@ pub mod section;
 pub mod tolerance;
 pub mod topo;
 
-pub use brep::Brep;
+pub use brep::{Brep, LocatedDefect};
 pub use build::extrude;
 pub use error::KernelError;
 pub use geom::{CurveGeom, CurveId, GeomStore, PointId, SurfaceGeom, SurfaceId, VertexGeom};

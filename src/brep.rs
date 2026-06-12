@@ -6,10 +6,31 @@
 //! and provides the one-stop [`validate`](Brep::validate) entry point.
 
 use crate::geom::{GeomStore, SurfaceGeom, VertexGeom};
+use crate::math::Point3;
 use crate::tolerance::Tol;
 use crate::topo::arena::Id;
 use crate::topo::validate::{validate_topology, Defect, ValidateLevel};
 use crate::topo::{Sense, Solid, TopoStore};
+
+/// A topological [`Defect`] paired with a representative coordinate, resolved by
+/// the B-rep layer (`docs/design/progress.md`: "Defect への座標付加").
+///
+/// The topology layer cannot carry coordinates — it must not know about the math
+/// layer (`DESIGN.md` §3.2) — so the bare [`Defect`] it produces names only
+/// handles and parameters. This wrapper is built at the B-rep layer, which *does*
+/// own the geometry, by resolving each defect's handles to a representative point
+/// (a `[f64; 3]` world coordinate, not a math type, so the wrapper itself stays
+/// free of the topology/math coupling concern). `location` is `None` when no
+/// coordinate is meaningful for the variant or the handle did not resolve.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct LocatedDefect {
+    /// The underlying topological defect.
+    pub defect: Defect,
+    /// A representative world coordinate `[x, y, z]` for the defect, if one could
+    /// be resolved (e.g. the position of an unpaired half-edge's start).
+    pub location: Option<[f64; 3]>,
+}
 
 /// A boundary representation: topology, geometry and the top-level solids.
 #[derive(Debug, Clone, Default)]
@@ -57,6 +78,60 @@ impl Brep {
             Ok(())
         } else {
             Err(defects)
+        }
+    }
+
+    /// Validate as [`validate`](Self::validate), but attach a representative
+    /// world coordinate to each defect (`docs/design/progress.md`).
+    ///
+    /// Identical checks to [`validate`](Self::validate); the difference is the
+    /// error payload: each [`Defect`] is wrapped in a [`LocatedDefect`] whose
+    /// `location` is resolved from the B-rep's geometry (the start of an unpaired
+    /// half-edge, the coordinate of an off-surface vertex, …). This keeps the
+    /// topology layer coordinate-free while giving callers a point to highlight.
+    ///
+    /// Returns `Ok(())` when there are no defects.
+    pub fn validate_located(
+        &self,
+        tol: &Tol,
+        level: ValidateLevel,
+    ) -> Result<(), Vec<LocatedDefect>> {
+        match self.validate(tol, level) {
+            Ok(()) => Ok(()),
+            Err(defects) => Err(defects
+                .into_iter()
+                .map(|defect| {
+                    let location = self.locate_defect(&defect).map(|p| [p.x, p.y, p.z]);
+                    LocatedDefect { defect, location }
+                })
+                .collect()),
+        }
+    }
+
+    /// Resolve a representative coordinate for a defect from this B-rep's
+    /// geometry, or `None` when no point is meaningful / the handle is stale.
+    fn locate_defect(&self, defect: &Defect) -> Option<Point3> {
+        match defect {
+            Defect::MissingSibling { half_edge, .. }
+            | Defect::BoundaryVertexMismatch { half_edge, .. } => {
+                // Use the half-edge's curve evaluated at its start parameter (the
+                // start of the unpaired / mismatched edge is the point to flag).
+                let he = self.topo.half_edges.get(*half_edge)?;
+                let curve = self.geom.curve(he.curve)?;
+                Some(curve.point_at(he.boundary[0]))
+            }
+            Defect::MultipleSiblings { half_edge, .. }
+            | Defect::LoopDiscontinuity { half_edge, .. }
+            | Defect::LoopGeometryGap { half_edge, .. } => {
+                let he = self.topo.half_edges.get(*half_edge)?;
+                self.vertex_point(he.start)
+            }
+            Defect::VertexOffSurface { point, .. } => match self.geom.point(*point)? {
+                VertexGeom::Explicit(p) => Some(*p),
+            },
+            // Counting / structural defects (Euler, genus, dangling, empty loop)
+            // have no single representative coordinate.
+            _ => None,
         }
     }
 

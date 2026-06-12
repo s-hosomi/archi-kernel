@@ -609,13 +609,21 @@ fn cylinder_oblique_cut_ellipse_cap() {
         .expect("cyl oblique cut valid");
     assert_eq!(caps.len(), 1usize, "one elliptical cap");
 
+    // The oblique plane passes through the axis at z = 1.5 (the mid-height of
+    // the [0, 3] cylinder), so by symmetry it keeps exactly half the cylinder:
+    // V = ½·π·r²·L. The divergence-theorem volume integral now integrates the
+    // elliptical-rim cylinder patch in closed form (`mass/volume.rs`), so this
+    // is a real volume check, not just a geometric one.
+    let v = bb.signed_volume();
+    let expected_vol = 0.5_f64 * PI * radius * radius * length;
+    assert!(
+        (v - expected_vol).abs() < VOL_EPS_CURVED,
+        "oblique cut V {v}, expected {expected_vol}"
+    );
+
     // The cap edges must be on an ellipse, and its semi-axes match the analytic
     // plane × cylinder section: semi-minor = r, semi-major = r / |cos θ| where θ
     // is the angle between the plane normal and the axis (here 45°, cos = 1/√2).
-    // This is the analytic check for the oblique cut (the divergence-theorem
-    // volume integral in `mass/` cannot yet integrate a cylinder patch with an
-    // oblique boundary, so the closed-form ellipse geometry is checked instead —
-    // a known Phase 5 limitation, not a cut defect).
     let cap = bb.topo.faces.get(caps[0]).unwrap();
     let cap_loop = bb.topo.loops.get(cap.outer).unwrap();
     let mut found_ellipse = false;

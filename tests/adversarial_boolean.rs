@@ -938,3 +938,168 @@ fn poly2d_tol_jitter_identity_proptest() {
             "jitter ({jx},{jy}) at ({bx},{by}): identity {lhs} vs 1.0");
     });
 }
+
+// ── prismatic collinear near-overlap degeneracy (pinned, Phase 5) ────────────
+
+/// FINDING (Phase 5, pinned): the prismatic 2.5-D arrangement collapses to an
+/// empty result when one operand's straight edge is **collinear with and overlaps
+/// the other's edge with unequal extent, the two edges separated by a
+/// *sub-tolerance* gap** (here ~2·ULP, far below `Tol::length` yet not exactly
+/// equal), while the overlapping operand also extends well past the other on the
+/// far side.
+///
+/// Minimal repro: A = unit box `[0,1]³`. B spans `x ∈ [−1.55, 1.0−2ε]`,
+/// `y ∈ [0.1, 3.0]`, `z ∈ [0, 0.2]`. B's right edge sits at
+/// `x = 0.999_999_999_999_999_78` (2.2e-16 below A's right edge `x = 1.0`) — a
+/// near-coincident parallel edge, *not* an exact coincidence — and B overhangs A
+/// far to the left and in `y`. Expected: `V(A−B) = 0.82`, `V(A∩B) = 0.18`.
+/// Actual: both come back **empty** (0 volume), though each result is internally
+/// watertight, so the volume identity `V(A−B)+V(A∩B)=V(A)` breaks (1 ≠ 0).
+///
+/// Root cause (see the Phase 5 investigation): unlike the validated `poly2d`
+/// engine, `boolean/prismatic/arrange.rs` has **no vertex-on-edge / grazing
+/// projection step** and traces cells with a floating-point containment probe.
+/// The two near-collinear vertical edges form a sub-tolerance sliver whose
+/// endpoints are *not* shared vertices (B's corners are at different `y` than A's
+/// corners), so the `VertexStore` absorption never merges them; the DCEL trace
+/// then mis-orders the sliver and the residency classification empties every
+/// cell. This is distinct from `poly2d_sub_tol_gap_hole_lost` (a 2-D engine gap)
+/// and from the *exact* collinear-overlap cases (which now pass — see the OK
+/// cases the `prism_volume_identity_proptest` covers via its `OFF` offset).
+///
+/// The fix is a collinear-edge / vertex-on-edge merge in the prismatic
+/// arrangement (a multi-hundred-line change to `arrange.rs`'s ingest+trace),
+/// deferred past Phase 5; this test pins the exact trigger so it becomes a
+/// regression asset once that lands. The `prism_volume_identity_proptest` steers
+/// around the trigger with its `OFF = 0.0131` offset.
+#[test]
+#[ignore = "prismatic collinear near-overlap sliver: fix is a vertex-on-edge merge in arrange.rs (post-Phase-5)"]
+fn prism_collinear_near_overlap_sliver_empties_result() {
+    let tol = Tol::default();
+    let a = box_z(0.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+    // x0 = −1.55, wx = 2.55 ⇒ right edge = −1.55 + 2.55 = 0.999_999_999_999_999_78.
+    let b = box_z(-1.55, 0.1, 0.0, 2.55, 2.9, 0.2);
+
+    let diff = prismatic::difference(&a, &b, &tol).expect("a−b");
+    let inter = prismatic::intersection(&a, &b, &tol).expect("a∩b");
+    let vd = diff.signed_volume();
+    let vi = inter.signed_volume();
+    // The identity the fix must restore (currently vd = vi = 0).
+    assert!(
+        (vd + vi - 1.0).abs() <= 1e-6,
+        "V(A−B)+V(A∩B) = {} != 1.0 (collinear near-overlap sliver emptied the result)",
+        vd + vi
+    );
+}
+
+// ── extended volume-identity proptests (Phase 5: circles + Clip path) ────────
+
+/// A square beam of side `s` centred on the x axis, from `x0`, length `len`,
+/// extruded along `+x` (so a z-column can clip it).
+fn beam_x(x0: f64, len: f64, s: f64) -> ExtrudeLeaf {
+    ExtrudeLeaf {
+        profile: Profile2d::rect(s / 2.0, s / 2.0).expect("rect"),
+        origin: Point3::new(x0, 0.0, 0.0),
+        axis: Vec3::X,
+        length: len,
+    }
+}
+
+/// Volume identity `V(A−B)+V(A∩B)=V(A)` for a rectangular beam clipped by a
+/// **round** (circular) column along the common z direction — the Phase 3c arc
+/// path, now exercised under proptest (`DESIGN.md` §7: circles included).
+#[test]
+fn prism_volume_identity_circular_proptest() {
+    let cfg = ProptestConfig {
+        cases: 600,
+        ..ProptestConfig::default()
+    };
+    proptest!(cfg, |(
+        cx in 0.2_f64..1.8_f64,
+        r in 0.05_f64..0.4_f64,
+    )| {
+        let tol = Tol::default();
+        // Beam: 0.6 square section, x ∈ [0, 2]. Column: round, axis +z, radius r,
+        // centred at (cx, 0), tall enough to fully pierce the beam in z.
+        let beam = beam_x(0.0, 2.0, 0.6);
+        let col = ExtrudeLeaf {
+            profile: Profile2d::circle(r).expect("circle"),
+            origin: Point3::new(cx, 0.0, -1.0),
+            axis: Vec3::Z,
+            length: 2.0,
+        };
+        let diff = prismatic::difference(&beam, &col, &tol).expect("beam − col");
+        let inter = prismatic::intersection(&beam, &col, &tol).expect("beam ∩ col");
+        assert_watertight(&diff, &tol, "circular diff");
+        assert_watertight(&inter, &tol, "circular inter");
+        let va = 0.6 * 0.6 * 2.0;
+        let vd = diff.signed_volume();
+        let vi = inter.signed_volume();
+        prop_assert!((vd + vi - va).abs() <= 1e-6,
+            "V(A−B)+V(A∩B) = {} != V(A) = {va} (cx={cx}, r={r})", vd + vi);
+    });
+}
+
+/// Volume identity through the **model Clip path**: a girder clipped by a moving
+/// box column must keep `V(clipped) = V(gross) − V(gross ∩ column)` for every
+/// column position (the same identity, routed through `prismatic::clip` and the
+/// model layer rather than a bare difference).
+#[test]
+fn prism_clip_volume_identity_proptest() {
+    use archi_kernel::csg::{ClipRule, CsgNode, Member, StableId};
+    use archi_kernel::model::{takeoff, Model};
+
+    let cfg = ProptestConfig {
+        cases: 400,
+        ..ProptestConfig::default()
+    };
+    proptest!(cfg, |(
+        cx in -0.2_f64..1.8_f64,
+        cw in 0.2_f64..0.8_f64,
+    )| {
+        let tol = Tol::default();
+        // Gross girder: 0.4×0.4 section, x ∈ [0, 2], extruded +x.
+        let girder_gross = ExtrudeLeaf {
+            profile: Profile2d::rect(0.2, 0.2).expect("rect"),
+            origin: Point3::new(0.0, 0.0, 0.0),
+            axis: Vec3::X,
+            length: 2.0,
+        };
+        // Column: a box centred at (cx,0) of side cw, tall in z, covering the
+        // girder section fully in y and z.
+        let col = box_z(cx - cw / 2.0, -0.5, -0.5, cw, 1.0, 1.0);
+
+        // Reference identity via bare booleans.
+        let gross_brep = prismatic::difference(&girder_gross, &col, &tol)
+            .expect("gross − col");
+        let inter = prismatic::intersection(&girder_gross, &col, &tol)
+            .expect("gross ∩ col");
+        let v_gross = 2.0 * 0.4 * 0.4;
+        let v_clipped_ref = gross_brep.signed_volume();
+        prop_assert!((v_clipped_ref + inter.signed_volume() - v_gross).abs() <= 1e-6);
+
+        // Same via the model Clip path.
+        let mut model = Model::new();
+        let col_node = CsgNode::Extrude {
+            profile: Profile2d::rect(0.5, cw / 2.0).expect("rect"),
+            origin: Point3::new(cx, 0.0, -0.5),
+            axis: Vec3::Z,
+            length: 1.0,
+        };
+        model.insert(StableId(1), Member::new(col_node)).unwrap();
+        let girder_node = CsgNode::Clip {
+            base: Box::new(CsgNode::Extrude {
+                profile: Profile2d::rect(0.2, 0.2).expect("rect"),
+                origin: Point3::new(0.0, 0.0, 0.0),
+                axis: Vec3::X,
+                length: 2.0,
+            }),
+            clippers: vec![StableId(1)],
+            rule: ClipRule::Priority,
+        };
+        model.insert(StableId(2), Member::new(girder_node)).unwrap();
+        let qty = takeoff(&mut model, StableId(2), &tol).expect("clip take-off");
+        prop_assert!((qty.concrete_volume - v_clipped_ref).abs() <= 1e-6,
+            "clip path V = {} != bare difference V = {v_clipped_ref}", qty.concrete_volume);
+    });
+}

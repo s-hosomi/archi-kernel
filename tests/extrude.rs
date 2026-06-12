@@ -251,15 +251,14 @@ fn csg_extrude_evaluates_and_reevaluates_when_dirty() {
     assert!(member.last_valid().is_some());
     assert!(!member.is_dirty(&tol), "clean after eval");
 
-    // Mutate the tree and mark dirty: the next eval must rebuild with the new
-    // length.
-    member.csg = CsgNode::Extrude {
+    // Mutate the tree through `csg_mut`, which marks dirty automatically: the
+    // next eval must rebuild with the new length.
+    *member.csg_mut() = CsgNode::Extrude {
         origin: Point3::origin(),
         profile,
         axis: Vec3::Z,
         length: 6.0_f64,
     };
-    member.mark_dirty();
     assert!(member.is_dirty(&tol));
 
     let brep = member.brep(&tol).expect("re-eval");
