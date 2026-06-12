@@ -66,11 +66,11 @@
 mod arrangement;
 mod classify;
 mod error;
-mod geom;
-mod intersect;
+pub(crate) mod geom;
+pub(crate) mod intersect;
 mod reconstruct;
 mod region;
-mod snap;
+pub(crate) mod snap;
 
 pub use classify::Op;
 pub use error::Poly2Error;

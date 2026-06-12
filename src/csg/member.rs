@@ -1,8 +1,9 @@
 //! The per-member cache and lazy-evaluation machinery.
 
+use crate::boolean::prismatic::{self, ExtrudeLeaf, Operand, PrismError};
 use crate::brep::Brep;
 use crate::build::extrude;
-use crate::csg::node::CsgNode;
+use crate::csg::node::{CsgNode, Opening};
 use crate::error::KernelError;
 use crate::primitives::Line3;
 use crate::tolerance::Tol;
@@ -18,11 +19,20 @@ use crate::topo::validate::{Defect, ValidateLevel};
 #[non_exhaustive]
 pub enum EvalError {
     /// A full 3-D boolean was required but is not yet supported; the result is
-    /// withheld rather than approximated (`DESIGN.md` §4.1).
-    Unsupported3dBoolean,
+    /// withheld rather than approximated (`DESIGN.md` §4.1). The `reason`
+    /// records *why* the 2.5-D fast path declined, machine-readably.
+    Unsupported3dBoolean {
+        /// Why the prismatic reduction was not applicable.
+        reason: UnsupportedReason,
+    },
     /// The evaluation exceeded the configured complexity limit and was isolated
-    /// (`DESIGN.md` §4.5).
-    ComplexityLimit,
+    /// (`DESIGN.md` §4.5). The measure that tripped the budget is carried.
+    ComplexityLimit {
+        /// The complexity measure that exceeded the budget.
+        measure: usize,
+        /// The budget it exceeded.
+        budget: usize,
+    },
     /// Evaluation produced a structurally invalid B-rep; the defects are
     /// carried for diagnosis.
     InvalidResult(Vec<Defect>),
@@ -35,9 +45,56 @@ pub enum EvalError {
     NotYetImplemented,
 }
 
+/// Why a member could not be reduced to the 2.5-D prismatic fast path.
+///
+/// Fine-grained so a failing member can be isolated and reported precisely
+/// (`DESIGN.md` §4.5, `synthesis.md` §2-15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub enum UnsupportedReason {
+    /// The two operands share no common prismatic direction (e.g. two H-sections
+    /// crossed at a right angle), so the boolean does not fall to 2.5-D.
+    NoCommonDirection,
+    /// An operand has a circular cross-section whose curved boundary would land
+    /// on the 2-D side as an arc (Phase 3c). The offending operand is recorded.
+    CircularOperand {
+        /// Which operand is circular.
+        operand: Operand,
+    },
+    /// The 2-D engine encountered an arc it cannot yet handle (Phase 3c).
+    ArcNotYetSupported,
+    /// A boolean whose operands are not both single extruded leaves (e.g. a
+    /// union of three or more solids), which needs a general `Brep × Brep`
+    /// boolean outside this phase.
+    NonLeafOperands,
+}
+
 impl From<KernelError> for EvalError {
     fn from(e: KernelError) -> Self {
         EvalError::Construction(e.to_string())
+    }
+}
+
+impl From<PrismError> for EvalError {
+    fn from(e: PrismError) -> Self {
+        match e {
+            PrismError::NoCommonDirection => EvalError::Unsupported3dBoolean {
+                reason: UnsupportedReason::NoCommonDirection,
+            },
+            PrismError::CircularInvolved { operand } => EvalError::Unsupported3dBoolean {
+                reason: UnsupportedReason::CircularOperand { operand },
+            },
+            PrismError::ArcNotYetSupported => EvalError::Unsupported3dBoolean {
+                reason: UnsupportedReason::ArcNotYetSupported,
+            },
+            PrismError::ComplexityLimit { measure, budget } => {
+                EvalError::ComplexityLimit { measure, budget }
+            }
+            PrismError::InvalidResult(defects) => EvalError::InvalidResult(defects),
+            // An internal 2-D failure is a bug surfaced as a string, not a panic.
+            PrismError::Poly2(p) => EvalError::Construction(p.to_string()),
+        }
     }
 }
 
@@ -93,10 +150,11 @@ impl Member {
 
     /// Evaluate (or return the cached) B-rep for the given tolerance.
     ///
-    /// Evaluation is not implemented in this phase, so this currently always
-    /// yields [`EvalError::NotYetImplemented`]. The caching contract is in
-    /// place: a clean cache built with the same `tol` is returned directly, and
-    /// a successful result updates [`last_valid`](Self::last_valid).
+    /// Extrusions, prismatic differences, opening subtractions and unions are
+    /// evaluated; anything outside the 2.5-D fast path yields a descriptive
+    /// [`EvalError`]. The caching contract holds: a clean cache built with the
+    /// same `tol` is returned directly, and a successful result updates
+    /// [`last_valid`](Self::last_valid).
     pub fn brep(&mut self, tol: &Tol) -> Result<&Brep, EvalError> {
         if !self.is_dirty(tol) {
             if let Some(Ok(_)) = &self.cache {
@@ -124,11 +182,20 @@ impl Member {
 
     /// Evaluate the CSG tree into a B-rep.
     ///
-    /// Only the [`CsgNode::Extrude`] leaf is evaluated for real in this phase:
-    /// it builds the extruded solid, validates it at
-    /// [`ValidateLevel::Full`](crate::topo::ValidateLevel::Full), and yields the
-    /// validated B-rep (or the defects, as [`EvalError::InvalidResult`]). Every
-    /// other node returns [`EvalError::NotYetImplemented`].
+    /// Implemented nodes:
+    ///
+    /// * [`CsgNode::Extrude`] — builds the extruded solid (Phase 2).
+    /// * [`CsgNode::Difference`] of two extruded leaves — the prismatic 2.5-D
+    ///   difference (`DESIGN.md` §4.2).
+    /// * [`CsgNode::OpeningSubtraction`] of an extruded base by extruded
+    ///   openings — the openings are fused with a 2-D union and removed in one
+    ///   prismatic difference (`DESIGN.md` §4.5).
+    /// * [`CsgNode::Union`] of two extruded leaves — the prismatic union.
+    ///
+    /// All results validate at [`ValidateLevel::Full`]. Anything outside the
+    /// 2.5-D fast path returns [`EvalError::Unsupported3dBoolean`] (a
+    /// data-preserving explicit error, never a wrong answer) or
+    /// [`EvalError::NotYetImplemented`].
     fn evaluate(&self, tol: &Tol) -> Result<Brep, EvalError> {
         match &self.csg {
             CsgNode::Extrude {
@@ -143,7 +210,64 @@ impl Member {
                     .map_err(EvalError::InvalidResult)?;
                 Ok(brep)
             }
+            CsgNode::Difference { positive, negative } => {
+                let pos = extrude_leaf(positive).ok_or(EvalError::Unsupported3dBoolean {
+                    reason: UnsupportedReason::NonLeafOperands,
+                })?;
+                let neg = extrude_leaf(negative).ok_or(EvalError::Unsupported3dBoolean {
+                    reason: UnsupportedReason::NonLeafOperands,
+                })?;
+                Ok(prismatic::difference(&pos, &neg, tol)?)
+            }
+            CsgNode::OpeningSubtraction { base, openings } => {
+                let base_leaf = extrude_leaf(base).ok_or(EvalError::Unsupported3dBoolean {
+                    reason: UnsupportedReason::NonLeafOperands,
+                })?;
+                let mut opening_leaves = Vec::with_capacity(openings.len());
+                for (_id, Opening { shape }) in openings {
+                    let leaf = extrude_leaf(shape).ok_or(EvalError::Unsupported3dBoolean {
+                        reason: UnsupportedReason::NonLeafOperands,
+                    })?;
+                    opening_leaves.push(leaf);
+                }
+                Ok(prismatic::opening_subtraction(
+                    &base_leaf,
+                    &opening_leaves,
+                    tol,
+                )?)
+            }
+            CsgNode::Union(nodes) => {
+                let mut leaves = Vec::with_capacity(nodes.len());
+                for node in nodes {
+                    let leaf = extrude_leaf(node).ok_or(EvalError::Unsupported3dBoolean {
+                        reason: UnsupportedReason::NonLeafOperands,
+                    })?;
+                    leaves.push(leaf);
+                }
+                Ok(prismatic::union(&leaves, tol)?)
+            }
             _ => Err(EvalError::NotYetImplemented),
         }
+    }
+}
+
+/// Extract an [`ExtrudeLeaf`] from a CSG node when it is a single extrusion.
+///
+/// Returns `None` for any non-leaf node, so the boolean fast path can report
+/// [`UnsupportedReason::NonLeafOperands`] cleanly.
+fn extrude_leaf(node: &CsgNode) -> Option<ExtrudeLeaf> {
+    match node {
+        CsgNode::Extrude {
+            profile,
+            origin,
+            axis,
+            length,
+        } => Some(ExtrudeLeaf {
+            profile: *profile,
+            origin: *origin,
+            axis: *axis,
+            length: *length,
+        }),
+        _ => None,
     }
 }

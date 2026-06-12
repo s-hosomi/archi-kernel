@@ -525,8 +525,13 @@ fn member_extrude_evaluates_and_non_extrude_is_not_yet_implemented() {
     member.brep(&tol).expect("extrude member must evaluate");
     assert!(member.last_valid().is_some());
 
-    // A non-Extrude node is still unimplemented.
-    let mut other = Member::new(CsgNode::Union(Vec::new()));
+    // The priority-clip node is still unimplemented in this phase (booleans and
+    // openings are wired in Phase 3b, but Clip is not).
+    let mut other = Member::new(CsgNode::Clip {
+        base: Box::new(CsgNode::Union(Vec::new())),
+        clippers: Vec::new(),
+        rule: archi_kernel::csg::ClipRule::Priority,
+    });
     assert!(matches!(
         other.brep(&tol),
         Err(EvalError::NotYetImplemented)

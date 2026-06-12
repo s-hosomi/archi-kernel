@@ -23,6 +23,7 @@
 
 pub mod half_space;
 pub mod poly2d;
+pub mod prismatic;
 
 mod support;
 
