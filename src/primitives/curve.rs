@@ -55,6 +55,38 @@ impl Circle3 {
     pub fn radius(self) -> f64 {
         self.radius
     }
+
+    /// Point at parametric angle `t` (radians): `c + r·cos(t)·u + r·sin(t)·v`
+    /// where `u`, `v` are an orthonormal basis of the circle's plane.
+    ///
+    /// The basis is derived deterministically from `normal`, so `point_at` is
+    /// stable for a given circle.
+    pub fn point_at(self, t: f64) -> Point3 {
+        let (u, v) = plane_basis(self.normal);
+        self.center + u * (self.radius * t.cos()) + v * (self.radius * t.sin())
+    }
+}
+
+/// Build a deterministic orthonormal basis `(u, v)` of the plane with the given
+/// unit `normal`, such that `u × v = normal`.
+fn plane_basis(normal: Unit3) -> (Vec3, Vec3) {
+    let n = normal.as_vec();
+    // Pick the axis least aligned with `n` to avoid a near-zero cross product.
+    let seed = if n.x.abs() <= n.y.abs() && n.x.abs() <= n.z.abs() {
+        Vec3::X
+    } else if n.y.abs() <= n.z.abs() {
+        Vec3::Y
+    } else {
+        Vec3::Z
+    };
+    // `seed` is not parallel to `n`, so the cross product is non-degenerate.
+    let u = n
+        .cross(seed)
+        .try_unit()
+        .expect("seed is non-parallel to normal")
+        .as_vec();
+    let v = n.cross(u);
+    (u, v)
 }
 
 /// Ellipse embedded in 3-D space.

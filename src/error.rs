@@ -31,6 +31,13 @@ pub enum KernelError {
         /// Semi-minor axis value.
         semi_minor: f64,
     },
+    /// A profile dimension (width, height, …) was not strictly positive.
+    NonPositiveDimension {
+        /// The name of the offending dimension.
+        name: &'static str,
+        /// The offending value.
+        value: f64,
+    },
 }
 
 impl fmt::Display for KernelError {
@@ -53,6 +60,12 @@ impl fmt::Display for KernelError {
                 f,
                 "semi_major ({semi_major}) must be >= semi_minor ({semi_minor})"
             ),
+            KernelError::NonPositiveDimension { name, value } => {
+                write!(
+                    f,
+                    "profile dimension {name} must be strictly positive, got {value}"
+                )
+            }
         }
     }
 }

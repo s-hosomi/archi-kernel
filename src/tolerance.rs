@@ -12,7 +12,12 @@
 //! classification [`Sign3`] is part of the public API from day one.
 
 /// Tolerances used by all geometric predicates.
-#[derive(Debug, Clone, Copy)]
+///
+/// `PartialEq` is derived so that a [`Tol`] can be used as part of a cache key
+/// (the lazy CSG evaluator keys the cached B-rep on the tolerance it was built
+/// with, `DESIGN.md` §5.2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Tol {
     /// Absolute length tolerance in metres.
     pub length: f64,
@@ -34,6 +39,7 @@ impl Default for Tol {
 
 /// Tolerant sign of a signed scalar (distance, dot product, …).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Sign3 {
     /// Strictly negative beyond tolerance.
     Below,
