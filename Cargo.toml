@@ -1,6 +1,6 @@
 [package]
 name = "archi-kernel"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 authors = ["s-hosomi"]
@@ -8,4 +8,10 @@ repository = "https://github.com/s-hosomi/archi-kernel"
 description = "Domain-specific B-rep geometry kernel for building simulation: analytic surfaces (planes + cylinders) with closed-form intersections"
 
 [dependencies]
-nalgebra = "0.33"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+serde = ["dep:serde"]
+
+[dev-dependencies]
+serde_json = "1"

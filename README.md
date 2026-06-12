@@ -8,28 +8,36 @@ Instead of competing with general-purpose kernels (Parasolid, ACIS, Open CASCADE
 
 ## Status
 
-v0.1.0 — Phase 0 of the roadmap:
+v0.2.0 — Phase 0.5 complete (API hygiene):
 
 - Analytic primitives: `Plane`, `Cylinder`, `Line3`, `Circle3`, `Ellipse3`
+- Self-contained 3-D math module (`Point3`, `Vec3`, `Unit3`) — no third-party linear algebra dependency
+- All constructors return `Result` — panic-free public API
+- Private fields with value-passing accessors; `#[non_exhaustive]` on all public enums
+- `KernelError` with hand-written `Display` / `std::error::Error`
+- Optional `serde` feature for serialization of math types
 - Tolerant predicates (`Tol`, 3-value classification `Sign3`)
 - Closed-form intersections: plane × plane, plane × cylinder (all five cases), line × plane
 - Verification tests against hand-computed analytic solutions
 
-Planned next (see [DESIGN.md](DESIGN.md) §10): API hygiene (v0.2.0) → half-edge topology → extruded solids → half-space cuts → boolean difference (2.5D-first) → section drawings → mass properties / quantity takeoff → tessellation.
+Planned next (see [DESIGN.md](DESIGN.md) §10): half-edge topology → extruded solids → half-space cuts → boolean difference (2.5D-first) → section drawings → mass properties / quantity takeoff → tessellation.
 
 ## Usage
 
 ```rust
 use archi_kernel::intersect::{plane_cylinder, PlaneCylinder};
-use archi_kernel::{Cylinder, Line3, Plane, Tol};
-use nalgebra::{Point3, Vector3};
+use archi_kernel::{Cylinder, Line3, Plane, Point3, Tol, Vec3};
 
 let tol = Tol::default();
-let column = Cylinder::new(Line3::new(Point3::origin(), Vector3::z()), 0.3);
-let slab = Plane::new(Point3::new(0.0, 0.0, 2.8), Vector3::z());
+let column = Cylinder::new(
+    Line3::new(Point3::origin(), Vec3::Z).expect("valid axis"),
+    0.3,
+)
+.expect("valid cylinder");
+let slab = Plane::new(Point3::new(0.0, 0.0, 2.8), Vec3::Z).expect("valid plane");
 
 match plane_cylinder(&slab, &column, &tol) {
-    PlaneCylinder::Circle(c) => println!("section circle r = {} m", c.radius),
+    PlaneCylinder::Circle(c) => println!("section circle r = {} m", c.radius()),
     other => println!("{other:?}"),
 }
 ```
@@ -37,8 +45,8 @@ match plane_cylinder(&slab, &column, &tol) {
 ## Development
 
 ```bash
-cargo test                                   # analytic verification tests
-cargo clippy --all-targets -- -D warnings    # zero-warning policy
+cargo test --all-features                                   # analytic verification + serde smoke tests
+cargo clippy --all-targets --all-features -- -D warnings    # zero-warning policy
 cargo fmt --all -- --check
 ```
 

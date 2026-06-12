@@ -94,7 +94,7 @@ src/
 
 ### 3.2 不変条件: トポロジーは幾何を持たない
 
-**トポロジー層 (`topo/`) はジオメトリ座標を一切持たず、`geom/` の GeomStore への ID 参照のみを保持する。** Fornjot は同じ分離を当初持ちながらリファクタで崩し、半年の作り直しに至った (#2116)。この不変条件はディレクトリ物理分離+ CI の import 検査 (topo が nalgebra・primitives を import しないこと) で機械的に守る。実行時テストでは型レベルの性質は検証できない。
+**トポロジー層 (`topo/`) はジオメトリ座標を一切持たず、`geom/` の GeomStore への ID 参照のみを保持する。** Fornjot は同じ分離を当初持ちながらリファクタで崩し、半年の作り直しに至った (#2116)。この不変条件はディレクトリ物理分離+ CI の import 検査 (topo が math・primitives を import しないこと) で機械的に守る。実行時テストでは型レベルの性質は検証できない。
 
 ### 3.3 トポロジー (half-edge)
 
@@ -232,9 +232,9 @@ pub enum CsgNode {
 ## 8. 公開 API・依存方針
 
 - **コンストラクタはパニックしない**: `assert!` を全廃し `Result` を返す (Phase 0.5 で既存 API を v0.2.0 として改修)
-- **公開 API に nalgebra 型を露出しない**: nalgebra のマイナー更新が本クレートのメジャー更新を強制するため。公開シグネチャは生 `f64` / 自前境界型とし、nalgebra は内部実装に閉じ込める。入力側だけでなく**戻り値型 (交差結果・質量特性・テッセレーション出力) も対象**
-- **依存方針 (明文化)**: 実行時依存は nalgebra のみ + Phase 3a から `robust` (Shewchuk 厳密述語、述語窓口内に限定)。serde は optional feature (未使用なら依存に現れない)。エラー型は手書き impl とし thiserror は採らない。「依存ゼロの純粋ライブラリ」(§11) はこの構成と矛盾しない
-- **serde は境界 DTO に対して定義**し、`nalgebra/serde-serialize` には依存しない (ワイヤフォーマットを内部表現に結合させない)
+- **サードパーティの線形代数型を公開 API に露出しない**: 外部クレートのマイナー更新が本クレートのメジャー更新を強制するため。v0.2.0 で nalgebra を**自前の最小 math モジュール** (`Point3`/`Vec3`/`Unit3`、必要演算は dot/cross/norm 程度) で置換し完全に除去した — 変換層のノイズがなく、依存ゼロが文字通り成立する
+- **依存方針 (明文化)**: 実行時依存ゼロ + Phase 3a から `robust` (Shewchuk 厳密述語、述語窓口内に限定)。serde は optional feature (未使用なら依存に現れない)。エラー型は手書き impl とし thiserror は採らない。「依存ゼロの純粋ライブラリ」(§11) が文字通り成立
+- **serde は自前型に直接 derive**する (自前型はワイヤフォーマットを自己決定でき、外部クレートの内部表現に結合しない)
 - 全公開 enum に `#[non_exhaustive]` (円錐対応等の variant 追加を semver-safe に)。CI に cargo-semver-checks
 - **wasm**: コアは wasm 互換を維持 (スレッド・FS 非依存)。wasm-bindgen ラッパは将来の別クレートとし、境界はフラットな f64 配列で渡す
 - 単位は SI (m, rad) のみ。**ST-Bridge は mm 単位**なので、×10⁻³ の変換はアダプタ層 (fem-io 側) に閉じ込める
@@ -258,7 +258,7 @@ pub enum CsgNode {
 | Phase | 内容 | 完了条件 |
 |-------|------|----------|
 | 0 | プリミティブ + 閉形式交差 + Tol | **済 (v0.1.0)** |
-| 0.5 | API 衛生: コンストラクタ Result 化、nalgebra 非露出、serde feature、`#[non_exhaustive]`、cargo-semver-checks | **v0.2.0 として実施** (破壊的変更のため)。全コンストラクタ panic-free |
+| 0.5 | API 衛生: コンストラクタ Result 化、自前 math (nalgebra 除去)、serde feature、`#[non_exhaustive]` | **済 (v0.2.0)**。全コンストラクタ panic-free。cargo-semver-checks は初回タグ時に有効化 |
 | 1 | topo/geom 分離トポロジー (HalfEdge boundary 込み)、世代付き arena、平面正準化付き GeomStore、`validate()` (リング項込みオイラー・sibling・watertight)、CSG 器 (CsgNode 全語彙・Member・stable id)、述語窓口シグネチャ | 手組みの立方体・L形・穴あき面で validate() 緑。CI が topo の幾何 import 禁止を検査 |
 | 2 | 断面プロファイル (矩形/H形/円形) + 押し出し | 3 断面の押し出しが watertight、体積が解析値一致。実 ST-Bridge データで非 2.5D ケース頻度を計測 |
 | 3a | 半空間カット + 内外分類器 + `robust` 導入 | カット結果が常に watertight。断面ポリゴンが解析解一致 |
@@ -285,7 +285,7 @@ pub enum CsgNode {
 - 標準 rustfmt、clippy 警告ゼロ (`-D warnings`)、公開型に rustdoc
 - 単位は SI (m, rad) のみ。表示単位変換は利用側 (adapter) の責務
 - float 直接比較禁止 — 幾何述語は必ず `Tol` 経由、述語は `predicate/` 窓口に集約
-- コンストラクタはパニックしない (Result を返す)。公開 API に nalgebra 型を露出しない
+- コンストラクタはパニックしない (Result を返す)。公開 API はすべて自前型 (math モジュール)
 - トポロジー層は幾何を持たない (CI で機械検査)
 - テスト数値リテラルに `f64` 型注釈、許容誤差を明示
 - 公開 enum に `#[non_exhaustive]`
