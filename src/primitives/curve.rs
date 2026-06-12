@@ -1,5 +1,6 @@
 use crate::error::KernelError;
 use crate::math::{Point3, Unit3, Vec3};
+use crate::tolerance::Tol;
 
 /// Circle embedded in 3-D space.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -112,8 +113,24 @@ impl Ellipse3 {
     /// Build an ellipse.
     ///
     /// `semi_major` and `semi_minor` must both be strictly positive, and
-    /// `semi_major >= semi_minor`. Returns an appropriate [`KernelError`]
-    /// otherwise.
+    /// `semi_major >= semi_minor`. `major_dir` must not be parallel to
+    /// `normal` (their dot product must be small enough that the ellipse plane
+    /// is well-defined). Returns an appropriate [`KernelError`] otherwise.
+    ///
+    /// When `major_dir` is only slightly non-orthogonal to `normal` (within
+    /// the angular tolerance), it is silently Gram-Schmidt orthogonalized onto
+    /// the ellipse plane so that small numerical rounding errors in the caller
+    /// do not cause spurious failures.
+    ///
+    /// # Errors
+    ///
+    /// * [`KernelError::ZeroNormal`] – `normal` is zero-length.
+    /// * [`KernelError::ZeroDirection`] – `major_dir` is zero-length or
+    ///   degenerates to zero after orthogonal projection onto the plane.
+    /// * [`KernelError::NonPositiveSemiAxis`] – either semi-axis is ≤ 0.
+    /// * [`KernelError::SemiMajorLessThanSemiMinor`] – axes are in the wrong order.
+    /// * [`KernelError::MajorDirNotInPlane`] – `major_dir` is (nearly) parallel
+    ///   to `normal`.
     pub fn new(
         center: Point3,
         normal: Vec3,
@@ -123,6 +140,31 @@ impl Ellipse3 {
     ) -> Result<Self, KernelError> {
         let unit_normal = normal.try_unit().ok_or(KernelError::ZeroNormal)?;
         let unit_major = major_dir.try_unit().ok_or(KernelError::ZeroDirection)?;
+
+        // Verify and enforce major_dir ⊥ normal.
+        // Using Tol::default() here keeps the check consistent with the rest of
+        // the kernel's angular-tolerance policy (DESIGN.md §12).
+        let tol = Tol::default();
+        let dot = unit_normal.as_vec().dot(unit_major.as_vec());
+        let abs_dot = dot.abs();
+
+        // If the two directions are nearly parallel the Gram-Schmidt projection
+        // degenerates to zero; return a hard error.
+        if abs_dot > 1.0_f64 - tol.angular {
+            return Err(KernelError::MajorDirNotInPlane { dot: abs_dot });
+        }
+
+        // If the directions are not orthogonal but not yet parallel, silently
+        // orthogonalize major_dir onto the ellipse plane (Gram-Schmidt).
+        // This absorbs small floating-point drift from callers that already
+        // guarantee orthogonality (e.g. plane_cylinder).
+        let unit_major = if abs_dot > tol.angular {
+            let in_plane = unit_major.as_vec() - unit_normal.as_vec() * dot;
+            in_plane.try_unit().ok_or(KernelError::ZeroDirection)?
+        } else {
+            unit_major
+        };
+
         if semi_minor <= 0.0 {
             return Err(KernelError::NonPositiveSemiAxis {
                 semi_axis: semi_minor,

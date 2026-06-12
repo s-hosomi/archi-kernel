@@ -38,6 +38,15 @@ pub enum KernelError {
         /// The offending value.
         value: f64,
     },
+    /// The `major_dir` supplied to `Ellipse3::new` is (nearly) parallel to
+    /// `normal`, so the two directions cannot span the ellipse plane.
+    ///
+    /// The dot product `|major_dir · normal|` must be strictly less than
+    /// `Tol::angular` for a valid ellipse (orthogonality invariant).
+    MajorDirNotInPlane {
+        /// Absolute value of `dot(major_dir, normal)` at the time of the check.
+        dot: f64,
+    },
 }
 
 impl fmt::Display for KernelError {
@@ -64,6 +73,13 @@ impl fmt::Display for KernelError {
                 write!(
                     f,
                     "profile dimension {name} must be strictly positive, got {value}"
+                )
+            }
+            KernelError::MajorDirNotInPlane { dot } => {
+                write!(
+                    f,
+                    "major_dir must be perpendicular to normal (|dot| must be < angular tol), \
+                     got |dot| = {dot}"
                 )
             }
         }

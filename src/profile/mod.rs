@@ -101,8 +101,8 @@ fn rect_outline(half_w: f64, half_h: f64) -> ProfileGeom {
 ///   3 └──────────┘ ...
 /// ```
 ///
-/// Degeneracy checks (`DESIGN.md` §6-1): the web must be no wider than the
-/// flange (`tw ≤ b`) and the two flanges must not meet or overlap
+/// Degeneracy checks (`DESIGN.md` §6-1): the web must be strictly narrower
+/// than the flange (`tw < b`) and the two flanges must not meet or overlap
 /// (`2·tf < h`, i.e. the clear web height is strictly positive).
 fn h_section_outline(
     half_w: f64,
@@ -113,8 +113,9 @@ fn h_section_outline(
     let b = 2.0 * half_w; // overall flange width
     let h = 2.0 * half_h; // overall depth
 
-    // Web no wider than the flange.
-    if web > b {
+    // Web must be strictly narrower than the flange; equality produces
+    // zero-length edges (degenerate polygon) that break downstream 2-D boolean.
+    if web >= b {
         return Err(KernelError::NonPositiveDimension {
             name: "flange_width_minus_web",
             value: b - web,
