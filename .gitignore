@@ -1,2 +1,7 @@
 /target
 Cargo.lock
+
+# Claude Code 関連・エージェント成果物ドキュメントはコミットしない
+CLAUDE.md
+.claude/
+/docs/
