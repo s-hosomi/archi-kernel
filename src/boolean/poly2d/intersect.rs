@@ -244,40 +244,48 @@ fn seg_seg(a0: Point2, a1: Point2, b0: Point2, b1: Point2, tol: &Tol) -> EdgeCro
         return out;
     }
 
-    // Proper / improper transversal crossing: the standard straddle test using
-    // exact orientations. Endpoints lying *on* the other segment count (closed
-    // segments), which is exactly what we want for building geometry.
-    let straddle_ab = orientations_straddle(o0, o1);
-    let straddle_ba = orientations_straddle(o2, o3);
-    if straddle_ab && straddle_ba {
+    // Proper transversal crossing: each segment must have its two endpoints on
+    // **strictly opposite** sides of the other's supporting line. We deliberately
+    // do *not* count a `Collinear` orientation as a straddle here.
+    //
+    // A `Collinear` orientation means one endpoint lies *on* the other's line —
+    // i.e. a shared endpoint, a T-junction, or a collinear overlap. None of those
+    // is a proper interior crossing, and feeding them to `line_line_point` is
+    // unsafe: when the two segments are near-parallel (e.g. two nearly-collinear
+    // edges that share an endpoint, the common sub-tolerance-jitter case), the
+    // line/line denominator is near zero and the constructed point is numerically
+    // meaningless — it can land arbitrarily far away (at the *far* endpoint of one
+    // segment), injecting a spurious split vertex that corrupts the arrangement.
+    // The endpoint-on-segment (T-junction) and collinear cases are handled
+    // exactly and robustly below by `add_touch_if_on_segment` /
+    // `collinear_overlap`, which gate on the real span, so nothing is lost by
+    // restricting the transversal branch to *proper* crossings.
+    let proper_ab = matches!(
+        (o0, o1),
+        (Orient::Left, Orient::Right) | (Orient::Right, Orient::Left)
+    );
+    let proper_ba = matches!(
+        (o2, o3),
+        (Orient::Left, Orient::Right) | (Orient::Right, Orient::Left)
+    );
+    if proper_ab && proper_ba {
         if let Some(p) = line_line_point(a0, a1, b0, b1) {
             out.points.push(p);
         }
         return out;
     }
 
-    // No transversal crossing, but an endpoint of one may touch the interior of
-    // the other (T-junction): e.g. o2 == Collinear means a0 is on line(b0,b1).
-    // Add such touch points so the arrangement splits at them.
+    // No proper transversal crossing, but an endpoint of one may touch the
+    // interior of the other (T-junction), or one endpoint is collinear with the
+    // other's line. `o2 == Collinear` means a0 is on line(b0,b1); the span check
+    // inside `add_touch_if_on_segment` confirms it actually lies on the segment
+    // (not merely its infinite line, and not just coinciding with an endpoint).
     add_touch_if_on_segment(b0, b1, a0, o2, tol, &mut out);
     add_touch_if_on_segment(b0, b1, a1, o3, tol, &mut out);
     add_touch_if_on_segment(a0, a1, b0, o0, tol, &mut out);
     add_touch_if_on_segment(a0, a1, b1, o1, tol, &mut out);
 
     out
-}
-
-/// Do the orientations of the two query points relative to the base line
-/// indicate that they straddle it (opposite sides, or one/both on the line)?
-#[inline]
-fn orientations_straddle(o_first: Orient, o_second: Orient) -> bool {
-    matches!(
-        (o_first, o_second),
-        (Orient::Left, Orient::Right)
-            | (Orient::Right, Orient::Left)
-            | (Orient::Collinear, _)
-            | (_, Orient::Collinear)
-    )
 }
 
 /// If `p` is collinear with segment `(s0,s1)` (signalled by `o == Collinear`)
