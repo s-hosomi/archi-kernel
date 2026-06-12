@@ -789,3 +789,229 @@ fn shoelace(poly: &[[f64; 2]]) -> f64 {
     }
     a / 2.0_f64
 }
+
+// ── Partial-cylinder wall: cut perpendicular to the cylinder axis ────────────
+//
+// Regression for the half-space cut of a solid whose cross-section is a polygon
+// notched / pierced by a circular cylinder (a beam clipped by a round column, a
+// slab with a circular duct). Cutting such a solid perpendicular to the cylinder
+// axis makes a cap boundary that **mixes straight section edges with an arc** of
+// the `plane ∩ cylinder` section circle. Before the fix the cap builder had two
+// disjoint paths — one for a closed conic disk, one for straight loops — so a
+// mixed straight+arc cap loop never stitched: it raised `InvalidResult`
+// (`MissingSibling` on the Line boundary edges, `LoopDiscontinuity` /
+// `LoopGeometryGap` of the notch width). The unified directed-edge cap pool
+// chains straight edges and arcs together into one loop.
+
+use archi_kernel::boolean::prismatic::{self, ExtrudeLeaf};
+
+/// `true` if any loop of any cap face exposes a circular-arc edge.
+fn cap_has_arc(bb: &Brep, caps: &[Id<Face>]) -> bool {
+    for &cap in caps {
+        let Some(f) = bb.topo.faces.get(cap) else {
+            continue;
+        };
+        let mut loops = vec![f.outer];
+        loops.extend(f.inners.iter().copied());
+        for lid in loops {
+            let Some(lp) = bb.topo.loops.get(lid) else {
+                continue;
+            };
+            for &he in &lp.half_edges {
+                let Some(h) = bb.topo.half_edges.get(he) else {
+                    continue;
+                };
+                if matches!(bb.geom.curve(h.curve), Some(CurveGeom::Circle(_))) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Build `strip − cylinder` (a rectangular strip pierced/notched by a round
+/// column, common axis +z) via `prismatic::difference`, mirroring
+/// `tests/prismatic_arcs.rs::assert_strip_minus_cylinder`. The strip footprint is
+/// the world AABB `x∈[bx0,bx1] × y∈[by0,by1]`, extruded `z∈[0, h]`; the cylinder
+/// is radius `r` centred at `(cx, cy)`, through the full height.
+#[allow(clippy::too_many_arguments)]
+fn strip_minus_cylinder(
+    bx0: f64,
+    bx1: f64,
+    by0: f64,
+    by1: f64,
+    cx: f64,
+    cy: f64,
+    r: f64,
+    h: f64,
+) -> (Brep, Id<Solid>) {
+    let tol = Tol::default();
+    // half_w → world-Y extent, half_h → world-X extent (rotated prism basis).
+    let half_w = 0.5 * (by1 - by0);
+    let half_h = 0.5 * (bx1 - bx0);
+    let base = ExtrudeLeaf {
+        profile: Profile2d::rect(half_w, half_h).expect("rect"),
+        origin: Point3::new(0.5 * (bx0 + bx1), 0.5 * (by0 + by1), 0.0),
+        axis: Vec3::Z,
+        length: h,
+    };
+    let tool = ExtrudeLeaf {
+        profile: Profile2d::circle(r).expect("circle"),
+        origin: Point3::new(cx, cy, -0.5),
+        axis: Vec3::Z,
+        length: h + 1.0,
+    };
+    let brep = prismatic::difference(&base, &tool, &tol).expect("strip - cylinder");
+    brep.validate(&tol, ValidateLevel::Full)
+        .expect("input is watertight");
+    let solid = brep.solids[0];
+    (brep, solid)
+}
+
+/// Cut the given solid by a horizontal plane at `z = z_cut`, asserting Full
+/// validity on both halves, that their volumes sum to the whole, and that at
+/// least one cap of each half exposes an arc (the section circle). The notch /
+/// hole is uniform along z, so each half's volume equals `(z fraction)·V`.
+fn assert_perp_cut_conserves(brep: &Brep, solid: Id<Solid>, z_cut: f64, h: f64) {
+    let tol = Tol::default();
+    let total = brep.signed_volume();
+    let cut_plane = plane(Point3::new(0.0, 0.0, z_cut), Vec3::Z);
+
+    let below = cut(brep, solid, &cut_plane, KeepSide::Below, &tol).expect("below");
+    let above = cut(brep, solid, &cut_plane, KeepSide::Above, &tol).expect("above");
+    let CutResult::Cut {
+        brep: bb,
+        caps: caps_b,
+    } = &below
+    else {
+        panic!("expected a real cut below, got {below:?}");
+    };
+    let CutResult::Cut {
+        brep: ab,
+        caps: caps_a,
+    } = &above
+    else {
+        panic!("expected a real cut above, got {above:?}");
+    };
+    bb.validate(&tol, ValidateLevel::Full)
+        .expect("below is watertight");
+    ab.validate(&tol, ValidateLevel::Full)
+        .expect("above is watertight");
+
+    assert!(
+        cap_has_arc(bb, caps_b),
+        "below cap must expose the section arc"
+    );
+    assert!(
+        cap_has_arc(ab, caps_a),
+        "above cap must expose the section arc"
+    );
+
+    let vb = bb.signed_volume();
+    let va = ab.signed_volume();
+    assert!(
+        (vb + va - total).abs() < VOL_EPS_CURVED,
+        "halves must sum to the whole: {vb} + {va} vs {total}"
+    );
+    // Uniform notch/hole along z ⇒ each half is its z-fraction of the volume.
+    let frac = z_cut / h;
+    assert!(
+        (vb - total * frac).abs() < VOL_EPS_CURVED,
+        "below volume {vb}, expected {}",
+        total * frac
+    );
+    assert!(
+        (va - total * (1.0 - frac)).abs() < VOL_EPS_CURVED,
+        "above volume {va}, expected {}",
+        total * (1.0 - frac)
+    );
+}
+
+#[test]
+fn strip_notched_by_cylinder_perp_cut_short_edge() {
+    // The reported failure: a 0.4×6.0 strip notched by an r=0.35 cylinder centred
+    // on the midpoint of the short edge (r > the half-width, so the surviving arc
+    // crosses both long edges *and* the circle's 0/2π seam). Cut ⊥ the axis at
+    // z = 0.5. The cap is three straight section edges joined by one circular arc.
+    let h = 1.0_f64;
+    let (brep, solid) = strip_minus_cylinder(13.8, 14.2, 0.0, 6.0, 14.0, 0.0, 0.35, h);
+    assert_perp_cut_conserves(&brep, solid, 0.5, h);
+}
+
+#[test]
+fn strip_notched_by_cylinder_perp_cut_long_edge() {
+    // Variation: the circle straddles a long edge (x = 14.2) at mid-height, so the
+    // surviving arc is a smaller bite out of one side. Cut ⊥ the axis at z = 0.4.
+    let h = 1.0_f64;
+    let (brep, solid) = strip_minus_cylinder(13.8, 14.2, 0.0, 6.0, 14.2, 3.0, 0.15, h);
+    assert_perp_cut_conserves(&brep, solid, 0.4, h);
+}
+
+#[test]
+fn strip_notched_by_cylinder_perp_cut_corner() {
+    // Variation: the circle centred on a corner (quarter-bite). Cut ⊥ axis, z=0.5.
+    let h = 1.0_f64;
+    let (brep, solid) = strip_minus_cylinder(13.8, 14.2, 0.0, 6.0, 14.2, 6.0, 0.15, h);
+    assert_perp_cut_conserves(&brep, solid, 0.5, h);
+}
+
+#[test]
+fn slab_with_circular_through_hole_perp_cut_is_annulus_with_arc() {
+    // A slab (1.2 × 1.0 footprint) pierced by a full circular through-hole along
+    // +z. Cut ⊥ the axis: the cap is an *annulus* whose outer loop is straight
+    // section edges and whose hole loop is the full section circle (two arcs).
+    let tol = Tol::default();
+    let h = 1.0_f64;
+    // Hole well inside the footprint so the circle is a full through-hole.
+    let (brep, solid) = strip_minus_cylinder(-0.6, 0.6, -0.5, 0.5, 0.0, 0.0, 0.25, h);
+    assert_perp_cut_conserves(&brep, solid, 0.5, h);
+
+    let cut_plane = plane(Point3::new(0.0, 0.0, 0.5), Vec3::Z);
+    let below = cut(&brep, solid, &cut_plane, KeepSide::Below, &tol).expect("below");
+    let CutResult::Cut { brep: bb, caps } = below else {
+        panic!("expected cut");
+    };
+    // Exactly one cap face, an annulus (one hole loop), and the hole exposes arcs.
+    assert_eq!(caps.len(), 1usize, "one annular cap");
+    let cap = bb.topo.faces.get(caps[0]).unwrap();
+    assert_eq!(cap.inners.len(), 1usize, "annulus cap has one hole loop");
+    // The hole loop is the section circle: every hole edge is a circular arc.
+    let hole = bb.topo.loops.get(cap.inners[0]).unwrap();
+    assert!(
+        hole.half_edges.iter().all(|&he| {
+            let h = bb.topo.half_edges.get(he).unwrap();
+            matches!(bb.geom.curve(h.curve), Some(CurveGeom::Circle(_)))
+        }),
+        "the circular through-hole's cap loop must be all arcs"
+    );
+}
+
+#[test]
+fn strip_notched_by_cylinder_section_has_arc_loop() {
+    // The same construction exercised through `section()` (which runs the cut
+    // twice and intersects the caps): the section profile of a strip notched by a
+    // round column must expose an arc edge.
+    let tol = Tol::default();
+    let h = 1.0_f64;
+    let (brep, solid) = strip_minus_cylinder(13.8, 14.2, 0.0, 6.0, 14.0, 0.0, 0.35, h);
+
+    let sec_plane = plane(Point3::new(0.0, 0.0, 0.5), Vec3::Z);
+    let result = section(&brep, solid, &sec_plane, &tol).expect("section");
+    assert_eq!(result.profiles.len(), 1usize, "one profile");
+    let has_arc = result.profiles.iter().any(|p| {
+        p.outer
+            .edges
+            .iter()
+            .any(|e| matches!(e, SectionEdge::Arc { .. }))
+            || p.holes.iter().any(|hh| {
+                hh.edges
+                    .iter()
+                    .any(|e| matches!(e, SectionEdge::Arc { .. }))
+            })
+    });
+    assert!(
+        has_arc,
+        "the section of a cylinder-notched strip must expose an Arc edge"
+    );
+}

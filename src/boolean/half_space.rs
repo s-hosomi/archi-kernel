@@ -64,7 +64,9 @@ use crate::topo::arena::Id;
 use crate::topo::validate::ValidateLevel;
 use crate::topo::{Face, HalfEdge, Loop, Sense, Shell, Solid, Vertex};
 
-use super::support::{key, point_in_polygon, signed_area_2d, CoordKey, PlaneFrame};
+use super::support::{
+    key, loop_signed_area_2d, point_in_polygon, signed_area_2d, CoordKey, PlaneFrame,
+};
 
 /// A section connector leaving a vertex: `(far vertex, far point, near point)`.
 type SegLink = (Id<Vertex>, Point3, Point3);
@@ -215,13 +217,18 @@ impl SectionConic {
 }
 
 /// A section arc on the cut plane, recorded for a disk / annular cap.
+///
+/// Stored in the **wall-side** direction `pa → pb`; the cap arc is the reversed
+/// sibling `pb → pa` (start vertex `b`, boundary `[tb, ta]`) on the shared conic.
 #[derive(Debug, Clone, Copy)]
 struct SectionArc {
-    /// Wall-side start vertex. Retained for the directed-edge model.
-    #[allow(dead_code)]
-    a: Id<Vertex>,
-    /// Wall-side end vertex. The cap arc starts here and reverses the boundary.
+    /// Wall-side end vertex (at `pb`). The cap arc starts here and reverses the
+    /// boundary.
     b: Id<Vertex>,
+    /// Wall-side start point (the cap arc's far endpoint).
+    pa: Point3,
+    /// Wall-side end point (the cap arc's start, at `b`).
+    pb: Point3,
     /// The shared section conic curve.
     curve: CurveId,
     /// Angular boundary `[ta, tb]` on the wall side; the cap arc uses `[tb, ta]`.
@@ -1702,16 +1709,26 @@ impl<'a> Cutter<'a> {
             }
 
             // Build the kept sub-face. The section arc must follow the same
-            // angular half this face occupies. Disambiguate the arc interval by a
-            // representative interior angle: a non-portal fragment point's angle
-            // on the section conic (which shares the cylinder axis, so the angle
-            // matches). We pick the [ta, tb] interval (±2π) that contains it.
+            // angular span this face occupies. Disambiguate the arc interval by a
+            // representative **interior arc angle**: the midpoint of a kept arc
+            // (circle) edge of this face. The angle must come from a point on the
+            // curved rim — *not* from a seam (ruling) edge or a seam split point,
+            // both of which sit at exactly a portal angle (they share the ruling)
+            // and so cannot tell the two arcs apart. The rim shares the cylinder
+            // axis with the section conic, so its angle transfers directly. We then
+            // pick the `[ta, tb]` interval (±2π) that contains it.
             let (pa, pb) = (portals[0], portals[1]);
             let rep_angle = frags
                 .iter()
                 .flat_map(|f| f.iter())
-                .find(|n| n.sign != Sign3::On)
-                .map(|n| section.param_at(self.plane.project_point(n.point)))
+                .find_map(|n| match n.edge_geom {
+                    CurveGeom::Circle(_) | CurveGeom::Ellipse(_) => {
+                        let mid_t = 0.5 * (n.edge_b0 + n.edge_b1);
+                        let mid_pt = n.edge_geom.point_at(mid_t);
+                        Some(section.param_at(self.plane.project_point(mid_pt)))
+                    }
+                    _ => None,
+                })
                 .unwrap_or_else(|| 0.5 * (section.param_at(pa) + section.param_at(pb)));
             let (ta, tb) =
                 arc_interval_containing(section.param_at(pa), section.param_at(pb), rep_angle);
@@ -1968,11 +1985,15 @@ impl<'a> Cutter<'a> {
         tb: f64,
     ) {
         let curve = self.section_arc_curve(section);
-        let a = self.vertex_at(pa);
+        // Intern the start vertex so the wall-side arc half-edge and the cap arc
+        // resolve to the same `Id<Vertex>` at `pa`; only the end vertex `b` is
+        // retained (the cap arc starts there).
+        let _ = self.vertex_at(pa);
         let b = self.vertex_at(pb);
         self.section_arcs.push(SectionArc {
-            a,
             b,
+            pa,
+            pb,
             curve,
             ta,
             tb,
@@ -1981,182 +2002,56 @@ impl<'a> Cutter<'a> {
 
     // ── cap building ──────────────────────────────────────────────────────
 
-    /// Stitch the collected section edges into closed loops and emit cap faces.
+    /// Stitch the collected section edges and arcs into closed loops and emit cap
+    /// faces.
     ///
-    /// Each section edge was recorded as a **directed** wall-side edge `a → b`
-    /// (the material boundary). The cap half-edge along it is its reversed
-    /// sibling `b → a`. Those reversed edges form one outgoing edge per vertex,
-    /// so they chain into directed cycles uniquely — no winding guesswork, and
-    /// every cap half-edge is the exact reversed sibling of a wall half-edge.
+    /// Both straight section edges and section arcs are recorded as **directed**
+    /// wall-side edges `pa → pb` (the material boundary). The cap half-edge along
+    /// each is its reversed sibling `pb → pa` on the *same* curve, with the
+    /// boundary reversed. Collecting both kinds into one directed-edge pool lets a
+    /// cap loop mix straight edges and arcs freely — the case of a partial
+    /// cylindrical wall (a rectangular cross-section with a circular notch / hole)
+    /// cut perpendicular to the cylinder axis, whose cap boundary is straight
+    /// section edges joined to an arc of the `plane ∩ cylinder` curve. A
+    /// full-circle cap is the same machinery with two semicircular arcs and no
+    /// straight edges.
+    ///
+    /// Straight edges are first resolved by signed multiplicity: an edge recorded
+    /// in *both* directions is internal (shared by two kept sub-faces) and cancels.
+    /// Arc edges are always genuine cap boundaries (one per half-cylinder face) and
+    /// are not subject to cancellation — the two semicircles of a full circle carry
+    /// distinct boundaries and must both survive.
     fn build_caps(&mut self) -> Vec<Id<Face>> {
-        let mut cap_faces = self.build_arc_caps();
-        if self.section_edges.is_empty() {
-            return cap_faces;
-        }
-        cap_faces.extend(self.build_straight_caps());
-        cap_faces
-    }
-
-    /// Build a disk / annular cap from the recorded section arcs (cylinder cut).
-    ///
-    /// The arcs form a closed conic (one circle / ellipse); the cap is a single
-    /// disk face whose boundary is the section arcs, each the reversed sibling of
-    /// a half-cylinder wall arc — mirroring the extruder's two-arc disk cap.
-    fn build_arc_caps(&mut self) -> Vec<Id<Face>> {
-        if self.section_arcs.is_empty() {
+        let edges = self.collect_cap_edges();
+        if edges.is_empty() {
             return Vec::new();
         }
-        let arcs = self.section_arcs.clone();
-        // Cap surface: cut plane inserted canonically.
-        let (surf_id, _flip) = self.out.geom.insert_plane(self.plane, &self.tol);
-        let desired = self.cap_outward_normal();
-        let canon = match self.out.geom.surface(surf_id) {
-            Some(SurfaceGeom::Plane(p)) => *p,
-            _ => self.plane,
-        };
-        let canon_normal = canon.normal().as_vec();
 
-        // Emit the cap arcs as reversed siblings of the wall arcs: wall arc was
-        // pa→pb on `curve` with boundary [ta, tb]; the cap arc is pb→pa with
-        // boundary [tb, ta] on the same curve.
-        let mut hes = Vec::with_capacity(arcs.len());
-        for arc in &arcs {
-            hes.push(self.out.topo.add_half_edge(HalfEdge {
-                start: arc.b,
-                curve: arc.curve,
-                boundary: [arc.tb, arc.ta],
-            }));
-        }
-        let loop_id = self.out.topo.add_loop(Loop { half_edges: hes });
-
-        // Sense: choose so the cap's outward normal equals `desired`. A disk cap
-        // bounded by arcs traversed pb→pa winds about the section curve's normal;
-        // compare that normal against `desired`.
-        let arc_normal = match self.section_arcs.first() {
-            Some(a) => match self.out.geom.curve(a.curve) {
-                Some(CurveGeom::Circle(c)) => c.normal().as_vec(),
-                Some(CurveGeom::Ellipse(e)) => e.normal().as_vec(),
-                _ => canon_normal,
-            },
-            None => canon_normal,
-        };
-        let _ = arc_normal;
-        // The cap outward must equal `desired`; the canonical surface normal is
-        // `canon_normal`. Pick sense to match.
-        let sense = if canon_normal.dot(desired) > 0.0 {
-            Sense::Same
-        } else {
-            Sense::Reversed
-        };
-        let f = self.out.topo.add_face(Face {
-            surface: surf_id,
-            sense,
-            outer: loop_id,
-            inners: Vec::new(),
-        });
-        self.faces.push(f);
-        vec![f]
-    }
-
-    /// Stitch the straight section edges into closed loops and emit cap faces.
-    fn build_straight_caps(&mut self) -> Vec<Id<Face>> {
-        if self.section_edges.is_empty() {
-            return Vec::new();
-        }
-        // Resolve directed section edges. The cut boundary on the plane is a set
-        // of oriented loops: a real cap edge is recorded in exactly one
-        // direction (material on one side, cap on the other). If an edge was
-        // recorded in *both* directions it is an internal edge shared by two
-        // kept sub-faces — it cancels and is not a cap boundary. We tally signed
-        // multiplicity per undirected edge and keep only the net direction.
-        // Resolve the directed cap boundary. Each recorded section edge `pa→pb`
-        // mirrors a wall half-edge that was already emitted with that exact
-        // direction, so the cap half-edge along it must run `pb→pa` (the reversed
-        // sibling). We must therefore preserve each survivor's **original**
-        // direction — never re-canonicalise it. An edge recorded in *both*
-        // directions is internal (shared by two kept sub-faces) and cancels.
-        let mut signed: HashMap<(CoordKey, CoordKey), i32> = HashMap::new();
-        for &e in &self.section_edges {
-            let (ka, kb) = (key(e.pa), key(e.pb));
-            let (uk, dir) = if ka <= kb {
-                ((ka, kb), 1)
-            } else {
-                ((kb, ka), -1)
-            };
-            *signed.entry(uk).or_insert(0) += dir;
-        }
-        let mut emitted: std::collections::HashSet<(CoordKey, CoordKey)> =
-            std::collections::HashSet::new();
-        let mut edges: Vec<SectionEdge> = Vec::new();
-        for &e in &self.section_edges {
-            let (ka, kb) = (key(e.pa), key(e.pb));
-            let uk = if ka <= kb { (ka, kb) } else { (kb, ka) };
-            if signed.get(&uk).copied().unwrap_or(0) == 0 {
-                continue; // internal edge: cancels, not a cap boundary.
-            }
-            // Keep one survivor per directed edge, preserving its direction.
-            if emitted.insert((ka, kb)) {
-                edges.push(e);
-            }
-        }
-
-        // Directed cap edges b → a: index by their start vertex key (pb).
-        // The cap half-edge starts at vertex `b` (point pb) and ends at `a`
-        // (point pa) — the reversed wall edge leaving pb.
-        let mut next_cap: HashMap<CoordKey, (Id<Vertex>, Point3, Point3)> = HashMap::new();
-        for e in &edges {
-            next_cap.insert(key(e.pb), (e.b, e.pb, e.pa));
-        }
-
-        // Walk directed cycles.
-        let mut visited: std::collections::HashSet<CoordKey> = std::collections::HashSet::new();
-        let mut cycles: Vec<Vec<(Id<Vertex>, Point3)>> = Vec::new();
-        for e in &edges {
-            let start_key = key(e.pb);
-            if visited.contains(&start_key) {
-                continue;
-            }
-            let mut ring: Vec<(Id<Vertex>, Point3)> = Vec::new();
-            let mut cur = start_key;
-            let mut guard = 0usize;
-            loop {
-                guard += 1;
-                if guard > edges.len() * 2 + 8 {
-                    break;
-                }
-                if !visited.insert(cur) {
-                    break;
-                }
-                let Some(&(v, p_from, _p_to)) = next_cap.get(&cur) else {
-                    break;
-                };
-                ring.push((v, p_from));
-                cur = key(_p_to);
-                if cur == start_key {
-                    break;
-                }
-            }
-            if ring.len() >= 3 {
-                cycles.push(ring);
-            }
-        }
+        // Chain the directed wall-side edges into cycles by endpoint key. The cap
+        // half-edge along `pa → pb` runs `pb → pa`, so chaining the *wall* edges
+        // by shared `pb == next.pa` yields one outgoing edge per vertex and walks
+        // each cap loop uniquely (the cap loop is the wall chain reversed).
+        let cycles = chain_cap_edges(&edges);
         if cycles.is_empty() {
             return Vec::new();
         }
 
-        // Nest the cycles by exact 2-D containment.
+        // Nest the cycles by exact 2-D containment (with arc-segment area
+        // correction so an arc bulge is measured, not just the chord polygon).
         let frame = PlaneFrame::new(&self.plane);
         let cap_cycles: Vec<CapCycle> = cycles
             .into_iter()
             .map(|ring| {
-                let proj = ring.iter().map(|&(_, p)| frame.project(p)).collect();
-                CapCycle { ring, proj }
+                CapCycle::new(ring, &frame, |c| match self.out.geom.curve(c) {
+                    Some(CurveGeom::Circle(circle)) => Some(circle.radius()),
+                    _ => None,
+                })
             })
             .collect();
         let nested = nest_cap_cycles(&cap_cycles);
 
-        // Cap surface: cut plane inserted canonically; sense so its outward
-        // normal faces away from the kept material.
+        // Cap surface: cut plane inserted canonically; sense so its outward normal
+        // faces away from the kept material.
         let (surf_id, _flipped) = self.out.geom.insert_plane(self.plane, &self.tol);
         let desired = self.cap_outward_normal();
         let canon = match self.out.geom.surface(surf_id) {
@@ -2164,23 +2059,13 @@ impl<'a> Cutter<'a> {
             _ => self.plane,
         };
         let canon_normal = canon.normal().as_vec();
-        // The cap's outer ring is built from the reversed wall edges; its winding
-        // in the canonical (u × v = canon_normal) frame fixes the face's natural
-        // outward normal. Choose `sense` so the actual outward equals `desired`.
         let canon_frame = PlaneFrame::new(&canon);
 
         let mut cap_faces = Vec::new();
         for group in nested {
             // Natural outward of the built outer loop (right-hand rule about its
-            // winding in the canonical frame).
-            let outer_area = signed_area_2d(
-                &group
-                    .outer
-                    .ring
-                    .iter()
-                    .map(|&(_, p)| canon_frame.project(p))
-                    .collect::<Vec<_>>(),
-            );
+            // winding in the canonical frame, arc bulges included).
+            let outer_area = group.outer.signed_area(&canon_frame);
             let natural_outward = if outer_area >= 0.0 {
                 canon_normal
             } else {
@@ -2210,6 +2095,57 @@ impl<'a> Cutter<'a> {
         cap_faces
     }
 
+    /// Collect every cap boundary edge — straight section edges and section arcs
+    /// alike — as directed wall-side edges, after cancelling internal straight
+    /// edges (recorded in both directions by two adjacent kept faces).
+    fn collect_cap_edges(&self) -> Vec<CapEdge> {
+        // Tally signed multiplicity of straight edges per undirected key so an
+        // edge shared by two kept sub-faces (recorded both ways) cancels. Arcs are
+        // never cancelled.
+        let mut signed: HashMap<(CoordKey, CoordKey), i32> = HashMap::new();
+        for e in &self.section_edges {
+            let (ka, kb) = (key(e.pa), key(e.pb));
+            let dir = if ka <= kb { 1 } else { -1 };
+            let uk = if ka <= kb { (ka, kb) } else { (kb, ka) };
+            *signed.entry(uk).or_insert(0) += dir;
+        }
+
+        let mut emitted: std::collections::HashSet<(CoordKey, CoordKey)> =
+            std::collections::HashSet::new();
+        let mut edges: Vec<CapEdge> = Vec::new();
+        for e in &self.section_edges {
+            let (ka, kb) = (key(e.pa), key(e.pb));
+            let uk = if ka <= kb { (ka, kb) } else { (kb, ka) };
+            if signed.get(&uk).copied().unwrap_or(0) == 0 {
+                continue; // internal edge: cancels, not a cap boundary.
+            }
+            // Keep one survivor per directed edge, preserving its direction.
+            if emitted.insert((ka, kb)) {
+                edges.push(CapEdge::Straight {
+                    pa: e.pa,
+                    pb: e.pb,
+                    vb: e.b,
+                });
+            }
+        }
+        // Section arcs: every recorded arc is a genuine cap boundary. Dedup by the
+        // directed endpoint key so a doubly-recorded arc is not duplicated.
+        for a in &self.section_arcs {
+            let (ka, kb) = (key(a.pa), key(a.pb));
+            if emitted.insert((ka, kb)) {
+                edges.push(CapEdge::Arc {
+                    pa: a.pa,
+                    pb: a.pb,
+                    vb: a.b,
+                    curve: a.curve,
+                    ta: a.ta,
+                    tb: a.tb,
+                });
+            }
+        }
+        edges
+    }
+
     /// The cap's outward normal (away from kept material).
     fn cap_outward_normal(&self) -> Vec3 {
         let n = self.plane.normal().as_vec();
@@ -2221,25 +2157,40 @@ impl<'a> Cutter<'a> {
         }
     }
 
-    /// Build a cap loop's half-edges directly from its directed ring (each edge
-    /// is the reversed sibling of a wall half-edge, sharing the section curve).
+    /// Build a cap loop's half-edges directly from its directed ring of cap edges.
+    /// Each edge is the reversed sibling of a wall half-edge: a straight edge
+    /// `pa → pb` becomes the cap half-edge `pb → pa` on the shared section line; an
+    /// arc `pa → pb` with boundary `[ta, tb]` becomes `pb → pa` with boundary
+    /// `[tb, ta]` on the shared section conic.
     fn build_cap_loop(&mut self, cycle: &CapCycle) -> Id<Loop> {
-        let ring = &cycle.ring;
-        let n = ring.len();
+        let n = cycle.edges.len();
         let mut hes = Vec::with_capacity(n);
-        for i in 0..n {
-            let (va, pa) = ring[i];
-            let (_vb, pb) = ring[(i + 1) % n];
-            let Some((curve, line)) = self.section_line(pa, pb) else {
-                continue;
-            };
-            let ta = Self::line_param(&line, pa);
-            let tb = Self::line_param(&line, pb);
-            hes.push(self.out.topo.add_half_edge(HalfEdge {
-                start: va,
-                curve,
-                boundary: [ta, tb],
-            }));
+        for e in &cycle.edges {
+            match *e {
+                CapEdge::Straight { pa, pb, vb } => {
+                    // Reversed sibling: starts at pb (vb), runs to pa.
+                    let Some((curve, line)) = self.section_line(pa, pb) else {
+                        continue;
+                    };
+                    let ta = Self::line_param(&line, pb);
+                    let tb = Self::line_param(&line, pa);
+                    hes.push(self.out.topo.add_half_edge(HalfEdge {
+                        start: vb,
+                        curve,
+                        boundary: [ta, tb],
+                    }));
+                }
+                CapEdge::Arc {
+                    vb, curve, ta, tb, ..
+                } => {
+                    // Reversed sibling: starts at pb (vb), boundary [tb, ta].
+                    hes.push(self.out.topo.add_half_edge(HalfEdge {
+                        start: vb,
+                        curve,
+                        boundary: [tb, ta],
+                    }));
+                }
+            }
         }
         self.out.topo.add_loop(Loop { half_edges: hes })
     }
@@ -2333,13 +2284,17 @@ fn straddles(a: Sign3, b: Sign3) -> bool {
     )
 }
 
-/// Pick the directed angular interval between `t0` and `t1` that passes through
-/// `rep` (an interior representative angle), returning `[from, to]`.
+/// Pick the directed angular interval **from `t0` to `t1`** along the arc that
+/// passes through `rep` (an interior representative angle), returning `[from, to]`
+/// with `from ≡ t0` and `to ≡ t1` (mod 2π).
 ///
-/// Angles are on a circle; the two endpoints split it into two arcs. We choose
-/// the arc that contains `rep` and orient the interval so a parameter sweep from
-/// `from` to `to` stays on that arc (allowing one endpoint to exceed `2π` so the
-/// half-edge boundary is monotone, matching the curve parameterisation).
+/// Angles are on a circle; the two endpoints `t0`, `t1` split it into two arcs.
+/// We choose the arc that contains `rep` and orient the sweep so it **starts at
+/// `t0` and ends at `t1`**, going CCW or CW as needed (allowing the end to exceed
+/// `2π` or go below `0` so the half-edge boundary is monotone, matching the curve
+/// parameterisation). Crucially `from` always corresponds to `t0` (so the caller's
+/// `pa ↔ ta`, `pb ↔ tb` association is preserved regardless of which arc is
+/// chosen) — only the sweep direction changes.
 fn arc_interval_containing(t0: f64, t1: f64, rep: f64) -> (f64, f64) {
     let two_pi = std::f64::consts::TAU;
     let norm = |a: f64| {
@@ -2350,15 +2305,15 @@ fn arc_interval_containing(t0: f64, t1: f64, rep: f64) -> (f64, f64) {
         x
     };
     let (n0, n1, nr) = (norm(t0), norm(t1), norm(rep));
-    // Arc going from n0 increasing to n1 (wrapping): does it contain nr?
+    // CCW (increasing) arc from n0 to n1; does it contain rep?
     let span_inc = norm(n1 - n0);
     let rep_off = norm(nr - n0);
     if rep_off <= span_inc {
-        // Increasing arc n0 → n0 + span_inc contains rep.
+        // Sweep CCW: n0 → n0 + span_inc (≡ n1).
         (n0, n0 + span_inc)
     } else {
-        // The other arc: n1 → n1 + (2π − span_inc) = n0 + 2π.
-        (n1, n1 + (two_pi - span_inc))
+        // Sweep CW: n0 → n0 − (2π − span_inc) (≡ n1 the other way round).
+        (n0, n0 - (two_pi - span_inc))
     }
 }
 
@@ -2647,12 +2602,145 @@ fn representative_point(poly: &[[f64; 2]]) -> [f64; 2] {
 
 // ── cap cycle assembly ────────────────────────────────────────────────────
 
-/// A closed cap cycle: an ordered ring of (vertex, point) pairs.
+/// A directed cap boundary edge on the cut plane, recorded in the *wall-side*
+/// direction `pa → pb`. The cap half-edge along it is the reversed sibling
+/// `pb → pa` on the same curve. Straight edges and arcs share this pool so a cap
+/// loop can mix them (a rectangular cross-section with a circular notch / hole).
+#[derive(Debug, Clone, Copy)]
+enum CapEdge {
+    /// A straight section edge on the cut plane.
+    Straight {
+        pa: Point3,
+        pb: Point3,
+        /// Output vertex at `pb` (the cap half-edge's start).
+        vb: Id<Vertex>,
+    },
+    /// An arc of the `plane ∩ cylinder` section conic.
+    Arc {
+        pa: Point3,
+        pb: Point3,
+        /// Output vertex at `pb` (the cap half-edge's start).
+        vb: Id<Vertex>,
+        /// The shared section conic curve.
+        curve: CurveId,
+        /// Wall-side angular boundary `[ta, tb]`; the cap arc uses `[tb, ta]`.
+        ta: f64,
+        tb: f64,
+    },
+}
+
+impl CapEdge {
+    fn pa(&self) -> Point3 {
+        match *self {
+            CapEdge::Straight { pa, .. } | CapEdge::Arc { pa, .. } => pa,
+        }
+    }
+    fn pb(&self) -> Point3 {
+        match *self {
+            CapEdge::Straight { pb, .. } | CapEdge::Arc { pb, .. } => pb,
+        }
+    }
+}
+
+/// Chain directed wall-side cap edges into closed cycles.
+///
+/// Each edge runs `pa → pb`; the cap loop is the wall chain reversed, so we walk
+/// the wall edges forward by `pb == next.pa` (one outgoing edge per vertex) and
+/// emit the reversed siblings when building the loop. Returns each cycle as the
+/// ordered ring of wall edges in the order their reversed siblings traverse the
+/// cap loop (i.e. the wall chain reversed).
+fn chain_cap_edges(edges: &[CapEdge]) -> Vec<Vec<CapEdge>> {
+    // Index edges by the key of their start point `pa`.
+    let mut from: HashMap<CoordKey, usize> = HashMap::new();
+    for (i, e) in edges.iter().enumerate() {
+        from.entry(key(e.pa())).or_insert(i);
+    }
+    let mut used = vec![false; edges.len()];
+    let mut cycles: Vec<Vec<CapEdge>> = Vec::new();
+    for start in 0..edges.len() {
+        if used[start] {
+            continue;
+        }
+        let mut chain: Vec<CapEdge> = Vec::new();
+        let mut cur = start;
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            if guard > edges.len() * 2 + 8 {
+                break;
+            }
+            if used[cur] {
+                break;
+            }
+            used[cur] = true;
+            chain.push(edges[cur]);
+            let tail = key(edges[cur].pb());
+            match from.get(&tail) {
+                Some(&ni) if !used[ni] => cur = ni,
+                _ => break,
+            }
+        }
+        if chain.len() >= 2 {
+            // The cap loop traverses the reversed siblings, i.e. the wall chain in
+            // reverse order. Storing it reversed lets `build_cap_loop` emit the
+            // half-edges in loop order directly.
+            chain.reverse();
+            cycles.push(chain);
+        }
+    }
+    cycles
+}
+
+/// A closed cap cycle: an ordered ring of cap edges (in cap-loop order, i.e.
+/// each is the reversed sibling of its wall edge).
 #[derive(Debug, Clone)]
 struct CapCycle {
-    ring: Vec<(Id<Vertex>, Point3)>,
-    /// Projected 2-D ring for nesting.
+    edges: Vec<CapEdge>,
+    /// Projected 2-D chord ring (each edge's `pb`) for nesting / area.
     proj: Vec<[f64; 2]>,
+    /// Per-arc `(radius, signed_sweep)` corrections in cap-loop direction, for the
+    /// arc-corrected loop area; straight edges contribute nothing.
+    arc_terms: Vec<(f64, f64)>,
+}
+
+impl CapCycle {
+    /// Build a cap cycle from its ordered cap edges (cap-loop direction).
+    ///
+    /// The 2-D chord ring uses each edge's start point `pb` (the cap half-edge's
+    /// start). `radius_of` resolves an arc curve's radius for the segment-area
+    /// correction; `None` (e.g. an ellipse) drops the correction for that arc.
+    fn new(
+        edges: Vec<CapEdge>,
+        frame: &PlaneFrame,
+        radius_of: impl Fn(CurveId) -> Option<f64>,
+    ) -> Self {
+        // In cap-loop order each cap half-edge runs pb → pa; its start point is pb.
+        let proj: Vec<[f64; 2]> = edges.iter().map(|e| frame.project(e.pb())).collect();
+        let arc_terms: Vec<(f64, f64)> = edges
+            .iter()
+            .filter_map(|e| match *e {
+                CapEdge::Straight { .. } => None,
+                CapEdge::Arc { curve, ta, tb, .. } => {
+                    // The cap arc (reversed sibling) sweeps tb → ta.
+                    radius_of(curve).map(|r| (r, ta - tb))
+                }
+            })
+            .collect();
+        Self {
+            edges,
+            proj,
+            arc_terms,
+        }
+    }
+
+    /// Exact signed area of the cap loop in `frame`, including arc-segment
+    /// corrections. The chord polygon is the projected `pb` ring; the per-arc
+    /// `(radius, sweep)` corrections are precomputed at construction (and are
+    /// invariant under an in-plane frame, so they apply to any cap frame).
+    fn signed_area(&self, frame: &PlaneFrame) -> f64 {
+        let ring: Vec<[f64; 2]> = self.edges.iter().map(|e| frame.project(e.pb())).collect();
+        loop_signed_area_2d(&ring, &self.arc_terms)
+    }
 }
 
 /// A nesting group of cap cycles: outer + holes.
