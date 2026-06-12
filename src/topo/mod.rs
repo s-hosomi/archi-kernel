@@ -28,7 +28,7 @@ pub mod store;
 pub mod validate;
 
 pub use store::TopoStore;
-pub use validate::{Defect, ValidateLevel};
+pub use validate::{sibling_pairs, Defect, ValidateLevel};
 
 use crate::geom::{CurveId, PointId, SurfaceId};
 use arena::Id;

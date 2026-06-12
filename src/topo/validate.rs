@@ -181,12 +181,51 @@ pub fn validate_topology(
         None => return Err(defects),
     };
 
-    let (pairs, sibling_map) = check_siblings(store, &reachable, tol, &mut defects);
+    let (pairs, sibling_map) = pair_siblings(store, &reachable.half_edges, tol, &mut defects);
     check_loop_continuity(store, &reachable, &sibling_map, &mut defects);
     check_euler(&reachable, pairs, expected_genus, &mut defects);
 
     if defects.is_empty() {
         Ok(())
+    } else {
+        Err(defects)
+    }
+}
+
+/// Pair up the sibling half-edges of the given solids and return the pairing.
+///
+/// This is the reusable, public form of the sibling matching that
+/// [`validate_topology`] runs internally (`synthesis.md`: "tolerant パスの
+/// sibling 対応づけ"). Two half-edges are siblings when they share the same
+/// curve and have reversed boundary intervals (`[a, b]` vs `[b, a]`, compared
+/// with `tol.eq_length`); the watertight tessellator
+/// ([`crate::tess`]) consumes the pairing so that the two faces meeting at an
+/// edge discretise it identically.
+///
+/// On success returns a map sending every successfully paired half-edge to its
+/// sibling (the map is symmetric: both directions are present). On failure
+/// returns every [`Defect`] found — an unpaired half-edge
+/// ([`Defect::MissingSibling`], the shell is not watertight) or an over-shared
+/// one ([`Defect::MultipleSiblings`], a local non-manifold) — so callers that
+/// require a complete pairing can refuse to proceed. A dangling handle yields a
+/// [`Defect::DanglingReference`].
+///
+/// `tol` is used only to compare boundary parameters; no coordinates are
+/// inspected, so the "topology carries no geometry" invariant (`DESIGN.md`
+/// §3.2) holds.
+pub fn sibling_pairs(
+    store: &TopoStore,
+    solids: &[Id<Solid>],
+    tol: &Tol,
+) -> Result<HashMap<Id<HalfEdge>, Id<HalfEdge>>, Vec<Defect>> {
+    let mut defects = Vec::new();
+    let reachable = match gather(store, solids, &mut defects) {
+        Some(r) => r,
+        None => return Err(defects),
+    };
+    let (_pairs, sibling_map) = pair_siblings(store, &reachable.half_edges, tol, &mut defects);
+    if defects.is_empty() {
+        Ok(sibling_map)
     } else {
         Err(defects)
     }
@@ -328,15 +367,19 @@ fn push_dangling(defects: &mut Vec<Defect>, kind: EntityKind, index: u32, genera
 /// half-edges are siblings when they share the same curve and have reversed
 /// boundaries (`[a, b]` vs `[b, a]`, compared with `tol.eq_length`). Pairing is
 /// greedy within a curve group; a 3-way match is reported as a defect.
-fn check_siblings(
+///
+/// This is the single matching implementation shared by [`validate_topology`]
+/// and the public [`sibling_pairs`] query; it takes only the list of half-edges
+/// to pair so both call sites use identical semantics.
+fn pair_siblings(
     store: &TopoStore,
-    reachable: &Reachable,
+    half_edges: &[Id<HalfEdge>],
     tol: &Tol,
     defects: &mut Vec<Defect>,
 ) -> (usize, HashMap<Id<HalfEdge>, Id<HalfEdge>>) {
     // Group half-edges by the curve they run along.
     let mut by_curve: HashMap<CurveId, Vec<Id<HalfEdge>>> = HashMap::new();
-    for &he_id in &reachable.half_edges {
+    for &he_id in half_edges {
         if let Some(he) = store.half_edges.get(he_id) {
             by_curve.entry(he.curve).or_default().push(he_id);
         }

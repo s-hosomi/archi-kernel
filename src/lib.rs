@@ -11,6 +11,7 @@
 pub mod boolean;
 pub mod brep;
 pub mod build;
+pub mod clash;
 pub mod csg;
 pub mod error;
 pub mod geom;
@@ -22,6 +23,7 @@ pub mod predicate;
 pub mod primitives;
 pub mod profile;
 pub mod section;
+pub mod tess;
 pub mod tolerance;
 pub mod topo;
 
