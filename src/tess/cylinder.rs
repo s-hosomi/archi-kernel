@@ -19,7 +19,11 @@
 //!
 //! The triangle winding is chosen so the emitted normal points radially outward
 //! (the cylinder's outward normal, folded through the face
-//! [`Sense`](crate::topo::Sense)).
+//! [`Sense`](crate::topo::Sense)). The strip is built once with a single,
+//! topologically consistent base winding; the patch is then oriented as a whole
+//! by an **area-weighted** outward test (`Σ faceₙ · n_out`), so a sliver
+//! triangle near the seam — whose own face normal is dominated by round-off —
+//! cannot flip independently of its neighbours and break watertightness.
 
 use crate::brep::Brep;
 use crate::geom::CurveGeom;
@@ -118,10 +122,12 @@ pub(crate) fn tessellate_cylinder_face(
     top.frac.reverse();
 
     // Stitch the two polylines into a triangle strip. Both run seamA → seamB and
-    // share endpoints; advance whichever has covered less of its arc. Each
-    // triangle is oriented explicitly to the cylinder's outward normal (the
-    // radial direction at the triangle centroid, folded through the face sense),
-    // so winding is correct regardless of how the rim half-edges were stored.
+    // share endpoints; advance whichever has covered less of its arc. Every
+    // triangle is emitted with the strip's single consistent base winding, then
+    // the whole patch is oriented once to the cylinder's outward normal (the
+    // radial direction folded through the face sense), so winding is correct
+    // regardless of how the rim half-edges were stored — and no individual
+    // triangle can flip against its neighbours.
     let reversed = matches!(face.sense, Sense::Reversed);
     let axis_origin = cyl.axis().origin();
     let orient = Orienter {
@@ -167,14 +173,28 @@ impl Orienter {
 /// two seam points). We walk both from index 0, each step forming one triangle
 /// with the current bottom point `bi`, current top point `ti`, and the next
 /// point on whichever rim has the smaller parameter fraction — a parameter
-/// merge that consumes every vertex of both rims. The base winding `(b0, b1,
-/// t)` / `(b, t1, t0)` makes the outward (radial) normal; the face sense flips
-/// it.
+/// merge that consumes every vertex of both rims.
+///
+/// All triangles are collected with one consistent base winding (`(b0, b1, t)`
+/// for a bottom advance, `(b, t1, t0)` for a top advance — both wind the same
+/// way around the strip). The whole patch is then oriented to the outward
+/// normal by a single **area-weighted** test: `Σ faceₙ · n_out` summed over all
+/// triangles, where `faceₙ = (p1−p0)×(p2−p0)` has magnitude proportional to
+/// twice the triangle area. A sliver near the seam contributes a vanishing
+/// term, so the sound, area-bearing triangles set the sign; if it is negative
+/// every triangle is reversed together. This keeps the strip internally
+/// consistent (no neighbour can disagree) while still folding through the face
+/// sense correctly.
 fn stitch(bottom: &Rim, top: &Rim, builder: &mut MeshBuilder, face_tag: u32, orient: &Orienter) {
     let mut i = 0usize; // bottom index
     let mut j = 0usize; // top index
     let nb = bottom.pts.len();
     let nt = top.pts.len();
+
+    // Collect the strip in its base winding, accumulating the area-weighted
+    // agreement with the outward normal as we go.
+    let mut tris: Vec<(Point3, Point3, Point3)> = Vec::with_capacity(nb + nt);
+    let mut signed = 0.0_f64;
 
     while i + 1 < nb || j + 1 < nt {
         // Decide which rim to advance: the one whose next point has the smaller
@@ -197,33 +217,31 @@ fn stitch(bottom: &Rim, top: &Rim, builder: &mut MeshBuilder, face_tag: u32, ori
             j += 1;
             tri
         };
-        emit(builder, orient, p0, p1, p2, face_tag);
-    }
-}
 
-/// Intern and emit a triangle wound to the cylinder's outward normal at its
-/// centroid (explicit orientation, robust to rim storage direction).
-fn emit(
-    builder: &mut MeshBuilder,
-    orient: &Orienter,
-    p0: Point3,
-    p1: Point3,
-    p2: Point3,
-    face_tag: u32,
-) {
-    let centroid = Point3::new(
-        (p0.x + p1.x + p2.x) / 3.0,
-        (p0.y + p1.y + p2.y) / 3.0,
-        (p0.z + p1.z + p2.z) / 3.0,
-    );
-    let n_out = orient.outward_at(centroid);
-    let face_n = (p1 - p0).cross(p2 - p0);
-    let a = builder.vertex(p0);
-    let b = builder.vertex(p1);
-    let c = builder.vertex(p2);
-    if face_n.dot(n_out) >= 0.0 {
-        builder.triangle(a, b, c, face_tag);
-    } else {
-        builder.triangle(a, c, b, face_tag);
+        let centroid = Point3::new(
+            (p0.x + p1.x + p2.x) / 3.0,
+            (p0.y + p1.y + p2.y) / 3.0,
+            (p0.z + p1.z + p2.z) / 3.0,
+        );
+        let n_out = orient.outward_at(centroid);
+        let face_n = (p1 - p0).cross(p2 - p0);
+        // Area-weighted because `face_n` magnitude is 2·area: a sliver's tiny,
+        // round-off-dominated contribution cannot swing the patch's sign.
+        signed += face_n.dot(n_out);
+        tris.push((p0, p1, p2));
+    }
+
+    // Orient the whole patch once. `signed == 0` only for a degenerate (zero
+    // area) patch, where either winding is equivalent — keep the base winding.
+    let flip = signed < 0.0;
+    for (p0, p1, p2) in tris {
+        let a = builder.vertex(p0);
+        let b = builder.vertex(p1);
+        let c = builder.vertex(p2);
+        if flip {
+            builder.triangle(a, c, b, face_tag);
+        } else {
+            builder.triangle(a, b, c, face_tag);
+        }
     }
 }
