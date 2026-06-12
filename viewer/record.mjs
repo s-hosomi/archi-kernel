@@ -50,15 +50,8 @@ const setZ = async (zv) => {
 
 let n = 0;
 for (const z of zs) {
-  // If this exact plane height hits a (known, pinned) tangency degeneracy in a
-  // member, nudge the plane a few millimetres until every member sections
-  // cleanly — the frame stays honest kernel output, just at z ± ~1 cm.
-  let errs = await setZ(z);
-  for (const dz of [0.012, -0.012, 0.024, 0.05, -0.05, 0.08]) {
-    if (!errs) break;
-    console.log(`frame ${n} z=${z.toFixed(4)}: section error, nudging by ${dz}`);
-    errs = await setZ(z + dz);
-  }
+  const errs = await setZ(z);
+  if (errs) console.log(`frame ${n} z=${z.toFixed(4)}: ${errs} section errors`);
   await page.screenshot({ path: `${outdir}/f${String(n).padStart(3, '0')}.png` });
   n++;
 }
