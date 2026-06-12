@@ -1015,3 +1015,139 @@ fn strip_notched_by_cylinder_section_has_arc_loop() {
         "the section of a cylinder-notched strip must expose an Arc edge"
     );
 }
+
+// ── Horizontal sleeve (axis-parallel chord cut near the tangent) ─────────────
+//
+// Regression for the viewer's section sweep: a beam pierced by a *horizontal*
+// circular sleeve (cylinder axis along Y), cut by a *horizontal* plane (normal
+// Z) parallel to the sleeve axis at a height close to the cylinder's top/bottom
+// tangent. Near the tangent the two ruling-line crossings on a rim arc collapse
+// to (almost) the same angle; the chord-cut path must not emit a zero-length /
+// micro arc nor an unpaired half-circle, and exactly at the tangent it must
+// treat the plane as non-crossing (contact, no split).
+
+/// Build `beam − sleeve` where the sleeve is a horizontal cylinder along +Y.
+/// The beam is the world AABB `x∈[bx0,bx1] × z∈[bz0,bz1]`, extruded along Y over
+/// `y∈[0, len]`; the sleeve is radius `r` centred on the line `(cx, *, cz)`,
+/// running the full length plus overhang.
+#[allow(clippy::too_many_arguments)]
+fn beam_minus_sleeve_y(
+    bx0: f64,
+    bx1: f64,
+    bz0: f64,
+    bz1: f64,
+    cx: f64,
+    cz: f64,
+    r: f64,
+    len: f64,
+) -> (Brep, Id<Solid>) {
+    let tol = Tol::default();
+    // ExtrudeLeaf profiles live in the plane ⟂ axis. For axis +Y the profile's
+    // local (u, v) map to world (z, x) via `prismatic`'s frame; build the beam
+    // from a rectangle and the sleeve from a circle, both extruded along Y.
+    let half_w = 0.5 * (bx1 - bx0);
+    let half_h = 0.5 * (bz1 - bz0);
+    let base = ExtrudeLeaf {
+        profile: Profile2d::rect(half_w, half_h).expect("rect"),
+        origin: Point3::new(0.5 * (bx0 + bx1), 0.0, 0.5 * (bz0 + bz1)),
+        axis: Vec3::Y,
+        length: len,
+    };
+    let tool = ExtrudeLeaf {
+        profile: Profile2d::circle(r).expect("circle"),
+        origin: Point3::new(cx, -0.5, cz),
+        axis: Vec3::Y,
+        length: len + 1.0,
+    };
+    let brep = prismatic::difference(&base, &tool, &tol).expect("beam - sleeve");
+    brep.validate(&tol, ValidateLevel::Full)
+        .expect("input is watertight");
+    let solid = brep.solids[0];
+    (brep, solid)
+}
+
+/// Cut the beam-with-sleeve at horizontal `z = z_cut`, asserting Full validity on
+/// both halves and that their volumes sum to the whole.
+fn assert_horiz_cut_conserves(brep: &Brep, solid: Id<Solid>, z_cut: f64) {
+    let tol = Tol::default();
+    let total = brep.signed_volume();
+    let cut_plane = plane(Point3::new(0.0, 0.0, z_cut), Vec3::Z);
+
+    let below = cut(brep, solid, &cut_plane, KeepSide::Below, &tol).expect("below");
+    let above = cut(brep, solid, &cut_plane, KeepSide::Above, &tol).expect("above");
+    let vb = below.brep().signed_volume();
+    let va = above.brep().signed_volume();
+    below
+        .brep()
+        .validate(&tol, ValidateLevel::Full)
+        .expect("below watertight");
+    above
+        .brep()
+        .validate(&tol, ValidateLevel::Full)
+        .expect("above watertight");
+    assert!(
+        (vb + va - total).abs() < VOL_EPS_CURVED,
+        "halves must sum to the whole at z={z_cut}: {vb} + {va} vs {total}"
+    );
+}
+
+#[test]
+fn horizontal_sleeve_chord_cut_near_top_tangent() {
+    // Sleeve centre z = 3.15, r = 0.1 ⇒ top tangent at z = 3.25. Cut 5.5 mm below
+    // the tangent. Before the fix this raised `MissingSibling { boundary:
+    // [-π/2, π/2] }` (an unpaired half arc from the collapsed crossings).
+    let cz = 3.15_f64;
+    let r = 0.1_f64;
+    let (brep, solid) = beam_minus_sleeve_y(-0.2, 0.2, 2.8, 3.5, 0.0, cz, r, 4.0);
+    assert_horiz_cut_conserves(&brep, solid, cz + r - 0.0055);
+}
+
+#[test]
+fn horizontal_sleeve_chord_cut_near_bottom_tangent() {
+    // Bottom tangent at z = 3.05; cut 19.5 mm above it. Before the fix this raised
+    // `MissingSibling { boundary: [π, π] }` (a zero-sweep degenerate arc).
+    let cz = 3.15_f64;
+    let r = 0.1_f64;
+    let (brep, solid) = beam_minus_sleeve_y(-0.2, 0.2, 2.8, 3.5, 0.0, cz, r, 4.0);
+    assert_horiz_cut_conserves(&brep, solid, cz - r + 0.0195);
+}
+
+#[test]
+fn horizontal_sleeve_chord_cut_sweep_near_tangents() {
+    // A small sweep at several offsets inside both tangents (the viewer's section
+    // sweep): every height must cut cleanly and conserve volume.
+    let cz = 3.15_f64;
+    let r = 0.1_f64;
+    let (brep, solid) = beam_minus_sleeve_y(-0.2, 0.2, 2.8, 3.5, 0.0, cz, r, 4.0);
+    for &eps in &[0.0005_f64, 0.002, 0.005, 0.02, 0.05] {
+        assert_horiz_cut_conserves(&brep, solid, cz + r - eps); // below top tangent
+        assert_horiz_cut_conserves(&brep, solid, cz - r + eps); // above bottom tangent
+    }
+}
+
+#[test]
+fn horizontal_sleeve_chord_cut_exact_tangent_is_contact() {
+    // Exactly at the top tangent (z = centre + r within Tol): the plane touches
+    // the sleeve at a single ruling and must be treated as contact — no split,
+    // the whole beam kept on the side the sleeve sits, volume conserved.
+    let cz = 3.15_f64;
+    let r = 0.1_f64;
+    let (brep, solid) = beam_minus_sleeve_y(-0.2, 0.2, 2.8, 3.5, 0.0, cz, r, 4.0);
+    assert_horiz_cut_conserves(&brep, solid, cz + r);
+    assert_horiz_cut_conserves(&brep, solid, cz - r);
+}
+
+#[test]
+fn horizontal_sleeve_section_near_tangent() {
+    // Same construction through `section()` (cut twice + intersect caps).
+    let tol = Tol::default();
+    let cz = 3.15_f64;
+    let r = 0.1_f64;
+    let (brep, solid) = beam_minus_sleeve_y(-0.2, 0.2, 2.8, 3.5, 0.0, cz, r, 4.0);
+    let sec_plane = plane(Point3::new(0.0, 0.0, cz + r - 0.0055), Vec3::Z);
+    let result = section(&brep, solid, &sec_plane, &tol).expect("section");
+    assert!(
+        !result.profiles.is_empty(),
+        "section must produce a profile"
+    );
+}

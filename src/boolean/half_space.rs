@@ -550,7 +550,6 @@ impl<'a> Cutter<'a> {
         let Some(surface) = surface else {
             return;
         };
-
         // Determine the face's status from its vertex classes.
         let loops = self.face_loops(&face);
         let (kept, dropped, on) = self.face_side_summary(&loops, class);
@@ -743,7 +742,7 @@ impl<'a> Cutter<'a> {
         // the axis by z (the plane equation already absorbs the offset).
         let centre_at = |z: f64| axis.origin() + axis_dir * z;
         for &z in &[z_lo, z_hi] {
-            let roots = split_conic_param(centre_at(z), u * r, v * r, &self.plane);
+            let roots = split_conic_param(centre_at(z), u * r, v * r, &self.plane, &self.tol);
             for root in roots {
                 let t = align_into_interval(root, lo, hi, std::f64::consts::TAU);
                 if interior(t) {
@@ -1282,7 +1281,7 @@ impl<'a> Cutter<'a> {
             CurveGeom::Line(_) => return Vec::new(),
         };
         let (c, p_vec, q_vec) = axes;
-        let roots = split_conic_param(c, p_vec, q_vec, &self.plane);
+        let roots = split_conic_param(c, p_vec, q_vec, &self.plane, &self.tol);
         let (lo, hi) = (boundary[0], boundary[1]);
         let two_pi = std::f64::consts::TAU;
         let mut hits: Vec<(Point3, f64)> = Vec::new();
@@ -1372,7 +1371,7 @@ impl<'a> Cutter<'a> {
         axes: impl Fn() -> (Point3, Vec3, Vec3),
     ) -> Option<(Point3, f64)> {
         let (c, p_vec, q_vec) = axes();
-        let roots = split_conic_param(c, p_vec, q_vec, &self.plane);
+        let roots = split_conic_param(c, p_vec, q_vec, &self.plane, &self.tol);
         // Map each root into the boundary branch and keep interior ones.
         let (lo, hi) = (boundary[0], boundary[1]);
         let two_pi = std::f64::consts::TAU;
@@ -1429,12 +1428,11 @@ impl<'a> Cutter<'a> {
         sorted.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut segs = Vec::new();
-        // Connect consecutive portal pairs whose midpoint is inside the face.
+        // Connect consecutive portal pairs whose interior is inside the face.
         for w in sorted.windows(2) {
             let (va, pa, _) = w[0];
             let (vb, pb, _) = w[1];
-            let mid = midpoint(pa, pb);
-            if self.point_inside_outline(frame.project(mid), outline_2d) {
+            if self.segment_inside_outline(pa, pb, frame, outline_2d) {
                 segs.push(SectionSeg {
                     a: va,
                     b: vb,
@@ -1444,6 +1442,33 @@ impl<'a> Cutter<'a> {
             }
         }
         segs
+    }
+
+    /// `true` if the section segment `pa → pb` runs through face material.
+    ///
+    /// The test samples several interior points and takes the majority verdict.
+    /// A single midpoint test is fragile when the midpoint lands exactly on a
+    /// hole's tangent point (a section line grazing a circular hole at a near-
+    /// tangent height): that point sits on the sampled hole outline and the
+    /// even-odd parity flips spuriously. Sampling at asymmetric interior fractions
+    /// avoids the special midpoint and is robust to such grazing contacts.
+    fn segment_inside_outline(
+        &self,
+        pa: Point3,
+        pb: Point3,
+        frame: &PlaneFrame,
+        outline_2d: &[Vec<[f64; 2]>],
+    ) -> bool {
+        let mut inside = 0;
+        let mut total = 0;
+        for &f in &[0.5_f64, 0.25, 0.75, 0.125, 0.625] {
+            let p = pa + (pb - pa) * f;
+            total += 1;
+            if self.point_inside_outline(frame.project(p), outline_2d) {
+                inside += 1;
+            }
+        }
+        inside * 2 > total
     }
 
     /// Point-in-face test against the projected outline loops (outer adds, holes
@@ -2317,11 +2342,6 @@ fn arc_interval_containing(t0: f64, t1: f64, rep: f64) -> (f64, f64) {
     }
 }
 
-/// Midpoint of two points.
-fn midpoint(a: Point3, b: Point3) -> Point3 {
-    Point3::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.z + b.z) * 0.5)
-}
-
 /// Bring an angle `root` into the directed interval `[lo, hi]` by adding /
 /// subtracting `period`.
 fn align_into_interval(root: f64, lo: f64, hi: f64, period: f64) -> f64 {
@@ -2809,7 +2829,21 @@ fn nest_cap_cycles(cycles: &[CapCycle]) -> Vec<CapGroup> {
 /// With `R = hypot(A, B)`, `φ = atan2(B, A)` the equation is `R cos(t − φ) = C`,
 /// whose roots are `t = φ ± acos(C / R)` when `|C| ≤ R` (a tangent when `|C| = R`,
 /// none when `|C| > R`).
-fn split_conic_param(c: Point3, p_vec: Vec3, q_vec: Vec3, plane: &Plane) -> Vec<f64> {
+///
+/// # Tangent degeneracy (DESIGN.md §2.2)
+///
+/// Near a tangent the two roots `φ ± acos(C/R)` collapse to (almost) the same
+/// angle, and an arc split there would emit a zero-length / micro section edge or
+/// an unpaired half arc — the chord-cut failure of a horizontal cut grazing a
+/// sleeve rim. The amplitude `R` is the conic radius measured along the plane's
+/// in-section direction, so `R − |C|` is the geometric distance from the plane to
+/// the tangent. When that gap is within `Tol::length` the plane *touches* the
+/// conic (contact, not a crossing) and **no** roots are returned: the two crossing
+/// points would be closer than the length tolerance along the arc, a sub-tolerance
+/// sliver. This converts the angular degeneracy to the length comparison the
+/// design mandates (`R·Δθ ≤ Tol::length`, with `R·Δθ ≈ √(2 R (R−|C|))` near the
+/// tangent, so `R − |C| ≤ Tol::length` is the conservative length-based gate).
+fn split_conic_param(c: Point3, p_vec: Vec3, q_vec: Vec3, plane: &Plane, tol: &Tol) -> Vec<f64> {
     let n = plane.normal().as_vec();
     let a = n.dot(p_vec);
     let b = n.dot(q_vec);
@@ -2818,11 +2852,13 @@ fn split_conic_param(c: Point3, p_vec: Vec3, q_vec: Vec3, plane: &Plane) -> Vec<
     if r == 0.0 {
         return Vec::new();
     }
-    let ratio = cc / r;
-    // Outside [−1, 1] beyond a hair (tangent tolerance) means no intersection.
-    if !(-1.0..=1.0).contains(&ratio) && ratio.abs() - 1.0 > 1e-9_f64 {
+    // Distance from the plane to the conic's tangent, in length units. Within
+    // `Tol::length` of tangent (or beyond it) the plane only grazes the conic:
+    // the two crossings are a sub-tolerance sliver apart, so report no crossing.
+    if r - cc.abs() <= tol.length {
         return Vec::new();
     }
+    let ratio = cc / r;
     let clamped = ratio.clamp(-1.0, 1.0);
     let phi = b.atan2(a);
     let delta = clamped.acos();
@@ -2834,9 +2870,5 @@ fn split_conic_param(c: Point3, p_vec: Vec3, q_vec: Vec3, plane: &Plane) -> Vec<
         }
         x
     };
-    if delta < 1e-12_f64 {
-        vec![norm(phi)]
-    } else {
-        vec![norm(phi + delta), norm(phi - delta)]
-    }
+    vec![norm(phi + delta), norm(phi - delta)]
 }
