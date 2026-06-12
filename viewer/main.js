@@ -13,7 +13,7 @@ import { Line2 } from 'three/addons/lines/Line2.js';
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import init, { KernelModel } from './pkg/archi_kernel_wasm.js';
-import { MEMBERS, KIND_OF, LEVELS } from './building.js';
+import { MEMBERS, KIND_OF, BOUNDS } from './building.js';
 
 THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
 
@@ -28,8 +28,13 @@ const TONES = {
   column: 0xb6b1a7,
   'column-round': 0xa9b3b8,
   girder: 0xa9aeb6,
+  beam: 0xb4b8be,
   slab: 0xc7c3ba,
   wall: 0xd2cec6,
+  'wall-core': 0xbcb4a6,
+  canopy: 0xc9c6bf,
+  parapet: 0xcfccc5,
+  steel: 0x5d6671,
 };
 
 // ── Renderer / scene ─────────────────────────────────────────────────────────
@@ -50,7 +55,7 @@ const camera = new THREE.PerspectiveCamera(34, 2, 0.1, 500);
 camera.up.set(0, 0, 1);
 
 const controls = new OrbitControls(camera, canvas);
-controls.target.set(7, 3, 2.6);
+controls.target.set(9.6, 5.6, 4.6);
 controls.enableDamping = true;
 controls.dampingFactor = 0.06;
 controls.maxPolarAngle = Math.PI * 0.55;
@@ -61,17 +66,17 @@ scene.environmentIntensity = 0.55;
 
 // Key light: low warm sun from the south-west, long soft shadows.
 const sun = new THREE.DirectionalLight(0xfff2e2, 2.6);
-sun.position.set(-14, -22, 24);
+sun.position.set(-16, -26, 30);
 sun.castShadow = true;
 sun.shadow.mapSize.set(4096, 4096);
-sun.shadow.camera.left = -16;
-sun.shadow.camera.right = 16;
-sun.shadow.camera.top = 16;
-sun.shadow.camera.bottom = -16;
+sun.shadow.camera.left = -22;
+sun.shadow.camera.right = 22;
+sun.shadow.camera.top = 22;
+sun.shadow.camera.bottom = -22;
 sun.shadow.camera.far = 80;
 sun.shadow.bias = -2e-4;
 sun.shadow.normalBias = 0.02;
-sun.target.position.set(7, 3, 0);
+sun.target.position.set(9.6, 5.6, 0);
 scene.add(sun, sun.target);
 scene.add(new THREE.HemisphereLight(0xdfe8f2, 0xb8b0a2, 0.5));
 
@@ -247,6 +252,7 @@ function rebuildSectionGraphics() {
 // ── UI ───────────────────────────────────────────────────────────────────────
 const toggle = document.getElementById('section-toggle');
 const slider = document.getElementById('section-z');
+slider.max = String(BOUNDS.zMax - 0.25);
 toggle.addEventListener('change', () => setSection(toggle.checked));
 slider.addEventListener('input', () => {
   document.getElementById('section-z-label').textContent =
@@ -258,14 +264,14 @@ slider.addEventListener('input', () => {
 // ── Shots (deterministic states for screenshots) ─────────────────────────────
 function applyShotMode() {
   if (SHOT === 'section') {
-    camera.position.set(14.5, -11.0, 10.5);
-    controls.target.set(6.2, 3.0, 0.9);
+    camera.position.set(27.0, -19.5, 18.5);
+    controls.target.set(8.8, 5.4, 2.4);
     toggle.checked = true;
-    slider.value = '3.3';
-    setSection(true, 3.3);
+    slider.value = '4.10';
+    setSection(true, 4.10);
   } else {
-    camera.position.set(19.5, -14.0, 9.0);
-    controls.target.set(7.0, 3.1, 2.9);
+    camera.position.set(33.5, -23.5, 15.5);
+    controls.target.set(9.6, 5.4, 5.0);
   }
   controls.update();
   if (SHOT) {

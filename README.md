@@ -9,7 +9,7 @@
 A domain-specific B-rep geometry kernel for building simulation, written in Rust with zero runtime dependencies (one exception: Shewchuk's exact predicates via the `robust` crate, isolated behind a single predicate facade). Runs natively and in the browser via WebAssembly.
 
 <p align="center">
-  <img src="assets/hero.png" alt="A two-storey RC frame — columns, clipped girders, slabs with openings and a round column — evaluated by the kernel and rendered in the Three.js viewer" width="850">
+  <img src="assets/hero.png" alt="A three-storey RC office block — set-back roof terrace with a steel pergola, round-column colonnade, window-grid facades, core walls — modelled as kernel CSG and rendered in the Three.js viewer" width="850">
 </p>
 
 <p align="center">
@@ -56,7 +56,7 @@ CSG tree (source of truth)         B-rep (derived, disposable)
 
 **Live demo: <https://s-hosomi.github.io/archi-kernel/>** (deployed from `main` by the Pages workflow).
 
-`viewer/` is a no-build-step web app: the kernel compiled to WebAssembly (`wasm/`, thin `wasm-bindgen` adapter — flat typed arrays for geometry, the kernel's serde JSON for everything structured) plus an ES-module Three.js scene. The demo constructs a two-storey RC frame *as a CSG model in JavaScript* — columns, girders clipped to columns with priority rules, slabs deducted by girders with a stair opening and a round duct, a wall with windows, a round column, sleeved beams — and lets the kernel do the rest: evaluation, watertight meshing, live section planes with kernel-computed caps, and a running concrete-volume total in the HUD.
+`viewer/` is a no-build-step web app: the kernel compiled to WebAssembly (`wasm/`, thin `wasm-bindgen` adapter — flat typed arrays for geometry, the kernel's serde JSON for everything structured) plus an ES-module Three.js scene. The demo constructs a three-storey RC office block *as a CSG model in JavaScript* (~160 members): a set-back top floor with a roof terrace and a steel H-section pergola, a round-column colonnade along the front, window-grid facades with an entrance and canopy, a stair/elevator core whose voids stack through every slab, sleeved girders, and the full quantity-take-off deduction chain — columns over girders over beams over slabs. The kernel does the rest: evaluation, watertight meshing, live section planes with kernel-computed caps, and a running concrete-volume total in the HUD.
 
 ```bash
 rustup target add wasm32-unknown-unknown   # once

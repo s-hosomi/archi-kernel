@@ -25,9 +25,9 @@ await page.waitForFunction('window.__READY === true', { timeout: 60000 });
 // Sweep: pause at the top (full floor plate), glide down through the wall and
 // windows, pause at the bottom, then the frame list is ping-ponged by the
 // caller. Eased steps so the motion reads as deliberate, not linear.
-const Z_TOP = 3.42;
+const Z_TOP = 11.15;
 const Z_BOT = 0.55;
-const STEPS = 44;
+const STEPS = 56;
 const ease = (t) => 0.5 - 0.5 * Math.cos(Math.PI * t); // smooth in/out
 
 const zs = [];
