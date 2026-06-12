@@ -57,7 +57,7 @@ pub fn reconstruct(store: &VertexStore, selected: &[&FaceLoop], tol: &Tol) -> Re
     // Surviving directed edges: forward count minus reverse count (same curve).
     let mut adj: HashMap<VertexId, Vec<DEdge>> = HashMap::new();
     let mut keys: Vec<(VertexId, VertexId, GeomKey)> = count.keys().copied().collect();
-    keys.sort_by(|x, y| (x.0, x.1, x.2).cmp(&(y.0, y.1, y.2)));
+    keys.sort_by_key(|x| (x.0, x.1, x.2));
     for k in keys {
         let (a, b, gk) = k;
         let fwd = count.get(&(a, b, gk)).map(|e| e.0).unwrap_or(0);
