@@ -68,8 +68,12 @@ pub enum SectionEdge {
         end: [f64; 2],
     },
     /// A circular arc, centre/radius in the cut-plane frame, swept from
-    /// `start_angle` to `end_angle` (radians, the curve's own parameterisation),
-    /// with `start`/`end` the arc endpoints (2-D, cut-plane frame).
+    /// `start_angle` to `end_angle` in traversal order: `end_angle −
+    /// start_angle` is the **signed sweep** of the loop's traversal (positive =
+    /// counter-clockwise in the cut-plane frame; magnitude may exceed π, up to
+    /// 2π for a closed full-circle edge). `start`/`end` are the arc endpoints
+    /// (2-D, cut-plane frame). Sampling `start_angle + t·(end_angle −
+    /// start_angle)` for `t ∈ [0, 1]` therefore reproduces the arc exactly.
     Arc {
         /// Arc centre in the cut-plane frame.
         center: [f64; 2],
@@ -367,11 +371,41 @@ fn loop_to_section(
                 has_arc = true;
                 let center = project(c.center());
                 let ang = |p: [f64; 2]| (p[1] - center[1]).atan2(p[0] - center[0]);
+                let tau = std::f64::consts::TAU;
+                let a0 = ang(s2);
+                // The endpoints alone leave the sweep ambiguous (two arcs join
+                // any two points on a circle; a closed full-circle edge is
+                // fully ambiguous). Recover the traversal's arc from the
+                // half-edge boundary: the arc must pass through the parameter
+                // midpoint. `end_angle − start_angle` is then the *signed
+                // sweep* of the traversal (up to ±2π, may exceed ±π).
+                let mid = c.point_at(0.5 * (he.boundary[0] + he.boundary[1]));
+                let am = ang(project(mid));
+                // Normalize into (0, 2π].
+                let norm = |x: f64| {
+                    let mut v = x % tau;
+                    if v <= 0.0 {
+                        v += tau;
+                    }
+                    v
+                };
+                let closed = {
+                    let dx = s2[0] - e2[0];
+                    let dy = s2[1] - e2[1];
+                    (dx * dx + dy * dy).sqrt() <= c.radius() * 1e-9
+                };
+                let (d_ccw, d_cw) = if closed {
+                    (tau, -tau)
+                } else {
+                    let n = norm(ang(e2) - a0);
+                    (n, n - tau)
+                };
+                let sweep = if norm(am - a0) < d_ccw { d_ccw } else { d_cw };
                 edges.push(SectionEdge::Arc {
                     center,
                     radius: c.radius(),
-                    start_angle: ang(s2),
-                    end_angle: ang(e2),
+                    start_angle: a0,
+                    end_angle: a0 + sweep,
                     start: s2,
                     end: e2,
                 });

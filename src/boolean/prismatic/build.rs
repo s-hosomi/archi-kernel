@@ -469,37 +469,53 @@ impl Builder {
     /// The `(start, end)` angular boundary of a directed arc `pa → pb` on a circle
     /// of `center`, swept in the `ccw` direction.
     ///
-    /// The endpoints are **anchored on the arc's own midpoint**, not on the
-    /// direction: `start` and `end` are chosen as the unique angles (modulo the
-    /// `0`/`2π` seam) whose interval contains the midpoint angle and spans the true
-    /// (≤ 2π) sweep. Because the midpoint is the same physical point for a forward
-    /// arc and its reverse, both produce the **same unordered** angle pair, so the
-    /// reverse arc's `(end, start)` reverse-matches the forward's `(start, end)`
-    /// for sibling pairing — and the two semicircles of one circle (which share
-    /// their seam endpoints) get *distinct* pairs (one through the seam, one not),
-    /// resolving the otherwise-ambiguous `MultipleSiblings`.
+    /// # The `0`/`2π` seam normalisation rule (watertightness contract)
+    ///
+    /// A half-edge and its sibling (the same physical arc traversed the other way)
+    /// must carry exactly reversed boundaries `[s, e]` vs `[e, s]`, compared with
+    /// an **absolute** tolerance — the validator does *not* compare angles modulo
+    /// `2π` (`topo::validate::is_sibling`). So the two arcs that border the same
+    /// rim — a cylinder-wall rim arc and a cap-ring arc — must agree on the *same*
+    /// numeric angle for each shared endpoint, including its `2π` offset. The rule
+    /// that guarantees this:
+    ///
+    /// 1. The arc's **half-span** `half = ½·|sweep|` and its **midpoint angle**
+    ///    `mid` are computed from the two endpoints and the direction. Both are
+    ///    direction-independent: reversing `pa↔pb` and `ccw` leaves the physical
+    ///    midpoint and the unsigned span unchanged.
+    /// 2. `mid` is taken as the polar angle of the arc's actual **midpoint
+    ///    point** (via [`circle_angle`], one `atan2(..).rem_euclid(2π)` on the
+    ///    identical physical point), *not* as `start + ½·sweep`. The latter sits
+    ///    right on the `0`/`2π` discontinuity for a seam-crossing arc, so the wall
+    ///    and the cap — computing it from opposite endpoints — landed on opposite
+    ///    sides of the seam (one read `≈0`, the other `≈2π`), yielding boundaries
+    ///    that differed by `2π` and failed to sibling-pair. Anchoring on the
+    ///    shared midpoint point removes that ambiguity entirely.
+    /// 3. The boundary is then `mid ± half`, oriented by `ccw`, so a seam-crossing
+    ///    arc reads e.g. `[-0.61, 0.61]` and its reverse `[0.61, -0.61]` — exact
+    ///    reverses regardless of which endpoint each face started from. The two
+    ///    semicircles of a full circle (which share the seam endpoints) still get
+    ///    *distinct* pairs (their midpoints differ by π), resolving the otherwise
+    ///    ambiguous `MultipleSiblings`.
+    ///
+    /// [`Circle3::point_at`](crate::primitives::Circle3::point_at) is
+    /// `2π`-periodic, so a boundary that leaves `[0, 2π)` still names the correct
+    /// point.
     fn arc_angles(center: [f64; 2], pa: [f64; 2], pb: [f64; 2], ccw: bool) -> (f64, f64) {
-        use std::f64::consts::TAU;
         let a = Self::circle_angle(center, pa);
         let b_raw = Self::circle_angle(center, pb);
-        // Midpoint of the directed arc in the (e1,e2) frame.
         let s = directed_sweep_angles(a, b_raw, ccw); // signed, in (-2π, 2π)
-                                                      // End angle = start + signed sweep (may leave [0,2π); that is exactly how
-                                                      // the seam-crossing arc is distinguished — it reads e.g. [π, 2π] while the
-                                                      // other semicircle reads [0, π]). The reverse arc, anchored on the same
-                                                      // midpoint, yields the swapped pair.
-        let end = a + s;
-        // Normalise the *pair* so it is independent of which endpoint we started
-        // from: rotate so the smaller angle is the start's canonical value. We key
-        // on the midpoint so forward/reverse agree.
-        let mid = a + 0.5 * s;
-        let mid_norm = mid.rem_euclid(TAU);
-        // Recompute start/end as mid ± half-sweep with start being mid − |s|/2 in
-        // the canonical frame, then orient by ccw so the reverse swaps them.
         let half = 0.5 * s.abs();
-        let lo = mid_norm - half;
-        let hi = mid_norm + half;
-        let _ = (a, end);
+        // Midpoint angle of the directed arc, reduced to a canonical `[0, 2π)`
+        // representative that is the **same for the forward and reverse
+        // traversals**. The two traversals' raw midpoints `a + ½·s` differ by
+        // exactly `0` or `2π` (the reverse folds the far endpoint into `[0,2π)`),
+        // so reducing modulo `2π` agrees — *except* right on the seam, where one
+        // raw value is `≈0` and the other `≈2π`; `seam_canonical_angle` snaps both
+        // to the same side so they cannot disagree by a full turn.
+        let mid = seam_canonical_angle(a + 0.5 * s);
+        let lo = mid - half;
+        let hi = mid + half;
         if ccw {
             (lo, hi)
         } else {
@@ -771,6 +787,32 @@ impl Builder {
         brep.validate(tol, ValidateLevel::Full)
             .map_err(PrismError::InvalidResult)?;
         Ok(brep)
+    }
+}
+
+/// Reduce an angle to a canonical `[0, 2π)` representative that is **seam-stable**:
+/// any value within a hair of a full turn (the `0`/`2π` seam) folds to exactly
+/// `0`, not to `2π − ε`.
+///
+/// This is the keystone of the arc-boundary normalisation
+/// ([`Builder::arc_angles`]). The midpoint angle of a directed arc is computed as
+/// `start + ½·sweep`; the same physical arc traversed the other way yields a raw
+/// midpoint that differs by exactly `0` or `2π`. A plain `rem_euclid(2π)` maps
+/// those to the same number *except* when the midpoint sits on the seam, where
+/// rounding pushes one copy to `≈0` and the other to `≈2π` — and the resulting
+/// boundary pairs then differ by `2π` and fail to sibling-pair (the watertightness
+/// break this function fixes). Snapping the seam removes that single ambiguity, so
+/// forward and reverse arcs always produce exactly reversed boundaries.
+fn seam_canonical_angle(theta: f64) -> f64 {
+    use std::f64::consts::TAU;
+    // A sub-tolerance angular epsilon: far below any geometric angle the build can
+    // produce, but comfortably above floating-point seam jitter (~1e-12).
+    const SEAM_EPS: f64 = 1.0e-9;
+    let r = theta.rem_euclid(TAU);
+    if r >= TAU - SEAM_EPS || r <= SEAM_EPS {
+        0.0
+    } else {
+        r
     }
 }
 
