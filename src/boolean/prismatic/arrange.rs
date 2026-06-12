@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::boolean::poly2d::geom::{orient2d, Arc, Edge2, Orient, Point2};
 use crate::boolean::poly2d::intersect::intersect;
 use crate::boolean::poly2d::snap::{VertexId, VertexStore};
-use crate::boolean::poly2d::{Poly2Error, Region};
+use crate::boolean::poly2d::{Contour, Poly2Error, Region};
 use crate::tolerance::Tol;
 
 use super::error::PrismError;
@@ -113,9 +113,28 @@ impl Arrangement {
 
     /// Build the arrangement overlaying every operand region.
     pub(super) fn build(regions: &[&Region], tol: &Tol) -> Result<Self, PrismError> {
+        // Vertex-on-edge (grazing) projection, ported from the validated 2-D
+        // engine ([`crate::boolean::poly2d::arrangement`]). Before any snapping or
+        // pairwise splitting, move each operand vertex that lies within `tol` of a
+        // *different* operand's straight edge interior onto that edge. This
+        // collapses sub-tolerance grazing gaps (two near-collinear vertical edges
+        // separated by ~ULP) into exact coincidences, so the existing collinear
+        // split + `VertexStore` snap produce shared vertices instead of leaving a
+        // sliver that empties the residency classification. Without this step a
+        // near-collinear overlapping pair traces a degenerate arrangement and the
+        // boolean result collapses to empty (`DESIGN.md` §4.2 robustness).
+        //
+        // Generalised from the 2-operand engine to N operands: each region is
+        // projected against the straight edges of every *other* region, processed
+        // in order so a later region sees the already-projected earlier ones (the
+        // same A←project(A,B), B←project(B,A') mutual order poly2d uses). Arc
+        // contours are passed through unchanged (their endpoints are seam points
+        // that already snap vertex-to-vertex).
+        let projected: Vec<Region> = project_all_grazing(regions, tol);
+
         let mut store = VertexStore::new(*tol);
         let mut inputs: Vec<InputEdge> = Vec::new();
-        for (i, r) in regions.iter().enumerate() {
+        for (i, r) in projected.iter().enumerate() {
             ingest(r, i, &mut store, &mut inputs)?;
         }
 
@@ -131,6 +150,36 @@ impl Arrangement {
                     let v = store.insert(p);
                     push_split(&mut split_points[i], v, &inputs[i]);
                     push_split(&mut split_points[j], v, &inputs[j]);
+                }
+            }
+        }
+
+        // Vertex-on-edge (T-junction) splitting for straight edges, ported from
+        // the validated 2-D engine. After grazing projection two operands' edges
+        // can be exactly collinear/overlapping, but `intersect` returns no crossing
+        // for a vertex that merely lies *on* another edge's interior (a T-join, not
+        // a transversal crossing). Splitting the host edge at every such existing
+        // vertex makes the shared point a true split vertex so the DCEL trace and
+        // sibling pairing are consistent — without it a near-collinear overlap that
+        // the projection collapsed leaves the longer edge un-split and the cell
+        // residency classification can still collapse. Arc inputs are skipped (the
+        // grazing pass leaves arcs verbatim).
+        let vcount = store.len();
+        for i in 0..n {
+            if !matches!(inputs[i].geom, EdgeGeom::Seg) {
+                continue;
+            }
+            let (sa, sb) = (inputs[i].a, inputs[i].b);
+            let a = store.point(sa);
+            let b = store.point(sb);
+            for vid in 0..vcount {
+                let v = VertexId(vid);
+                if v == sa || v == sb {
+                    continue;
+                }
+                let p = store.point(v);
+                if point_on_segment_interior(a, b, p, tol) {
+                    push_split(&mut split_points[i], v, &inputs[i]);
                 }
             }
         }
@@ -196,6 +245,111 @@ impl Arrangement {
 /// Map a 2-D engine error into a prismatic error (arc-degeneracy → Phase 3c).
 fn map_poly2(e: Poly2Error) -> PrismError {
     PrismError::from(e)
+}
+
+/// Project every operand's grazing vertices onto the straight edges of the other
+/// operands, returning owned (possibly rewritten) regions in input order.
+///
+/// Mirrors the validated 2-D engine's mutual `project_grazing_vertices` pass but
+/// generalised to any number of operands: region `i` is projected against the
+/// straight edges of every other region, taking the already-projected form for
+/// regions `< i` and the original form for regions `> i`. This sequential order
+/// matches poly2d's `A ← project(A, B); B ← project(B, A')` and keeps the result
+/// deterministic. Arc contours are passed through verbatim.
+fn project_all_grazing(regions: &[&Region], tol: &Tol) -> Vec<Region> {
+    let mut out: Vec<Region> = regions.iter().map(|r| (*r).clone()).collect();
+    for i in 0..out.len() {
+        // Collect the straight edges of all *other* operands (already-projected
+        // for j < i, original for j > i).
+        let mut others: Vec<(Point2, Point2)> = Vec::new();
+        for (j, r) in out.iter().enumerate() {
+            if j == i {
+                continue;
+            }
+            for c in &r.contours {
+                for e in &c.edges {
+                    if let Edge2::Seg { start, end } = e {
+                        others.push((*start, *end));
+                    }
+                }
+            }
+        }
+        if others.is_empty() {
+            continue;
+        }
+        out[i] = project_grazing_vertices(&out[i], &others, tol);
+    }
+    out
+}
+
+/// Project every (segment-input) vertex of `region` that lies within `tol` of one
+/// of the straight `edges` interiors onto that edge, collapsing a sub-tolerance
+/// grazing gap. Arc contours are passed through unchanged.
+fn project_grazing_vertices(region: &Region, edges: &[(Point2, Point2)], tol: &Tol) -> Region {
+    let project = |p: Point2| -> Point2 {
+        for &(a, b) in edges {
+            if let Some(foot) = project_if_on_segment_interior(a, b, p, tol) {
+                return foot;
+            }
+        }
+        p
+    };
+
+    let contours = region
+        .contours
+        .iter()
+        .map(|c| {
+            if c.has_arc() {
+                // Don't reshape arc contours; pass them through verbatim.
+                c.clone()
+            } else {
+                let pts: Vec<Point2> = c.vertices().into_iter().map(project).collect();
+                Contour::from_points(&pts)
+            }
+        })
+        .collect();
+    Region::new(contours)
+}
+
+/// If `p` lies within `tol` of the interior of segment `a → b`, return the foot of
+/// the perpendicular (the projected point); otherwise `None`. Endpoints are not
+/// "interior", so a vertex coincident with `a` or `b` is left to ordinary vertex
+/// snapping (`t` is clamped to `[0, 1]`, but the off-foot distance test rejects
+/// points beyond the endpoints).
+fn project_if_on_segment_interior(a: Point2, b: Point2, p: Point2, tol: &Tol) -> Option<Point2> {
+    let eps_sq = tol.length * tol.length;
+    let d = a.to(b);
+    let len_sq = d.len_sq();
+    if len_sq <= eps_sq {
+        return None;
+    }
+    let t_raw = a.to(p).dot(d) / len_sq;
+    let t = t_raw.clamp(0.0, 1.0);
+    let foot = Point2::new(a.x + d.x * t, a.y + d.y * t);
+    if foot.dist_sq(p) > eps_sq {
+        return None;
+    }
+    Some(foot)
+}
+
+/// `true` if `p` lies strictly in the interior of segment `a → b` within `tol`
+/// (a T-junction host point), excluding a margin around each endpoint so a vertex
+/// coincident with an endpoint is not treated as an interior split. Ported from
+/// the 2-D engine.
+fn point_on_segment_interior(a: Point2, b: Point2, p: Point2, tol: &Tol) -> bool {
+    let eps_sq = tol.length * tol.length;
+    let d = a.to(b);
+    let len_sq = d.len_sq();
+    if len_sq <= eps_sq {
+        return false;
+    }
+    let t = a.to(p).dot(d) / len_sq;
+    let margin = tol.length / len_sq.sqrt();
+    if t <= margin || t >= 1.0 - margin {
+        return false;
+    }
+    let cross = a.to(p).cross(d);
+    (cross * cross) <= eps_sq * len_sq
 }
 
 /// Geometry discriminator for the dedup key.

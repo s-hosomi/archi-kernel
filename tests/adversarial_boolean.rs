@@ -967,13 +967,15 @@ fn poly2d_tol_jitter_identity_proptest() {
 /// and from the *exact* collinear-overlap cases (which now pass — see the OK
 /// cases the `prism_volume_identity_proptest` covers via its `OFF` offset).
 ///
-/// The fix is a collinear-edge / vertex-on-edge merge in the prismatic
-/// arrangement (a multi-hundred-line change to `arrange.rs`'s ingest+trace),
-/// deferred past Phase 5; this test pins the exact trigger so it becomes a
-/// regression asset once that lands. The `prism_volume_identity_proptest` steers
-/// around the trigger with its `OFF = 0.0131` offset.
+/// FIXED: `arrange.rs` now runs a vertex-on-edge (grazing) projection ported from
+/// the validated 2-D engine before snapping/splitting — each operand vertex within
+/// `tol` of another operand's straight-edge interior is moved onto that edge,
+/// collapsing the sub-tolerance sliver into an exact coincidence so the existing
+/// collinear split + `VertexStore` snap share the vertices. This test is now an
+/// active regression asset (no longer `#[ignore]`d). The
+/// `prism_volume_identity_proptest` still steers around the trigger with its
+/// `OFF = 0.0131` offset.
 #[test]
-#[ignore = "prismatic collinear near-overlap sliver: fix is a vertex-on-edge merge in arrange.rs (post-Phase-5)"]
 fn prism_collinear_near_overlap_sliver_empties_result() {
     let tol = Tol::default();
     let a = box_z(0.0, 0.0, 0.0, 1.0, 1.0, 1.0);

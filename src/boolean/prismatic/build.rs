@@ -44,6 +44,7 @@
 
 use std::collections::HashMap;
 
+use crate::boolean::poly2d::snap::VertexId;
 use crate::boolean::poly2d::Op;
 use crate::boolean::support::{key, CoordKey};
 use crate::brep::Brep;
@@ -64,8 +65,15 @@ use super::error::PrismError;
 /// or a circular arc).
 #[derive(Debug, Clone, Copy)]
 pub(super) enum BoundaryEdge2 {
-    /// A straight segment `a → b` (2-D frame coords).
-    Seg { a: [f64; 2], b: [f64; 2] },
+    /// A straight segment `a → b` (2-D frame coords), with the wedge tags of its
+    /// endpoints (`wa` at `a`, `wb` at `b`; see [`Wedges`]). Both default to `0`
+    /// except at a non-manifold corner pinch.
+    Seg {
+        a: [f64; 2],
+        b: [f64; 2],
+        wa: u32,
+        wb: u32,
+    },
     /// An arc `a → b` on a circle of `center` / `radius`, swept `ccw` or not.
     Arc {
         a: [f64; 2],
@@ -76,8 +84,14 @@ pub(super) enum BoundaryEdge2 {
     },
 }
 
-/// Convert a cell ring of [`RingEdge`]s into 2-D [`BoundaryEdge2`]s.
-fn ring_to_bedges(arr: &Arrangement, ring: &[RingEdge]) -> Vec<BoundaryEdge2> {
+/// Convert a cell ring of [`RingEdge`]s into 2-D [`BoundaryEdge2`]s, tagging each
+/// straight endpoint with its wedge via `tag` (mapping a 2-D vertex id to its
+/// wedge tag on the cap's material side).
+fn ring_to_bedges(
+    arr: &Arrangement,
+    ring: &[RingEdge],
+    tag: &impl Fn(VertexId, VertexId, VertexId) -> u32,
+) -> Vec<BoundaryEdge2> {
     ring.iter()
         .map(|e| {
             let pa = arr.point(e.a);
@@ -86,6 +100,9 @@ fn ring_to_bedges(arr: &Arrangement, ring: &[RingEdge]) -> Vec<BoundaryEdge2> {
                 EdgeGeom::Seg => BoundaryEdge2::Seg {
                     a: [pa.x, pa.y],
                     b: [pb.x, pb.y],
+                    // The corner at each endpoint is bounded by this ring edge.
+                    wa: tag(e.a, e.a, e.b),
+                    wb: tag(e.b, e.a, e.b),
                 },
                 EdgeGeom::Arc {
                     center,
@@ -229,6 +246,19 @@ pub(super) fn build_combined(
     }
     let comp_of = |ci: usize, k: usize, vp: &mut Vec<usize>| uf_find(vp, voxel_id(ci, k));
 
+    // ── wedge tags: resolve non-manifold corner pinches ────────────────────
+    // Two material cells that meet a single 2-D *vertex* but are not adjacent
+    // through any edge there (the void-void corner pinch: each is separated from
+    // the other by a void on both sides) belong to the same global solid yet form
+    // a non-manifold pinch — the vertical line through that corner would otherwise
+    // carry four wall half-edges on one interned curve. We therefore split the
+    // interning locally per corner: each maximal locally-connected bundle of
+    // resident voxels around a 2-D vertex (a "wedge") gets its own tag, so its
+    // walls and caps intern a distinct corner vertex and vertical edge — two
+    // manifold edges instead of one 4-way edge. Ordinary (degree-≤2) vertices have
+    // exactly one wedge and tag `0`, so this is a no-op everywhere but the pinch.
+    let wedges = Wedges::compute(&arr, &resident, bands.len());
+
     // ── walls: per arrangement edge, per band ──────────────────────────────
     // A straight edge becomes a planar wall quad; an **arc** edge becomes a
     // cylinder wall (Phase 3c). Both face outward toward the void side.
@@ -241,13 +271,19 @@ pub(super) fn build_combined(
             if left == right {
                 continue;
             }
-            let comp = if left {
-                comp_of(e.left.unwrap(), k, &mut vparent)
+            let mat_cell = if left {
+                e.left.unwrap()
             } else {
-                comp_of(e.right.unwrap(), k, &mut vparent)
+                e.right.unwrap()
             };
+            let comp = comp_of(mat_cell, k, &mut vparent);
             match e.geom {
                 EdgeGeom::Seg => {
+                    // Wedge tags for the two corners over `e.a` / `e.b`, taken on
+                    // the material side's cell in this band. The corner at each end
+                    // is bounded by this very arrangement edge `(e.a, e.b)`.
+                    let w0 = wedges.tag(e.a, mat_cell, e.a, e.b, k);
+                    let w1 = wedges.tag(e.b, mat_cell, e.a, e.b, k);
                     builder.wall(
                         comp,
                         [pa.x, pa.y],
@@ -255,6 +291,8 @@ pub(super) fn build_combined(
                         bd.z0,
                         bd.z1,
                         /* material_on_left = */ left,
+                        w0,
+                        w1,
                     );
                 }
                 EdgeGeom::Arc {
@@ -281,12 +319,6 @@ pub(super) fn build_combined(
     // ── interfaces: per cell, per level (band boundaries, incl. bottom/top) ─
     let nbands = bands.len();
     for (ci, cell) in arr.cells.iter().enumerate() {
-        let outer = ring_to_bedges(&arr, &cell.outer);
-        let inners: Vec<Vec<BoundaryEdge2>> = cell
-            .inner_rings
-            .iter()
-            .map(|ring| ring_to_bedges(&arr, ring))
-            .collect();
         for k in 0..=nbands {
             let below = if k == 0 { false } else { resident[ci][k - 1] };
             let above = if k == nbands { false } else { resident[ci][k] };
@@ -294,11 +326,17 @@ pub(super) fn build_combined(
                 continue;
             }
             let z = level_z(&bands, k);
-            let comp = if below {
-                comp_of(ci, k - 1, &mut vparent)
-            } else {
-                comp_of(ci, k, &mut vparent)
-            };
+            // The cap belongs to the resident (material) side; its wedge tags are
+            // taken in that side's band so they match the abutting wall rims.
+            let mat_band = if below { k - 1 } else { k };
+            let comp = comp_of(ci, mat_band, &mut vparent);
+            let tag = |v: VertexId, va: VertexId, vb: VertexId| wedges.tag(v, ci, va, vb, mat_band);
+            let outer = ring_to_bedges(&arr, &cell.outer, &tag);
+            let inners: Vec<Vec<BoundaryEdge2>> = cell
+                .inner_rings
+                .iter()
+                .map(|ring| ring_to_bedges(&arr, ring, &tag))
+                .collect();
             builder.interface(comp, &outer, &inners, z, /* up = */ below && !above);
         }
     }
@@ -363,10 +401,21 @@ fn level_z(bands: &[Band], k: usize) -> f64 {
 /// interned curve and sibling-pair.
 #[derive(Debug, Clone, Copy)]
 enum BEdge3 {
-    /// A straight edge `a → b`.
-    Line { a: Point3, b: Point3 },
+    /// A straight edge `a → b`. `wa` / `wb` are **wedge tags** for the two
+    /// endpoints (see [`Wedges`]): two coincident endpoints with the *same* wedge
+    /// tag intern to one shared vertex, while a non-manifold pinch corner gives the
+    /// two material wedges distinct tags so the corner vertex (and the vertical
+    /// edge through it) split into two manifold instances. `0` is the default
+    /// "ordinary" tag carried by every non-pinch endpoint.
+    Line {
+        a: Point3,
+        b: Point3,
+        wa: u32,
+        wb: u32,
+    },
     /// An arc `a → b` on `circle`, swept from `a_ang` to `b_ang` (radians, the
-    /// circle's own parameterisation).
+    /// circle's own parameterisation). Arc endpoints are never pinch corners, so
+    /// they carry no wedge tag (always the default `0`).
     Arc {
         circle: Circle3,
         a: Point3,
@@ -377,6 +426,12 @@ enum BEdge3 {
 }
 
 impl BEdge3 {
+    /// A straight edge with the default (ordinary) wedge tags on both endpoints.
+    #[inline]
+    fn line(a: Point3, b: Point3) -> Self {
+        BEdge3::Line { a, b, wa: 0, wb: 0 }
+    }
+
     fn start(&self) -> Point3 {
         match self {
             BEdge3::Line { a, .. } => *a,
@@ -429,6 +484,211 @@ fn uf_union(parent: &mut [usize], a: usize, b: usize) {
     let (ra, rb) = (uf_find(parent, a), uf_find(parent, b));
     if ra != rb {
         parent[ra] = rb;
+    }
+}
+
+/// Undirected key of an arrangement edge, by its endpoint vertex-id pair.
+type UEdgeKey = (VertexId, VertexId);
+
+#[inline]
+fn uedge(a: VertexId, b: VertexId) -> UEdgeKey {
+    if a.0 <= b.0 {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Per-corner wedge tags that resolve non-manifold pinch points.
+///
+/// A boundary **corner** is the meeting of two consecutive ring edges of one cell
+/// at a 2-D vertex. A single cell can visit the same vertex through *two distinct
+/// corners* (the void-void pinch: the surrounding material's one cell wraps around
+/// the touch point on two opposite quadrants), which the validator would reject as
+/// a non-manifold pinched edge. We therefore group corners into **wedges**: two
+/// corners are in the same wedge when they sit on opposite sides of a shared
+/// arrangement edge at the vertex whose two cells are *both resident* in the band
+/// (material is continuous across — no wall), or when they are the same corner of
+/// the same cell in vertically adjacent resident bands. Each wedge gets a distinct
+/// per-vertex tag, so its walls and caps intern an independent corner vertex and
+/// vertical edge — two manifold edges in place of one 4-way edge.
+///
+/// Ordinary vertices have a single wedge and tag `0`, so interning is unchanged
+/// away from a pinch.
+struct Wedges {
+    /// `tags[(v, cell, edge_key, band)] → u32`, the tag of the corner of `cell`
+    /// bounded by the arrangement edge `edge_key` at vertex `v` in `band`. Absent
+    /// ⇒ tag `0`.
+    tags: HashMap<(VertexId, usize, UEdgeKey, usize), u32>,
+}
+
+/// A boundary corner: cell, and the two arrangement edges meeting at the vertex.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Corner {
+    cell: usize,
+    e_prev: UEdgeKey,
+    e_cur: UEdgeKey,
+}
+
+impl Wedges {
+    fn compute(arr: &Arrangement, resident: &[Vec<bool>], nbands: usize) -> Self {
+        let nbands = nbands.max(1);
+
+        // 1. Enumerate every boundary corner and index it. A corner is keyed by
+        //    (cell, e_prev, e_cur); we also record, per (vertex, cell, incident
+        //    edge), which corner that edge belongs to — both of a corner's edges
+        //    point back to it, so a wall on an edge (and a cap ring meeting there)
+        //    can find its corner.
+        let mut corner_index: HashMap<Corner, usize> = HashMap::new();
+        let mut corners: Vec<(VertexId, usize)> = Vec::new(); // (vertex, cell) per corner
+        let mut edge_to_corner: HashMap<(VertexId, usize, UEdgeKey), usize> = HashMap::new();
+
+        let add_ring =
+            |ci: usize,
+             ring: &[RingEdge],
+             corner_index: &mut HashMap<Corner, usize>,
+             corners: &mut Vec<(VertexId, usize)>,
+             edge_to_corner: &mut HashMap<(VertexId, usize, UEdgeKey), usize>| {
+                let m = ring.len();
+                if m == 0 {
+                    return;
+                }
+                for i in 0..m {
+                    let prev = ring[i];
+                    let cur = ring[(i + 1) % m];
+                    // Corner at the shared vertex prev.b == cur.a.
+                    debug_assert_eq!(prev.b, cur.a);
+                    let v = cur.a;
+                    let kp = uedge(prev.a, prev.b);
+                    let kc = uedge(cur.a, cur.b);
+                    let corner = Corner {
+                        cell: ci,
+                        e_prev: kp,
+                        e_cur: kc,
+                    };
+                    let idx = *corner_index.entry(corner).or_insert_with(|| {
+                        corners.push((v, ci));
+                        corners.len() - 1
+                    });
+                    edge_to_corner.insert((v, ci, kp), idx);
+                    edge_to_corner.insert((v, ci, kc), idx);
+                }
+            };
+
+        for (ci, cell) in arr.cells.iter().enumerate() {
+            add_ring(
+                ci,
+                &cell.outer,
+                &mut corner_index,
+                &mut corners,
+                &mut edge_to_corner,
+            );
+            for ring in &cell.inner_rings {
+                add_ring(
+                    ci,
+                    ring,
+                    &mut corner_index,
+                    &mut corners,
+                    &mut edge_to_corner,
+                );
+            }
+        }
+
+        let ncorners = corners.len();
+        // 2. Union corners into wedges, per band. Node space: corner * nbands + k.
+        let node = |corner: usize, k: usize| corner * nbands + k;
+        let mut parent: Vec<usize> = (0..ncorners * nbands).collect();
+
+        // Horizontal: across each arrangement edge whose two cells are both
+        // resident in band k, the two cells' corners that own that edge are one
+        // wedge (no wall between them).
+        for e in &arr.edges {
+            let (Some(l), Some(r)) = (e.left, e.right) else {
+                continue;
+            };
+            let kedge = uedge(e.a, e.b);
+            for &v in &[e.a, e.b] {
+                let (Some(&cl), Some(&cr)) = (
+                    edge_to_corner.get(&(v, l, kedge)),
+                    edge_to_corner.get(&(v, r, kedge)),
+                ) else {
+                    continue;
+                };
+                // `k` indexes `resident` and drives `node`; an index loop is clear.
+                #[allow(clippy::needless_range_loop)]
+                for k in 0..nbands {
+                    if resident[l][k] && resident[r][k] {
+                        uf_union(&mut parent, node(cl, k), node(cr, k));
+                    }
+                }
+            }
+        }
+        // Vertical: the same corner in adjacent resident bands.
+        for (corner, &(_, ci)) in corners.iter().enumerate() {
+            for k in 1..nbands {
+                if resident[ci][k] && resident[ci][k - 1] {
+                    uf_union(&mut parent, node(corner, k), node(corner, k - 1));
+                }
+            }
+        }
+
+        // 3. Assign per-vertex compact tags. Within one vertex, each distinct
+        //    resident wedge-root gets a small id (0, 1, …); ≤1 wedge ⇒ all `0`.
+        //    Iterate corners in index order (deterministic) so the assignment is
+        //    stable across the wall and cap passes (which only ever *read* `tags`).
+        let mut per_vertex_next: HashMap<VertexId, u32> = HashMap::new();
+        let mut root_tag: HashMap<usize, u32> = HashMap::new();
+        for (corner, &(v, ci)) in corners.iter().enumerate() {
+            // `k` indexes `resident` and drives `node`; an index loop is clear.
+            #[allow(clippy::needless_range_loop)]
+            for k in 0..nbands {
+                if !resident[ci][k] {
+                    continue;
+                }
+                let root = uf_find(&mut parent, node(corner, k));
+                root_tag.entry(root).or_insert_with(|| {
+                    let n = per_vertex_next.entry(v).or_insert(0);
+                    let t = *n;
+                    *n += 1;
+                    t
+                });
+            }
+        }
+
+        // 4. Build the (vertex, cell, edge_key, band) → tag map. Both bounding
+        //    edges of a corner resolve to the corner's wedge tag, so a wall (keyed
+        //    by its arrangement edge) and a cap ring (keyed by its ring edges) at
+        //    the same corner agree. Only non-zero tags are stored.
+        let mut tags: HashMap<(VertexId, usize, UEdgeKey, usize), u32> = HashMap::new();
+        for (corner_key, &corner) in &corner_index {
+            let (v, ci) = corners[corner];
+            // `k` indexes `resident` and drives `node`; an index loop is clear.
+            #[allow(clippy::needless_range_loop)]
+            for k in 0..nbands {
+                if !resident[ci][k] {
+                    continue;
+                }
+                let root = uf_find(&mut parent, node(corner, k));
+                if let Some(&tag) = root_tag.get(&root) {
+                    if tag != 0 {
+                        tags.insert((v, ci, corner_key.e_prev, k), tag);
+                        tags.insert((v, ci, corner_key.e_cur, k), tag);
+                    }
+                }
+            }
+        }
+
+        Self { tags }
+    }
+
+    /// The wedge tag of the corner of `cell` bounded by arrangement edge
+    /// `(va, vb)` at vertex `v` in `band` (`0` if ordinary).
+    #[inline]
+    fn tag(&self, v: VertexId, cell: usize, va: VertexId, vb: VertexId, band: usize) -> u32 {
+        self.tags
+            .get(&(v, cell, uedge(va, vb), band))
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -552,6 +812,16 @@ impl Builder {
     }
 
     /// Emit a vertical wall quad on the 2-D segment `p0→p1` spanning `[z0, z1]`.
+    ///
+    /// `w0` / `w1` are the **wedge tags** of the corners over `p0` / `p1` (see
+    /// [`Wedges`]). The two vertical edges (over `p0`, over `p1`) and the four
+    /// corner vertices carry the tag of the 2-D point they sit over, so a
+    /// non-manifold pinch corner — where four walls meet on one vertical line —
+    /// splits into two manifold edges (one per material wedge) instead of a 4-way
+    /// non-manifold edge. The two horizontal rim edges run between `p0` and `p1`,
+    /// so each carries `w0` at its `p0` end and `w1` at its `p1` end, exactly
+    /// matching the cap-ring edge along the same 2-D segment (which is tagged the
+    /// same way), preserving the wall↔cap sibling pairing.
     #[allow(clippy::too_many_arguments)]
     fn wall(
         &mut self,
@@ -561,6 +831,8 @@ impl Builder {
         z0: f64,
         z1: f64,
         material_on_left: bool,
+        w0: u32,
+        w1: u32,
     ) {
         let b0 = self.lift(p0, z0);
         let b1 = self.lift(p1, z0);
@@ -568,30 +840,66 @@ impl Builder {
         let t0 = self.lift(p0, z1);
         let edge = b1 - b0;
         let right_normal = edge.cross(self.frame.d);
-        let lines = |pts: [Point3; 4]| {
-            vec![
-                BEdge3::Line {
-                    a: pts[0],
-                    b: pts[1],
-                },
-                BEdge3::Line {
-                    a: pts[1],
-                    b: pts[2],
-                },
-                BEdge3::Line {
-                    a: pts[2],
-                    b: pts[3],
-                },
-                BEdge3::Line {
-                    a: pts[3],
-                    b: pts[0],
-                },
-            ]
-        };
+        // Each lifted corner carries the wedge tag of its 2-D point: b0/t0 over p0
+        // (tag w0), b1/t1 over p1 (tag w1).
         if material_on_left {
-            self.planar_face(comp, lines([b0, b1, t1, t0]), Vec::new(), right_normal);
+            // Ring b0 →(rim,z0)→ b1 →(seam,p1)→ t1 →(rim,z1)→ t0 →(seam,p0)→ b0.
+            let lines = vec![
+                BEdge3::Line {
+                    a: b0,
+                    b: b1,
+                    wa: w0,
+                    wb: w1,
+                },
+                BEdge3::Line {
+                    a: b1,
+                    b: t1,
+                    wa: w1,
+                    wb: w1,
+                },
+                BEdge3::Line {
+                    a: t1,
+                    b: t0,
+                    wa: w1,
+                    wb: w0,
+                },
+                BEdge3::Line {
+                    a: t0,
+                    b: b0,
+                    wa: w0,
+                    wb: w0,
+                },
+            ];
+            self.planar_face(comp, lines, Vec::new(), right_normal);
         } else {
-            self.planar_face(comp, lines([b0, t0, t1, b1]), Vec::new(), -right_normal);
+            // Ring b0 →(seam,p0)→ t0 →(rim,z1)→ t1 →(seam,p1)→ b1 →(rim,z0)→ b0.
+            let lines = vec![
+                BEdge3::Line {
+                    a: b0,
+                    b: t0,
+                    wa: w0,
+                    wb: w0,
+                },
+                BEdge3::Line {
+                    a: t0,
+                    b: t1,
+                    wa: w0,
+                    wb: w1,
+                },
+                BEdge3::Line {
+                    a: t1,
+                    b: b1,
+                    wa: w1,
+                    wb: w1,
+                },
+                BEdge3::Line {
+                    a: b1,
+                    b: b0,
+                    wa: w1,
+                    wb: w0,
+                },
+            ];
+            self.planar_face(comp, lines, Vec::new(), -right_normal);
         }
     }
 
@@ -663,16 +971,16 @@ impl Builder {
         let outer = if material_on_left {
             vec![
                 arc_bottom_fwd,
-                BEdge3::Line { a: b1, b: t1 },
+                BEdge3::line(b1, t1),
                 arc_top_back,
-                BEdge3::Line { a: t0, b: b0 },
+                BEdge3::line(t0, b0),
             ]
         } else {
             vec![
                 arc_bottom_rev,
-                BEdge3::Line { a: b0, b: t0 },
+                BEdge3::line(b0, t0),
                 arc_top_fwd,
-                BEdge3::Line { a: t1, b: b1 },
+                BEdge3::line(t1, b1),
             ]
         };
         // The cylinder surface's stored normal is radial-out. The face's *outward*
@@ -731,9 +1039,11 @@ impl Builder {
         edges
             .iter()
             .map(|e| match *e {
-                BoundaryEdge2::Seg { a, b } => BEdge3::Line {
+                BoundaryEdge2::Seg { a, b, wa, wb } => BEdge3::Line {
                     a: self.lift(a, z),
                     b: self.lift(b, z),
+                    wa,
+                    wb,
                 },
                 BoundaryEdge2::Arc {
                     a,
@@ -833,7 +1143,12 @@ fn reverse_bedges(edges: &[BEdge3]) -> Vec<BEdge3> {
         .iter()
         .rev()
         .map(|e| match *e {
-            BEdge3::Line { a, b } => BEdge3::Line { a: b, b: a },
+            BEdge3::Line { a, b, wa, wb } => BEdge3::Line {
+                a: b,
+                b: a,
+                wa: wb,
+                wb: wa,
+            },
             BEdge3::Arc {
                 circle,
                 a,
@@ -861,12 +1176,20 @@ type CircleKey = (CoordKey, i64);
 struct ComponentBuilder<'a> {
     brep: &'a mut Brep,
     tol: Tol,
-    vert_by_key: HashMap<CoordKey, Id<Vertex>>,
-    coord_by_key: HashMap<CoordKey, Point3>,
-    line_by_key: HashMap<(CoordKey, CoordKey), (CurveId, CoordKey)>,
+    vert_by_key: HashMap<VKey, Id<Vertex>>,
+    coord_by_key: HashMap<VKey, Point3>,
+    line_by_key: HashMap<(VKey, VKey), (CurveId, VKey)>,
     circle_by_key: HashMap<CircleKey, CurveId>,
     faces: Vec<Id<Face>>,
 }
+
+/// A vertex-identity key: the quantised coordinate **plus a wedge tag**. At a
+/// non-manifold corner pinch the two material wedges share one coordinate but
+/// carry distinct tags, so they intern as two independent vertices (and the
+/// vertical edge through the corner as two independent curves) — splitting the
+/// pinch into two manifold edges. Away from a pinch the tag is `0`, so identity
+/// reduces to the coordinate as before.
+type VKey = (CoordKey, u32);
 
 impl<'a> ComponentBuilder<'a> {
     fn new(brep: &'a mut Brep, tol: Tol) -> Self {
@@ -881,8 +1204,8 @@ impl<'a> ComponentBuilder<'a> {
         }
     }
 
-    fn vertex(&mut self, p: Point3) -> Id<Vertex> {
-        let k = key(p);
+    fn vertex(&mut self, p: Point3, wedge: u32) -> Id<Vertex> {
+        let k: VKey = (key(p), wedge);
         if let Some(&v) = self.vert_by_key.get(&k) {
             return v;
         }
@@ -893,8 +1216,8 @@ impl<'a> ComponentBuilder<'a> {
         v
     }
 
-    fn line_curve(&mut self, a: Point3, b: Point3) -> (CurveId, CoordKey) {
-        let (ka, kb) = (key(a), key(b));
+    fn line_curve(&mut self, a: Point3, b: Point3, wa: u32, wb: u32) -> (CurveId, VKey) {
+        let (ka, kb): (VKey, VKey) = ((key(a), wa), (key(b), wb));
         let unordered = if ka <= kb { (ka, kb) } else { (kb, ka) };
         if let Some(&entry) = self.line_by_key.get(&unordered) {
             return entry;
@@ -921,11 +1244,11 @@ impl<'a> ComponentBuilder<'a> {
         cid
     }
 
-    /// A straight half-edge from `a` to `b`.
-    fn line_half_edge(&mut self, a: Point3, b: Point3) -> Id<HalfEdge> {
-        let start = self.vertex(a);
-        let _ = self.vertex(b);
-        let (curve, origin_key) = self.line_curve(a, b);
+    /// A straight half-edge from `a` to `b`, carrying the endpoints' wedge tags.
+    fn line_half_edge(&mut self, a: Point3, b: Point3, wa: u32, wb: u32) -> Id<HalfEdge> {
+        let start = self.vertex(a, wa);
+        let _ = self.vertex(b, wb);
+        let (curve, origin_key) = self.line_curve(a, b, wa, wb);
         let origin_pt = self.coord_by_key[&origin_key];
         let line = match self.brep.geom.curve(curve).expect("line curve") {
             CurveGeom::Line(l) => *l,
@@ -949,8 +1272,9 @@ impl<'a> ComponentBuilder<'a> {
         a_ang: f64,
         b_ang: f64,
     ) -> Id<HalfEdge> {
-        let start = self.vertex(a);
-        let _ = self.vertex(b);
+        // Arc endpoints are never pinch corners; wedge tag `0`.
+        let start = self.vertex(a, 0);
+        let _ = self.vertex(b, 0);
         let curve = self.circle_curve(circle);
         self.brep.topo.add_half_edge(HalfEdge {
             start,
@@ -963,7 +1287,7 @@ impl<'a> ComponentBuilder<'a> {
     fn ring_half_edges(&mut self, ring: &[BEdge3]) -> Vec<Id<HalfEdge>> {
         ring.iter()
             .map(|e| match *e {
-                BEdge3::Line { a, b } => self.line_half_edge(a, b),
+                BEdge3::Line { a, b, wa, wb } => self.line_half_edge(a, b, wa, wb),
                 BEdge3::Arc {
                     circle,
                     a,
