@@ -33,21 +33,23 @@
 
 ## アーキテクチャ
 
-```
-CSG 木(正本)                      B-rep(派生・使い捨て)
-┌──────────────────────────┐  遅延  ┌──────────────────────────────┐
-│ Model: StableId で部材管理 │ ─────▶ │ Brep = TopoStore + GeomStore │
-│ + 依存 DAG                │  評価  │ 曲線パラメータ区間つき半エッジ │
-│ Extrude/Opening/Clip/…   │        │ 幾何は ID ハンドル参照のみ     │
-└──────────────────────────┘        │ (CI で機械的に検査)           │
-        ▲                           └──────────────────────────────┘
-        │ 編集すると dirty が               │ validate(Full): リング項込み
-        │ DAG を伝って伝播                  │ オイラー検査・sibling 対応・
-                                            ▼ watertight — 一級 API
-                                    断面 / 質量 / メッシュ / 干渉
-                                            │ フラット配列(wasm 境界)
-                                            ▼
-                                    Three.js ビューア (viewer/)
+```mermaid
+flowchart LR
+    EDIT(["部材の編集"]) -->|"dirty が依存 DAG を伝播"| MODEL
+
+    subgraph SOURCE["CSG 木 — 正本"]
+        MODEL["<b>Model</b><br/>StableId で部材管理 + 依存 DAG<br/>Extrude / Opening / Clip / Difference"]
+    end
+
+    subgraph DERIVED["B-rep — 派生・使い捨て"]
+        BREP["<b>Brep</b> = TopoStore + GeomStore<br/>半エッジ(曲線パラメータ区間つき)<br/>幾何は ID ハンドル参照のみ(CI で検査)"]
+        VAL["<b>validate(Full)</b><br/>リング項込みオイラー / sibling 対応 / watertight"]
+        BREP --> VAL
+    end
+
+    MODEL -->|"遅延評価(部材単位キャッシュ、<br/>失敗は部材局所の EvalError)"| BREP
+    VAL --> APIS["断面 / 質量・数量拾い / メッシュ / 干渉"]
+    APIS -->|"フラット配列(wasm 境界)"| VIEWER(["Three.js ビューア(viewer/)"])
 ```
 
 - **正本は CSG 木で、B-rep はキャッシュにすぎません。** 評価は部材単位の push-dirty / pull-clean(トレランスもキャッシュキーに含む)。失敗したときは直前の正常な B-rep を表示用に残します。ブーリアンの失敗は、その部材だけに閉じた機械可読の `EvalError` になります — **壊れたジオメトリや、黙って間違った答えを返すことは決してありません**。2.5D の経路で扱えないものは扱えないと明示します(`Unsupported3dBoolean`、`PotentialClash`、`UnsupportedArcDegeneracy`)。

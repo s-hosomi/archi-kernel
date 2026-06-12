@@ -30,21 +30,23 @@ General-purpose B-rep kernels (Parasolid, ACIS, Open CASCADE) are hundreds of pe
 
 ## Architecture
 
-```
-CSG tree (source of truth)         B-rep (derived, disposable)
-┌──────────────────────────┐  lazy  ┌──────────────────────────────┐
-│ Model: members by        │ ─────▶ │ Brep = TopoStore + GeomStore │
-│ StableId + dependency DAG│  eval  │ half-edges with curve param  │
-│ Extrude/Opening/Clip/…   │        │ boundaries; geometry behind  │
-└──────────────────────────┘        │ ID handles only (CI-enforced)│
-        ▲                           └──────────────────────────────┘
-        │ push-dirty                        │ validate(Full): ring-aware
-   edits propagate                          │ Euler, sibling pairing,
-   along the DAG                            ▼ watertight — first-class API
-                                    sections / mass / tess / clash
-                                            │ flat arrays (wasm boundary)
-                                            ▼
-                                    Three.js viewer (viewer/)
+```mermaid
+flowchart LR
+    EDIT(["member edits"]) -->|"dirty propagates along the DAG"| MODEL
+
+    subgraph SOURCE["CSG tree — source of truth"]
+        MODEL["<b>Model</b><br/>members by StableId + dependency DAG<br/>Extrude / Opening / Clip / Difference"]
+    end
+
+    subgraph DERIVED["B-rep — derived, disposable"]
+        BREP["<b>Brep</b> = TopoStore + GeomStore<br/>half-edges with curve-parameter boundaries<br/>geometry behind ID handles only (CI-enforced)"]
+        VAL["<b>validate(Full)</b><br/>ring-aware Euler / sibling pairing / watertight"]
+        BREP --> VAL
+    end
+
+    MODEL -->|"lazy evaluation (per-member cache,<br/>failures are member-local EvalErrors)"| BREP
+    VAL --> APIS["sections / mass & take-off / tessellation / clash"]
+    APIS -->|"flat arrays (wasm boundary)"| VIEWER(["Three.js viewer (viewer/)"])
 ```
 
 - **The CSG tree is the document; the B-rep is a cache.** Evaluation is push-dirty / pull-clean at member granularity, keyed by tolerance, with the previous valid B-rep retained for display fallback. A failed boolean is a member-local, machine-readable `EvalError` — never corrupted geometry, never a silent wrong answer. Anything the 2.5-D path cannot handle says so explicitly (`Unsupported3dBoolean`, `PotentialClash`, `UnsupportedArcDegeneracy`).
