@@ -74,6 +74,21 @@ fn canonicalise(plane: Plane, tol: &Tol) -> (Plane, bool) {
 }
 
 /// Decide whether a normal points to the negative canonical half-space.
+///
+/// The first component (x, then y, then z) whose absolute value is **strictly
+/// greater** than [`Tol::angular`] determines the canonical orientation: if
+/// that component is negative the normal is flipped.  Components whose absolute
+/// value is at most `tol.angular` are treated as "zero-like" and skipped.
+///
+/// Keeping the threshold strict (`>`) rather than inclusive (`>=`) is
+/// deliberate: a component at exactly `tol.angular` is ambiguous (either sign
+/// may be noise), so skipping it lets the next, more dominant component decide.
+/// The consequence is that two normals whose first non-skipped component have
+/// opposite signs at exactly `tol.angular` end up with the same canonical
+/// orientation (both skip to the dominant component).  Any residual difference
+/// of up to `2·tol.angular` between canonical normals is absorbed by
+/// [`normals_agree`], which uses `2·tol.angular` as its threshold for exactly
+/// this reason.
 fn should_flip(n: Vec3, tol: &Tol) -> bool {
     for component in [n.x, n.y, n.z] {
         if component.abs() > tol.angular {
@@ -86,15 +101,21 @@ fn should_flip(n: Vec3, tol: &Tol) -> bool {
     false
 }
 
-/// `true` if two canonicalised unit normals agree within angular tolerance.
+/// `true` if two canonicalised unit normals agree within `2·angular` tolerance.
 ///
-/// Both inputs are already canonicalised to the same half-space, so a plain
-/// component-wise comparison suffices; we compare the squared chord length
-/// against `(2·sin(angular/2))²` via the simpler `|a − b| ≤ angular` bound,
-/// which is conservative for the small angles involved.
+/// Both inputs are already canonicalised to the same half-space by
+/// [`should_flip`].  Because `should_flip` treats components up to
+/// `tol.angular` as "zero-like" and skips them, two normals that are truly the
+/// same plane (within `tol.angular`) may end up with canonical forms whose
+/// sub-dominant component differs by up to `2·tol.angular` (the residual from
+/// both sides of the skip boundary).  Using `2·tol.angular` as the comparison
+/// threshold ensures those cases are correctly identified as duplicates.
+///
+/// The chord-length bound `|a − b|` is used rather than the exact angle; for
+/// the small differences in question the two are numerically equivalent.
 fn normals_agree(a: Unit3, b: Unit3, tol: &Tol) -> bool {
     let d = a.as_vec() - b.as_vec();
-    d.norm() <= tol.angular
+    d.norm() <= 2.0 * tol.angular
 }
 
 #[cfg(test)]

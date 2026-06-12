@@ -287,16 +287,24 @@ fn beam_geom(base: &CsgNode) -> Option<BeamGeom> {
     })
 }
 
-/// The `(radius, world centre-line origin)` of a circular opening, or `None` if
-/// the opening is not a circular extrusion.
+/// The `(radius, world centre-line midpoint)` of a circular opening, or `None`
+/// if the opening is not a circular extrusion.
 ///
-/// The centre is the opening extrusion's own origin (the cylinder axis passes
-/// through it). For the position checks we need a point on that axis closest to
-/// the beam; the opening origin lies on the axis, and the beam is thin in the
-/// sleeve-axis direction, so the origin is a faithful sleeve centre.
+/// The centre is the **midpoint** of the extrusion axis, i.e.
+/// `origin + axis_unit * (length / 2)`. Using the midpoint rather than the raw
+/// `origin` (one cap face) is correct regardless of which direction the opening
+/// is extruded: when the sleeve runs in the beam width direction the midpoint
+/// and origin share the same depth coordinate (the depth component of the axis
+/// is zero), so existing width-direction tests are unaffected; when the sleeve
+/// runs in the beam depth direction (a less common but valid configuration) the
+/// origin lies on one cap face while the true hole centre is at mid-depth, and
+/// only the midpoint gives the correct position.
 fn circular_opening(shape: &CsgNode) -> Option<(f64, Point3)> {
     let CsgNode::Extrude {
-        profile, origin, ..
+        profile,
+        origin,
+        axis,
+        length,
     } = shape
     else {
         return None;
@@ -304,5 +312,7 @@ fn circular_opening(shape: &CsgNode) -> Option<(f64, Point3)> {
     let Profile2d::Circle { radius } = profile else {
         return None;
     };
-    Some((*radius, *origin))
+    let axis_unit = axis.try_unit()?;
+    let centre = *origin + axis_unit.as_vec() * (*length / 2.0);
+    Some((*radius, centre))
 }
