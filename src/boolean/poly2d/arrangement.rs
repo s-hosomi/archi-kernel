@@ -11,25 +11,29 @@
 //!    so coincident points become one vertex (degeneracy collapse).
 //! 2. **Intersect** every pair of edges and snap the crossing points, so each
 //!    edge knows all the vertices that split it.
-//! 3. **Split** each input edge at its interior vertices into unit half-open
-//!    segments between consecutive vertices.
-//! 4. **Dedup** collinear-coincident split segments: two split segments between
-//!    the same vertex pair are the *same* arrangement edge (this is where
-//!    shared / overlapping boundary edges in buildings collapse). Each surviving
+//! 3. **Split** each input edge at its interior vertices into atomic edges
+//!    between consecutive vertices. Straight inputs split into sub-segments;
+//!    arc inputs split into sub-arcs ordered by angle along the sweep.
+//! 4. **Dedup** coincident atomic edges: two atomic edges between the same
+//!    vertex pair *with the same geometry* (both straight, or both arcs of the
+//!    same circle) are the same arrangement edge — this is where shared /
+//!    overlapping boundary edges in buildings collapse. Each surviving
 //!    arrangement edge becomes a pair of opposite **half-edges**.
-//! 5. **Build the DCEL**: sort half-edges leaving each vertex by angle, link
+//! 5. **Build the DCEL**: sort half-edges leaving each vertex by **tangent
+//!    angle** (so arcs order correctly against straight edges), link
 //!    `next`/`prev` by the "next clockwise" rule, and trace face loops.
-//! 6. **Extract faces**: each loop with positive signed area is a bounded face;
-//!    the single negative-area loop per component is the outer (unbounded) wrap.
+//! 6. **Extract faces**: every loop is kept; the unbounded outer wrap always
+//!    classifies as outside both operands and is therefore never selected.
 //!
-//! Robustness rests on the exact [`orient2d`] (combinatorial decisions) plus the
-//! snap (coincidence collapse). Float coordinates are used only for *where*,
-//! never for *whether*.
+//! Robustness rests on the exact [`orient2d`] (combinatorial decisions for
+//! segments) plus the snap (coincidence collapse). Float coordinates are used
+//! only for *where*, never for *whether*; arc sidedness uses an exact radial
+//! test (inside / outside the circle) which is unambiguous away from the curve.
 
 use std::collections::{BTreeMap, HashMap};
 
 use crate::boolean::poly2d::error::Poly2Error;
-use crate::boolean::poly2d::geom::{eps_sq, orient2d, Edge2, Orient, Point2};
+use crate::boolean::poly2d::geom::{eps_sq, orient2d, Arc, Edge2, Orient, Point2, Vec2};
 use crate::boolean::poly2d::intersect::intersect;
 use crate::boolean::poly2d::region::{Contour, Region};
 use crate::boolean::poly2d::snap::{VertexId, VertexStore};
@@ -44,60 +48,85 @@ pub enum Operand {
     B,
 }
 
-/// An input edge after snapping its endpoints to vertex ids, carrying its
-/// operand and its original traversal direction (used to recover winding).
+/// The geometry kind of an input or arrangement edge.
 #[derive(Debug, Clone, Copy)]
-struct InputSeg {
+enum EdgeGeom {
+    /// A straight segment.
+    Seg,
+    /// An arc on a circle: centre, radius. The traversal direction and the
+    /// angular span are recovered from the edge's two endpoints plus the
+    /// `ccw` flag (whether the input arc swept counter-clockwise).
+    Arc {
+        center: Point2,
+        radius: f64,
+        ccw: bool,
+    },
+}
+
+/// An input edge after snapping its endpoints to vertex ids, carrying its
+/// operand, original traversal direction, and geometry.
+#[derive(Debug, Clone, Copy)]
+struct InputEdge {
     a: VertexId,
     b: VertexId,
     operand: Operand,
+    geom: EdgeGeom,
 }
 
-/// An arrangement edge (an undirected segment between two distinct vertices),
-/// annotated with the net directed winding contribution of each operand.
+/// An arrangement edge (an undirected edge between two distinct vertices),
+/// annotated with its geometry and the net directed winding contribution of each
+/// operand.
 ///
-/// `wind_a` / `wind_b` are the sum over all coincident input segments of
-/// `+1` if the input ran `a → b` and `-1` if it ran `b → a`. After dedup an
-/// arrangement edge with `wind == 0` for *both* operands carries no boundary and
-/// is dropped (this is how a shared edge traversed in opposite directions — e.g.
-/// the internal edge of two squares being unioned — vanishes).
-#[derive(Debug, Clone)]
+/// `wind_a` / `wind_b` are the sum over all coincident input edges of `+1` if
+/// the input ran `a → b` and `-1` if it ran `b → a`. After dedup an arrangement
+/// edge with `wind == 0` for *both* operands carries no boundary and is dropped.
+#[derive(Debug, Clone, Copy)]
 struct ArrEdge {
     a: VertexId,
     b: VertexId,
     wind_a: i32,
     wind_b: i32,
+    /// Geometry of the edge in its **canonical** `(a ≤ b)` direction.
+    geom: EdgeGeom,
 }
 
 /// A directed half-edge in the DCEL.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct HalfEdge {
     origin: VertexId,
     dest: VertexId,
     twin: usize,
     next: usize,
+    /// Geometry as traversed `origin → dest`.
+    geom: EdgeGeom,
     /// Index of the face loop this half-edge belongs to (assigned during trace).
     face: Option<usize>,
 }
 
-/// A traced face loop: the ordered vertices of its boundary and its signed area.
+/// One directed boundary edge of a traced face loop, with the geometry needed to
+/// reconstruct an arc.
+#[derive(Debug, Clone, Copy)]
+pub struct LoopEdge {
+    /// Start vertex id.
+    pub a: VertexId,
+    /// End vertex id.
+    pub b: VertexId,
+    /// Geometry as traversed `a → b`.
+    geom: EdgeGeom,
+}
+
+/// A traced face loop: the ordered boundary edges of the face on its left.
 #[derive(Debug, Clone)]
 pub struct FaceLoop {
-    /// Vertices of the loop in traversal order.
+    /// Directed boundary edges in traversal order.
+    pub edges: Vec<LoopEdge>,
+    /// Start-point coordinates of each edge, parallel to `edges`.
     pub vertices: Vec<Point2>,
-    /// Snapped vertex ids of the loop, parallel to `vertices`. Reconstruction
-    /// uses these for *exact* shared-edge cancellation (no tolerance needed —
-    /// the snap already merged coincident vertices).
-    pub vertex_ids: Vec<VertexId>,
 }
 
 impl FaceLoop {
     /// Signed area of the loop (positive = CCW bounded face / outer boundary,
-    /// negative = CW hole boundary or the unbounded outer wrap).
-    ///
-    /// Used by the arrangement tests to assert face orientation; the boolean
-    /// driver classifies faces by winding, not area, so the lib path does not
-    /// call this.
+    /// negative = CW hole boundary or the unbounded outer wrap), arc-aware.
     #[cfg(test)]
     pub fn signed_area(&self) -> f64 {
         let mut acc = 0.0_f64;
@@ -107,62 +136,57 @@ impl FaceLoop {
             let b = self.vertices[(i + 1) % n];
             acc += a.x * b.y - b.x * a.y;
         }
-        0.5 * acc
+        let mut area = 0.5 * acc;
+        for (i, e) in self.edges.iter().enumerate() {
+            if let EdgeGeom::Arc {
+                center,
+                ccw,
+                radius,
+            } = e.geom
+            {
+                let pa = self.vertices[i];
+                let pb = self.vertices[(i + 1) % n];
+                let dtheta = directed_sweep(center, pa, pb, ccw);
+                area += 0.5 * radius * radius * (dtheta - dtheta.sin());
+            }
+        }
+        area
     }
 }
 
-/// The built arrangement: the snapped vertex store, the original input segments
-/// (kept for winding classification), and the traced bounded faces.
+/// The built arrangement.
 pub struct Arrangement {
     store: VertexStore,
-    inputs: Vec<InputSeg>,
-    /// Bounded faces (positive signed area), in no particular order.
+    inputs: Vec<InputEdge>,
+    /// Bounded faces, in no particular order.
     pub faces: Vec<FaceLoop>,
 }
 
 impl Arrangement {
     /// Build the arrangement from two operand regions.
-    ///
-    /// Returns [`Poly2Error::ArcNotYetSupported`] if any edge is an arc, and
-    /// [`Poly2Error::SelfIntersectingInput`] / [`Poly2Error::DegenerateContour`]
-    /// for malformed input.
     pub fn build(a: &Region, b: &Region, tol: &Tol) -> Result<Self, Poly2Error> {
-        if a.has_arc() || b.has_arc() {
-            return Err(Poly2Error::ArcNotYetSupported);
-        }
         validate_region(a, tol)?;
         validate_region(b, tol)?;
 
         let mut store = VertexStore::new(*tol);
-        let mut inputs: Vec<InputSeg> = Vec::new();
+        let mut inputs: Vec<InputEdge> = Vec::new();
 
-        // ── 0. vertex-on-edge pre-snap ─────────────────────────────────────
-        // Vertex-to-vertex snapping (the store's merge) never pulls a vertex
-        // that grazes the *interior of the other operand's edge* onto that edge.
-        // Left as-is, a sub-tolerance gap between a corner and an edge survives
-        // as a thin wedge that splits a face across the other operand's boundary
-        // (the face ends up partly inside, partly outside that operand — an
-        // ill-defined classification, and the source of a lost overlap/hole that
-        // also flipped run-to-run). We therefore *project* every vertex within
-        // `tol` of the other operand's edge onto that edge before ingesting, so
-        // the two become exactly collinear/coincident and the arrangement splits
-        // cleanly. The shift is at most `tol`, within the tolerance contract.
+        // Vertex-on-edge pre-snap is segment-only (the grazing case the building
+        // domain needs); arc inputs skip it (their endpoints are seam points that
+        // already snap vertex-to-vertex).
         let a = project_grazing_vertices(a, b, tol);
         let b = project_grazing_vertices(b, &a, tol);
 
-        // ── 1. snap endpoints, collect input segments ──────────────────────
         ingest(&a, Operand::A, &mut store, &mut inputs, tol)?;
         ingest(&b, Operand::B, &mut store, &mut inputs, tol)?;
 
-        // ── 2. intersect every pair, snap crossings, collect split points ──
-        // split_points[i] holds the parameter-ordered vertex ids that split
-        // input segment i (besides its own two endpoints).
+        // Intersect every pair, snap crossings, collect split points.
         let n = inputs.len();
         let mut split_points: Vec<Vec<VertexId>> = vec![Vec::new(); n];
         for i in 0..n {
-            let ei = seg_edge(&store, &inputs[i]);
+            let ei = input_edge2(&store, &inputs[i]);
             for j in (i + 1)..n {
-                let ej = seg_edge(&store, &inputs[j]);
+                let ej = input_edge2(&store, &inputs[j]);
                 let cr = intersect(&ei, &ej, tol)?;
                 for p in cr.points {
                     let v = store.insert(p);
@@ -172,17 +196,12 @@ impl Arrangement {
             }
         }
 
-        // ── 2b. vertex-on-edge snapping ────────────────────────────────────
-        // Snapping in step 1 is vertex-to-vertex only: a vertex lying within
-        // `tol` of the *interior of an edge* (but not near either endpoint) is
-        // never registered on that edge, so a contained operand whose corner
-        // grazes the other operand's edge sub-tolerance leaves a gap that the
-        // classifier's sample point can slip through (the hole is lost, and the
-        // failure is order-dependent). Here we split every edge at any existing
-        // vertex within `tol` of its interior, so the edge passes exactly
-        // through that shared vertex and the topology closes.
+        // Vertex-on-edge snapping for straight edges (segment grazing only).
         let vcount = store.len();
         for i in 0..inputs.len() {
+            if !matches!(inputs[i].geom, EdgeGeom::Seg) {
+                continue;
+            }
             let (sa, sb) = (inputs[i].a, inputs[i].b);
             let a = store.point(sa);
             let b = store.point(sb);
@@ -198,38 +217,25 @@ impl Arrangement {
             }
         }
 
-        // ── 3. split each input into unit segments between consecutive verts ─
-        // ── 4. dedup into arrangement edges keyed by unordered vertex pair ──
-        // A `BTreeMap` keyed on the canonical (min,max) vertex-id pair makes the
-        // arrangement-edge order **deterministic** (sorted by vertex id), not
-        // dependent on `HashMap`'s RandomState seed. That order flows into the
-        // half-edge indices, the DCEL trace order, and ultimately the longest-
-        // edge tie-break in `face_sample_point`, so a `HashMap` here made the
-        // result nondeterministic for identical input (observed area flipping
-        // run-to-run on sub-tol configurations).
-        let mut arr_map: BTreeMap<(VertexId, VertexId), ArrEdge> = BTreeMap::new();
-        for (i, seg) in inputs.iter().enumerate() {
-            let chain = ordered_chain(&store, seg, &split_points[i], tol);
+        // Split each input into atomic edges and dedup by (vertex pair, geom).
+        let mut arr_map: BTreeMap<(VertexId, VertexId, GeomKey), ArrEdge> = BTreeMap::new();
+        for (i, edge) in inputs.iter().enumerate() {
+            let chain = ordered_chain(&store, edge, &split_points[i], tol);
             for w in chain.windows(2) {
                 let (u, v) = (w[0], w[1]);
                 if u == v {
-                    continue; // zero-length fragment collapsed by snapping
+                    continue;
                 }
-                accumulate_edge(&mut arr_map, u, v, seg.operand);
+                accumulate_edge(&mut store, &mut arr_map, u, v, edge);
             }
         }
 
-        // Drop arrangement edges whose winding is zero for *both* operands:
-        // they are interior shared edges that cancel and carry no boundary.
         let arr_edges: Vec<ArrEdge> = arr_map
             .into_values()
             .filter(|e| e.wind_a != 0 || e.wind_b != 0)
             .collect();
 
-        // ── 5. build DCEL ──────────────────────────────────────────────────
         let halfs = build_dcel(&store, &arr_edges)?;
-
-        // ── 6. trace faces ─────────────────────────────────────────────────
         let faces = trace_faces(&store, halfs);
 
         Ok(Self {
@@ -240,14 +246,22 @@ impl Arrangement {
     }
 
     /// Winding number of `p` with respect to the given operand's *original*
-    /// input edges (before arrangement). Robust because `p` is taken in a face
-    /// interior, away from every edge.
+    /// input edges (before arrangement), counting both straight and arc edges.
     pub fn winding(&self, p: Point2, operand: Operand) -> i32 {
         let mut wind = 0_i32;
-        for seg in self.inputs.iter().filter(|s| s.operand == operand) {
-            let a = self.store.point(seg.a);
-            let b = self.store.point(seg.b);
-            wind += ray_cross_contribution(p, a, b);
+        for edge in self.inputs.iter().filter(|s| s.operand == operand) {
+            let a = self.store.point(edge.a);
+            let b = self.store.point(edge.b);
+            match edge.geom {
+                EdgeGeom::Seg => wind += ray_cross_seg(p, a, b),
+                EdgeGeom::Arc {
+                    center,
+                    radius,
+                    ccw,
+                } => {
+                    wind += ray_cross_arc(p, a, b, center, radius, ccw);
+                }
+            }
         }
         wind
     }
@@ -258,116 +272,344 @@ impl Arrangement {
         &self.store
     }
 
-    /// The `(in_a, in_b)` winding classification of the **face to the left** of
-    /// a directed loop, robust against thin neighbouring features.
+    /// The `(in_a, in_b)` winding classification of the **face to the left** of a
+    /// directed loop, robust against thin neighbouring features and curved-edge
+    /// tangencies.
     ///
-    /// [`FaceLoop::face_sample_point`] offsets the longest edge's midpoint by a
-    /// fixed fraction of that edge. That fixed step overshoots a thin
-    /// neighbouring face — a sub-tolerance gap between a contained hole and the
-    /// outer boundary, or a legitimate sliver — so the sample lands in the wrong
-    /// face and the loop misclassifies (the hole is lost; the result was also
-    /// order-dependent). Here the **winding signature** is the arbiter: start
-    /// from the standard (large) offset and halve it only while the operand
-    /// windings keep *changing* between consecutive steps. Once two successive
-    /// halvings agree, the sample has settled inside the minimal face adjacent to
-    /// the chosen edge and the signature is its limit value as the step → 0⁺.
-    ///
-    /// Seeding from the large step preserves the "the all-enclosing outer wrap
-    /// classifies as outside both and is dropped" invariant: the wrap's windings
-    /// are already stable far outside, so it is never shrunk inward into a
-    /// bounded face it does not actually bound.
+    /// The sample is offset from an edge midpoint along its left normal, then
+    /// shrunk until the **loop's own self-winding** at the sample matches the
+    /// target for "the face on the left": `+1` for a CCW loop (its interior),
+    /// `0` for a CW loop (the surrounding region). Anchoring on this topological
+    /// invariant — rather than on the raw step landing in the right place — makes
+    /// the classification robust where a curved edge's midpoint sits at a
+    /// tangent contact with another circle (the step would otherwise slip into
+    /// the neighbouring disc).
     pub fn loop_sample_point(&self, face: &FaceLoop) -> (i32, i32) {
         let classify = |p: Point2| (self.winding(p, Operand::A), self.winding(p, Operand::B));
-        let n = face.vertices.len();
-        if n < 2 {
-            return classify(face.face_sample_point());
+        let n = face.edges.len();
+        if n == 0 {
+            return (0, 0);
         }
-        // Longest edge for a numerically stable normal.
+        // Pick the longest edge (by chord) for a stable normal.
         let mut best_i = 0usize;
         let mut best_len = -1.0_f64;
         for i in 0..n {
-            let l = face.vertices[i].dist(face.vertices[(i + 1) % n]);
+            let e = &face.edges[i];
+            let l = self.store.point(e.a).dist(self.store.point(e.b));
             if l > best_len {
                 best_len = l;
                 best_i = i;
             }
         }
-        let a = face.vertices[best_i];
-        let b = face.vertices[(best_i + 1) % n];
-        let d = a.to(b);
-        let len = d.len();
-        if len <= 0.0 {
-            return classify(face.centroid());
+        let e = &face.edges[best_i];
+        let edge2 = arr_edge2(&self.store, e.a, e.b, e.geom);
+        // Sample at a **generic fraction** of the edge (not the midpoint): an arc
+        // midpoint can sit exactly at the circle's diametral height, where a
+        // horizontal winding ray grazes the circle and double-counts. A fraction
+        // like 0.37 keeps the base point off every circle's centre height and off
+        // the seam, so the winding ray-cast stays unambiguous.
+        let base = edge2.point_at(0.37);
+        let tan = edge_tangent_at_fraction(&edge2, 0.37);
+        if tan.len_sq() <= 0.0 {
+            return classify(self.centroid(face));
         }
-        let mid = Point2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
-        // Left normal of a→b is (-dy, dx)/len.
-        let nx = -d.y / len;
-        let ny = d.x / len;
-        let sample = |s: f64| Point2::new(mid.x + nx * s, mid.y + ny * s);
+        // Left normal of the tangent.
+        let nx = -tan.y;
+        let ny = tan.x;
+        let sample = |s: f64| Point2::new(base.x + nx * s, base.y + ny * s);
 
-        // Offset the midpoint along the left normal by a tiny step and classify.
-        // The step must land in the face immediately to the left of the chosen
-        // edge for any face thicker than the step, so it is taken **absolute and
-        // sub-tolerance** (a small multiple of `f64` noise at building
-        // coordinates, far below `eps = 1e-6` m). A fraction of the longest edge
-        // (the old rule) is the wrong scale: it is huge compared to a thin face's
-        // perpendicular thickness, so it overshoots into a neighbour. The
-        // winding is read with the exact `orient2d`, so a sample 1e-9 m off the
-        // edge classifies on the correct side without a round-off flip.
-        //
-        // We confirm the classification is stable: shrink the step while two
-        // successive samples disagree (the larger one still straddled an edge of
-        // a sub-`eps` sliver), and accept once they settle.
-        let mut step = 1.0e-9_f64;
-        let mut cur = classify(sample(step));
-        for _ in 0..30 {
-            step *= 0.25;
-            let next = classify(sample(step));
-            if next == cur {
-                return next;
+        // Target self-winding for "the face on the left".
+        let target = if loop_signed_area(&self.store, face) > 0.0 {
+            1
+        } else {
+            0
+        };
+
+        // Shrink the step until the sample lands in the loop's own left face
+        // (self-winding == target) *and* the global classification is stable.
+        let mut step = 1.0e-6_f64;
+        let mut last = classify(sample(step));
+        for _ in 0..40 {
+            let p = sample(step);
+            if self.loop_self_winding(face, p) == target {
+                return classify(p);
             }
-            cur = next;
+            last = classify(p);
+            step *= 0.5;
         }
-        cur
+        last
+    }
+
+    /// Winding number of `p` with respect to **one face loop's own edges**, used
+    /// to confirm a sample lies in the loop's left face.
+    fn loop_self_winding(&self, face: &FaceLoop, p: Point2) -> i32 {
+        let mut w = 0_i32;
+        for e in &face.edges {
+            let a = self.store.point(e.a);
+            let b = self.store.point(e.b);
+            match e.geom {
+                EdgeGeom::Seg => w += ray_cross_seg(p, a, b),
+                EdgeGeom::Arc {
+                    center,
+                    radius,
+                    ccw,
+                } => {
+                    w += ray_cross_arc(p, a, b, center, radius, ccw);
+                }
+            }
+        }
+        w
+    }
+
+    fn centroid(&self, face: &FaceLoop) -> Point2 {
+        let mut cx = 0.0_f64;
+        let mut cy = 0.0_f64;
+        for v in &face.vertices {
+            cx += v.x;
+            cy += v.y;
+        }
+        let k = face.vertices.len().max(1) as f64;
+        Point2::new(cx / k, cy / k)
     }
 }
 
-/// Winding contribution of a directed segment `a → b` to the winding number of
-/// `p`, using the standard "upward/downward crossing of the horizontal ray to
-/// the right" rule with the exact [`orient2d`] sidedness test.
-fn ray_cross_contribution(p: Point2, a: Point2, b: Point2) -> i32 {
-    if a.y <= p.y {
-        if b.y > p.y {
-            // upward crossing candidate; p strictly left of a→b ?
-            if orient2d(a, b, p) == Orient::Left {
-                return 1;
+impl LoopEdge {
+    /// Build the [`Edge2`] this loop edge represents, given the snapped store.
+    pub fn to_edge2(self, store: &VertexStore) -> Edge2 {
+        arr_edge2(store, self.a, self.b, self.geom)
+    }
+}
+
+/// Unit tangent of an edge at fraction `t ∈ [0, 1]`, in traversal direction.
+fn edge_tangent_at_fraction(edge: &Edge2, t: f64) -> Vec2 {
+    match edge {
+        Edge2::Seg { start, end } => {
+            let d = start.to(*end);
+            let l = d.len();
+            if l > 0.0 {
+                Vec2::new(d.x / l, d.y / l)
+            } else {
+                Vec2::new(0.0, 0.0)
             }
         }
-    } else if b.y <= p.y {
-        // downward crossing candidate; p strictly right of a→b ?
-        if orient2d(a, b, p) == Orient::Right {
-            return -1;
+        Edge2::Arc(a) => {
+            let theta = a.start_angle + a.sweep * t;
+            let s = if a.sweep >= 0.0 { 1.0 } else { -1.0 };
+            Vec2::new(-theta.sin() * s, theta.cos() * s)
         }
     }
+}
+
+/// Arc-aware signed area of a traced face loop (positive = CCW).
+fn loop_signed_area(store: &VertexStore, face: &FaceLoop) -> f64 {
+    let n = face.edges.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let pts: Vec<Point2> = face.edges.iter().map(|e| store.point(e.a)).collect();
+    let mut acc = 0.0_f64;
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        acc += a.x * b.y - b.x * a.y;
+    }
+    let mut area = 0.5 * acc;
+    for (i, e) in face.edges.iter().enumerate() {
+        if let EdgeGeom::Arc {
+            center,
+            radius,
+            ccw,
+        } = e.geom
+        {
+            let pa = pts[i];
+            let pb = pts[(i + 1) % n];
+            let dtheta = directed_sweep(center, pa, pb, ccw);
+            area += 0.5 * radius * radius * (dtheta - dtheta.sin());
+        }
+    }
+    area
+}
+
+/// A coarse geometry discriminator for the dedup key: straight edges share one
+/// key; arcs are keyed on quantised circle centre + radius so two arc fragments
+/// of the *same* circle dedup while distinct circles stay separate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum GeomKey {
+    Seg,
+    /// An arc keyed on its circle (centre + radius) **and** a quantised midpoint
+    /// of the arc as traversed in canonical `(a ≤ b)` order. The midpoint is
+    /// essential: two semicircles of the *same* circle between the *same* seam
+    /// vertices (upper vs lower) share the circle key but have opposite midpoints,
+    /// so they must not dedup into one (which would cancel both and erase the
+    /// circle). Distinct fragments of one input arc still share circle + midpoint
+    /// only when they are the same atomic edge.
+    Arc {
+        cx: i64,
+        cy: i64,
+        r: i64,
+        mx: i64,
+        my: i64,
+    },
+}
+
+/// Compute the dedup key for an atomic edge whose **canonical** geometry runs
+/// `pa → pb`.
+fn geom_key_for(pa: Point2, pb: Point2, geom: &EdgeGeom) -> GeomKey {
+    match geom {
+        EdgeGeom::Seg => GeomKey::Seg,
+        EdgeGeom::Arc {
+            center,
+            radius,
+            ccw,
+        } => {
+            let sa = (pa.y - center.y).atan2(pa.x - center.x);
+            let sweep = directed_sweep(*center, pa, pb, *ccw);
+            let mid = Point2::new(
+                center.x + radius * (sa + 0.5 * sweep).cos(),
+                center.y + radius * (sa + 0.5 * sweep).sin(),
+            );
+            GeomKey::Arc {
+                cx: (center.x * 1e9).round() as i64,
+                cy: (center.y * 1e9).round() as i64,
+                r: (radius * 1e9).round() as i64,
+                mx: (mid.x * 1e9).round() as i64,
+                my: (mid.y * 1e9).round() as i64,
+            }
+        }
+    }
+}
+
+/// The signed sweep (radians) from `pa` to `pb` about `center`, in the direction
+/// given by `ccw`, folded into `(−2π, 2π)` with the requested sign. The result
+/// is the arc's central angle as actually traversed.
+fn directed_sweep(center: Point2, pa: Point2, pb: Point2, ccw: bool) -> f64 {
+    let aa = (pa.y - center.y).atan2(pa.x - center.x);
+    let ab = (pb.y - center.y).atan2(pb.x - center.x);
+    if ccw {
+        let mut d = ab - aa;
+        d = d.rem_euclid(std::f64::consts::TAU);
+        d
+    } else {
+        let mut d = aa - ab;
+        d = d.rem_euclid(std::f64::consts::TAU);
+        -d
+    }
+}
+
+/// Build the [`Edge2`] for an atomic edge from `a → b` with the given geometry.
+fn arr_edge2(store: &VertexStore, a: VertexId, b: VertexId, geom: EdgeGeom) -> Edge2 {
+    let pa = store.point(a);
+    let pb = store.point(b);
+    match geom {
+        EdgeGeom::Seg => Edge2::seg(pa, pb),
+        EdgeGeom::Arc {
+            center,
+            radius,
+            ccw,
+        } => {
+            let start_angle = (pa.y - center.y).atan2(pa.x - center.x);
+            let sweep = directed_sweep(center, pa, pb, ccw);
+            Edge2::Arc(Arc::new(center, radius, start_angle, sweep))
+        }
+    }
+}
+
+/// Winding contribution of a directed segment `a → b`.
+fn ray_cross_seg(p: Point2, a: Point2, b: Point2) -> i32 {
+    if a.y <= p.y {
+        if b.y > p.y && orient2d(a, b, p) == Orient::Left {
+            return 1;
+        }
+    } else if b.y <= p.y && orient2d(a, b, p) == Orient::Right {
+        return -1;
+    }
     0
+}
+
+/// Winding contribution of a directed **arc** `a → b` (on its circle) to the
+/// winding number of `p`, by counting signed crossings of the horizontal ray to
+/// the right of `p` with the actual arc geometry.
+///
+/// The horizontal line `y = p.y` meets the circle in at most two points; for
+/// each that lies strictly to the right of `p` *and* within the arc's angular
+/// sweep, the arc contributes `+1` if it is locally rising (`dy/dθ` positive in
+/// the traversal direction) or `−1` if falling — the standard non-zero winding
+/// rule applied to a curved edge. This is exact away from the curve (the only
+/// place it matters, since the sample point is always taken in a face interior).
+fn ray_cross_arc(p: Point2, a: Point2, b: Point2, center: Point2, radius: f64, ccw: bool) -> i32 {
+    let dy = p.y - center.y;
+    // A ray whose height grazes the circle (|dy| ≈ radius) is **tangent**: by the
+    // standard ray-casting convention a tangent touch is not a crossing (it does
+    // not change inside/outside). Treating it as two coincident crossings would
+    // double-count (±2). A small absolute slack catches the case where a sample's
+    // y lands exactly on the circle's top/bottom — which happens when it sits at
+    // another circle's centre height. The sample is always in a face interior, so
+    // this never suppresses a real crossing.
+    let graze = 1e-9_f64;
+    if dy.abs() >= radius - graze {
+        return 0;
+    }
+    let dx = (radius * radius - dy * dy).max(0.0).sqrt();
+    // The two circle points at height p.y: x = center.x ± dx.
+    let arc = {
+        let start_angle = (a.y - center.y).atan2(a.x - center.x);
+        let sweep = directed_sweep(center, a, b, ccw);
+        Arc::new(center, radius, start_angle, sweep)
+    };
+    let mut acc = 0_i32;
+    let tol = Tol::default();
+    for &xx in &[center.x + dx, center.x - dx] {
+        let pt = Point2::new(xx, p.y);
+        if xx <= p.x {
+            continue; // not to the right of p
+        }
+        // Must lie within the arc's sweep.
+        if arc.angle_of_point(pt, &tol).is_none() {
+            continue;
+        }
+        // Half-open rule: exclude the crossing when it coincides with the arc's
+        // **end** endpoint, so a seam vertex shared by two arcs is counted by
+        // exactly one of them (the one for which it is the start). Without this a
+        // ray grazing a shared diametral vertex double-counts.
+        if pt.coincident(arc.end(), &tol) {
+            continue;
+        }
+        // Local vertical direction of the arc at this crossing. The CCW tangent at
+        // angle θ is (−sinθ, cosθ); for CW negate. We need d(y)/d(travel) sign.
+        let theta = (pt.y - center.y).atan2(pt.x - center.x);
+        let tan_y = if ccw { theta.cos() } else { -theta.cos() };
+        if tan_y > 0.0 {
+            acc += 1; // rising crossing
+        } else if tan_y < 0.0 {
+            acc -= 1; // falling crossing
+        }
+    }
+    acc
 }
 
 /// Reject malformed input: degenerate contours and self-intersections.
 fn validate_region(r: &Region, tol: &Tol) -> Result<(), Poly2Error> {
     for (ci, c) in r.contours.iter().enumerate() {
-        if c.distinct_vertex_count(tol) < 3 {
+        // An all-segment contour needs ≥3 distinct vertices; a contour with arcs
+        // can enclose area with only the seam vertices, so only reject it when it
+        // bounds no area.
+        if c.has_arc() {
+            if c.signed_area().abs() <= eps_sq(tol) {
+                return Err(Poly2Error::DegenerateContour { contour_index: ci });
+            }
+        } else if c.distinct_vertex_count(tol) < 3 {
             return Err(Poly2Error::DegenerateContour { contour_index: ci });
         }
     }
     Ok(())
 }
 
-/// Snap every contour edge's endpoints and emit [`InputSeg`]s.
+/// Snap every contour edge's endpoints and emit [`InputEdge`]s.
 fn ingest(
     r: &Region,
     operand: Operand,
     store: &mut VertexStore,
-    inputs: &mut Vec<InputSeg>,
+    inputs: &mut Vec<InputEdge>,
     _tol: &Tol,
 ) -> Result<(), Poly2Error> {
     for c in &r.contours {
@@ -377,22 +619,37 @@ fn ingest(
                     let a = store.insert(*start);
                     let b = store.insert(*end);
                     if a != b {
-                        inputs.push(InputSeg { a, b, operand });
+                        inputs.push(InputEdge {
+                            a,
+                            b,
+                            operand,
+                            geom: EdgeGeom::Seg,
+                        });
                     }
                 }
-                Edge2::Arc(_) => return Err(Poly2Error::ArcNotYetSupported),
+                Edge2::Arc(arc) => {
+                    let a = store.insert(arc.start());
+                    let b = store.insert(arc.end());
+                    inputs.push(InputEdge {
+                        a,
+                        b,
+                        operand,
+                        geom: EdgeGeom::Arc {
+                            center: arc.center,
+                            radius: arc.radius,
+                            ccw: arc.sweep >= 0.0,
+                        },
+                    });
+                }
             }
         }
     }
     Ok(())
 }
 
-/// Return a copy of `region` with every vertex that lies within `tol` of the
-/// interior of one of `other`'s edges moved onto that edge (orthogonal
-/// projection). This collapses a sub-tolerance vertex-on-edge gap to an exact
-/// incidence so the arrangement splits cleanly, instead of leaving a thin wedge
-/// that straddles `other`'s boundary. Arc edges are left untouched (unsupported
-/// elsewhere already).
+/// Project every (segment-input) region vertex within `tol` of another operand's
+/// straight edge interior onto that edge, collapsing a sub-tolerance grazing gap.
+/// Arc edges are passed through unchanged.
 fn project_grazing_vertices(region: &Region, other: &Region, tol: &Tol) -> Region {
     let edges: Vec<(Point2, Point2)> = other
         .contours
@@ -417,24 +674,18 @@ fn project_grazing_vertices(region: &Region, other: &Region, tol: &Tol) -> Regio
         .contours
         .iter()
         .map(|c| {
-            let pts: Vec<Point2> = c.vertices().into_iter().map(project).collect();
-            Contour::from_points(&pts)
+            if c.has_arc() {
+                // Don't reshape arc contours; pass them through verbatim.
+                c.clone()
+            } else {
+                let pts: Vec<Point2> = c.vertices().into_iter().map(project).collect();
+                Contour::from_points(&pts)
+            }
         })
         .collect();
     Region::new(contours)
 }
 
-/// If `p` lies within `tol` of segment `(a, b)`, return the point on the segment
-/// it should snap to: its orthogonal projection when that falls in the interior,
-/// or the **nearer endpoint** when the projection lands at (or just past) an end.
-/// Returns `None` if `p` is farther than `tol` from the whole segment.
-///
-/// Snapping a near-*corner* vertex to the endpoint (rather than refusing to move
-/// it) is essential: a vertex in the "dead zone" — beyond the vertex-merge
-/// radius of the corner, yet within `tol` of *two* edges meeting there — would
-/// otherwise be projected by one edge and left by the other, slanting a shared
-/// edge and inventing area. Clamping the projection to the segment makes such a
-/// vertex land exactly on the corner, consistently.
 fn project_if_on_segment_interior(a: Point2, b: Point2, p: Point2, tol: &Tol) -> Option<Point2> {
     let d = a.to(b);
     let len_sq = d.len_sq();
@@ -444,93 +695,131 @@ fn project_if_on_segment_interior(a: Point2, b: Point2, p: Point2, tol: &Tol) ->
     let t_raw = a.to(p).dot(d) / len_sq;
     let t = t_raw.clamp(0.0, 1.0);
     let foot = Point2::new(a.x + d.x * t, a.y + d.y * t);
-    // Distance from `p` to the (clamped) closest point on the segment.
     if foot.dist_sq(p) > eps_sq(tol) {
         return None;
     }
     Some(foot)
 }
 
-/// `true` if `p` lies within `tol` of the *interior* of segment `(a, b)`: the
-/// perpendicular distance is at most `tol.length` and the foot of the
-/// perpendicular falls strictly between the endpoints (endpoint coincidences are
-/// already handled by vertex-to-vertex snapping). Used to split an edge at a
-/// vertex that grazes it sub-tolerance.
 fn point_on_segment_interior(a: Point2, b: Point2, p: Point2, tol: &Tol) -> bool {
     let d = a.to(b);
     let len_sq = d.len_sq();
     if len_sq <= eps_sq(tol) {
-        return false; // degenerate base segment
+        return false;
     }
     let t = a.to(p).dot(d) / len_sq;
-    // Keep the foot strictly interior, with a margin so a near-endpoint vertex
-    // is left to vertex snapping rather than producing a near-zero fragment.
     let margin = tol.length / len_sq.sqrt();
     if t <= margin || t >= 1.0 - margin {
         return false;
     }
-    // Perpendicular distance: |(p − a) × d| / |d|.
     let cross = a.to(p).cross(d);
     (cross * cross) <= eps_sq(tol) * len_sq
 }
 
-/// Reconstruct the [`Edge2`] of an input segment from snapped coordinates.
+/// Reconstruct the [`Edge2`] of an input edge from snapped coordinates.
 #[inline]
-fn seg_edge(store: &VertexStore, s: &InputSeg) -> Edge2 {
-    Edge2::seg(store.point(s.a), store.point(s.b))
+fn input_edge2(store: &VertexStore, e: &InputEdge) -> Edge2 {
+    arr_edge2(store, e.a, e.b, e.geom)
 }
 
-/// Record `v` as a split point of input segment `s` if it is interior.
-fn push_split(splits: &mut Vec<VertexId>, v: VertexId, s: &InputSeg) {
+/// Record `v` as a split point of input edge `s` if it is interior.
+fn push_split(splits: &mut Vec<VertexId>, v: VertexId, s: &InputEdge) {
     if v != s.a && v != s.b && !splits.contains(&v) {
         splits.push(v);
     }
 }
 
-/// Order an input segment's vertices `a, (splits…), b` along the segment.
+/// Order an input edge's vertices `a, (splits…), b` along the edge: by chord
+/// projection for a segment, by angle along the sweep for an arc.
 fn ordered_chain(
     store: &VertexStore,
-    s: &InputSeg,
+    s: &InputEdge,
     splits: &[VertexId],
-    _tol: &Tol,
+    tol: &Tol,
 ) -> Vec<VertexId> {
     let a = store.point(s.a);
     let b = store.point(s.b);
-    let d = a.to(b);
-    let len_sq = d.len_sq().max(f64::MIN_POSITIVE);
-    let mut mids: Vec<(f64, VertexId)> = splits
-        .iter()
-        .map(|&v| {
-            let t = a.to(store.point(v)).dot(d) / len_sq;
-            (t, v)
-        })
-        .collect();
-    mids.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
-    let mut chain = Vec::with_capacity(mids.len() + 2);
-    chain.push(s.a);
-    for (_, v) in mids {
-        chain.push(v);
+    match s.geom {
+        EdgeGeom::Seg => {
+            let d = a.to(b);
+            let len_sq = d.len_sq().max(f64::MIN_POSITIVE);
+            let mut mids: Vec<(f64, VertexId)> = splits
+                .iter()
+                .map(|&v| (a.to(store.point(v)).dot(d) / len_sq, v))
+                .collect();
+            mids.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+            let mut chain = Vec::with_capacity(mids.len() + 2);
+            chain.push(s.a);
+            chain.extend(mids.into_iter().map(|(_, v)| v));
+            chain.push(s.b);
+            chain
+        }
+        EdgeGeom::Arc {
+            center,
+            radius,
+            ccw,
+        } => {
+            let arc = {
+                let start_angle = (a.y - center.y).atan2(a.x - center.x);
+                let sweep = directed_sweep(center, a, b, ccw);
+                Arc::new(center, radius, start_angle, sweep)
+            };
+            // Parameter along the sweep, in [0, 1], for each split.
+            let span = arc.sweep.abs().max(f64::MIN_POSITIVE);
+            let mut mids: Vec<(f64, VertexId)> = splits
+                .iter()
+                .filter_map(|&v| {
+                    let p = store.point(v);
+                    arc.angle_of_point(p, tol).map(|theta| {
+                        let off = (theta - arc.start_angle).abs() / span;
+                        (off, v)
+                    })
+                })
+                .collect();
+            mids.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+            let mut chain = Vec::with_capacity(mids.len() + 2);
+            chain.push(s.a);
+            chain.extend(mids.into_iter().map(|(_, v)| v));
+            chain.push(s.b);
+            chain
+        }
     }
-    chain.push(s.b);
-    chain
 }
 
-/// Add a directed unit segment `u → v` to the arrangement-edge map, folding the
-/// winding into the canonical (min,max) key.
+/// Add a directed atomic edge `u → v` to the arrangement-edge map.
 fn accumulate_edge(
-    map: &mut BTreeMap<(VertexId, VertexId), ArrEdge>,
+    store: &mut VertexStore,
+    map: &mut BTreeMap<(VertexId, VertexId, GeomKey), ArrEdge>,
     u: VertexId,
     v: VertexId,
-    operand: Operand,
+    edge: &InputEdge,
 ) {
-    let (key, dir) = if u <= v { ((u, v), 1) } else { ((v, u), -1) };
-    let entry = map.entry(key).or_insert(ArrEdge {
-        a: key.0,
-        b: key.1,
+    let (key_uv, dir) = if u <= v { ((u, v), 1) } else { ((v, u), -1) };
+    // Canonical geometry is the geometry as traversed in the (a ≤ b) direction.
+    let geom = match edge.geom {
+        EdgeGeom::Seg => EdgeGeom::Seg,
+        EdgeGeom::Arc {
+            center,
+            radius,
+            ccw,
+        } => EdgeGeom::Arc {
+            center,
+            radius,
+            // If we flipped to canonical order, the traversal direction flips too.
+            ccw: if dir == 1 { ccw } else { !ccw },
+        },
+    };
+    let pa = store.point(key_uv.0);
+    let pb = store.point(key_uv.1);
+    let gk = geom_key_for(pa, pb, &geom);
+    let entry = map.entry((key_uv.0, key_uv.1, gk)).or_insert(ArrEdge {
+        a: key_uv.0,
+        b: key_uv.1,
         wind_a: 0,
         wind_b: 0,
+        geom,
     });
-    match operand {
+    match edge.operand {
         Operand::A => entry.wind_a += dir,
         Operand::B => entry.wind_b += dir,
     }
@@ -539,17 +828,30 @@ fn accumulate_edge(
 /// Build the DCEL half-edge graph from undirected arrangement edges.
 fn build_dcel(store: &VertexStore, edges: &[ArrEdge]) -> Result<Vec<HalfEdge>, Poly2Error> {
     let mut halfs: Vec<HalfEdge> = Vec::with_capacity(edges.len() * 2);
-    // outgoing[v] = indices of half-edges with origin v.
     let mut outgoing: HashMap<VertexId, Vec<usize>> = HashMap::new();
 
     for e in edges {
         let h0 = halfs.len();
         let h1 = h0 + 1;
+        // h0: a → b with canonical geometry; h1: b → a with reversed geometry.
+        let rev_geom = match e.geom {
+            EdgeGeom::Seg => EdgeGeom::Seg,
+            EdgeGeom::Arc {
+                center,
+                radius,
+                ccw,
+            } => EdgeGeom::Arc {
+                center,
+                radius,
+                ccw: !ccw,
+            },
+        };
         halfs.push(HalfEdge {
             origin: e.a,
             dest: e.b,
             twin: h1,
             next: usize::MAX,
+            geom: e.geom,
             face: None,
         });
         halfs.push(HalfEdge {
@@ -557,33 +859,25 @@ fn build_dcel(store: &VertexStore, edges: &[ArrEdge]) -> Result<Vec<HalfEdge>, P
             dest: e.a,
             twin: h0,
             next: usize::MAX,
+            geom: rev_geom,
             face: None,
         });
         outgoing.entry(e.a).or_default().push(h0);
         outgoing.entry(e.b).or_default().push(h1);
     }
 
-    // For each vertex, sort outgoing half-edges by polar angle. The `next` of a
-    // half-edge h (arriving at vertex v = h.dest via its twin's origin) is the
-    // outgoing edge most clockwise from h's reverse direction — the standard
-    // "next half-edge around a face" rule that traces faces consistently CCW.
+    // Sort outgoing half-edges by *tangent* angle at the vertex (so an arc orders
+    // by the direction it leaves the vertex, not by its far endpoint).
     for (&v, outs) in &mut outgoing {
         let vp = store.point(v);
         outs.sort_by(|&x, &y| {
-            let ax = angle_of(store, &halfs[x], vp);
-            let ay = angle_of(store, &halfs[y], vp);
+            let ax = leave_angle(store, &halfs[x], vp);
+            let ay = leave_angle(store, &halfs[y], vp);
             ax.partial_cmp(&ay).unwrap_or(std::cmp::Ordering::Equal)
         });
     }
 
-    // Link next pointers. For an incoming half-edge `h_in` arriving at `v`, its
-    // twin `h_in.twin` is outgoing from `v`. Find that twin's position in v's
-    // sorted ring; the face successor is the *previous* outgoing edge in CW
-    // order (i.e. the next one clockwise), which keeps bounded faces CCW.
     let n = halfs.len();
-    // The body reads `halfs[h_in]` to find `v`/`twin` and then writes
-    // `halfs[h_in].next`, while also borrowing `outgoing`; an index loop is the
-    // clearest way to express that without fighting the borrow checker.
     #[allow(clippy::needless_range_loop)]
     for h_in in 0..n {
         let v = halfs[h_in].dest;
@@ -597,7 +891,6 @@ fn build_dcel(store: &VertexStore, edges: &[ArrEdge]) -> Result<Vec<HalfEdge>, P
             .ok_or(Poly2Error::Internal {
                 what: "twin not found in vertex ring",
             })?;
-        // Next outgoing in clockwise order = previous in the CCW-sorted ring.
         let k = outs.len();
         let next_out = outs[(pos + k - 1) % k];
         halfs[h_in].next = next_out;
@@ -606,15 +899,26 @@ fn build_dcel(store: &VertexStore, edges: &[ArrEdge]) -> Result<Vec<HalfEdge>, P
     Ok(halfs)
 }
 
-/// Polar angle of a half-edge's direction as seen from its origin vertex `vp`.
-#[inline]
-fn angle_of(store: &VertexStore, h: &HalfEdge, vp: Point2) -> f64 {
-    let d = vp.to(store.point(h.dest));
-    d.y.atan2(d.x)
+/// Angle at which a half-edge **leaves** its origin vertex (tangent direction),
+/// so arcs and straight edges order consistently in the DCEL ring.
+fn leave_angle(store: &VertexStore, h: &HalfEdge, vp: Point2) -> f64 {
+    let dir = match h.geom {
+        EdgeGeom::Seg => vp.to(store.point(h.dest)),
+        EdgeGeom::Arc { center, ccw, .. } => {
+            // Tangent of the circle at vp, in the traversal direction.
+            let rad = center.to(vp); // outward radial
+                                     // CCW tangent is the radial rotated +90°; CW is −90°.
+            if ccw {
+                Vec2::new(-rad.y, rad.x)
+            } else {
+                Vec2::new(rad.y, -rad.x)
+            }
+        }
+    };
+    dir.y.atan2(dir.x)
 }
 
-/// Trace all face loops by following `next` pointers, then keep the bounded
-/// (positive-area) ones.
+/// Trace all face loops by following `next` pointers.
 fn trace_faces(store: &VertexStore, mut halfs: Vec<HalfEdge>) -> Vec<FaceLoop> {
     let mut faces: Vec<FaceLoop> = Vec::new();
     let n = halfs.len();
@@ -623,17 +927,20 @@ fn trace_faces(store: &VertexStore, mut halfs: Vec<HalfEdge>) -> Vec<FaceLoop> {
             continue;
         }
         let face_id = faces.len();
+        let mut edges: Vec<LoopEdge> = Vec::new();
         let mut verts: Vec<Point2> = Vec::new();
-        let mut vids: Vec<VertexId> = Vec::new();
         let mut cur = start;
-        // Walk the cycle. A hard cap guards against a malformed graph rather
-        // than spinning forever (panic-free contract).
         let cap = n + 1;
         let mut steps = 0;
         loop {
             halfs[cur].face = Some(face_id);
-            vids.push(halfs[cur].origin);
-            verts.push(store.point(halfs[cur].origin));
+            let h = halfs[cur];
+            verts.push(store.point(h.origin));
+            edges.push(LoopEdge {
+                a: h.origin,
+                b: h.dest,
+                geom: h.geom,
+            });
             cur = halfs[cur].next;
             steps += 1;
             if cur == start || cur == usize::MAX || steps > cap {
@@ -641,146 +948,11 @@ fn trace_faces(store: &VertexStore, mut halfs: Vec<HalfEdge>) -> Vec<FaceLoop> {
             }
         }
         faces.push(FaceLoop {
+            edges,
             vertices: verts,
-            vertex_ids: vids,
         });
     }
-    // Keep loops of *both* orientations. A CCW loop bounds the face on its left
-    // (its interior); a CW loop is the inner boundary (a hole edge) of the face
-    // on its left. Both are needed so donut faces classify and reconstruct
-    // correctly. We drop only the single all-enclosing outer wrap of each
-    // connected component, identified as a loop whose left-side sample escapes
-    // to infinity — but that drop is unnecessary here because such a wrap's
-    // face-on-left is the unbounded region, which always classifies as outside
-    // both operands and is therefore never selected. So we keep everything.
     faces
-}
-
-impl FaceLoop {
-    /// A point in the **face that lies to the left** of this directed loop,
-    /// suitable for winding classification.
-    ///
-    /// In a DCEL every directed loop borders exactly one face on its left:
-    /// * a CCW loop's left side is its own enclosed interior;
-    /// * a CW loop (a hole boundary) has the surrounding face on its left.
-    ///
-    /// Classifying that left-side face and keeping the loop iff the face is
-    /// selected makes holes "just work": a kept CCW loop is an outer boundary, a
-    /// kept CW loop is a hole boundary of the same selected face.
-    ///
-    /// The sample is taken at the **midpoint of an edge**, offset by a *tiny*
-    /// step along that edge's left normal. The step is a small fraction of the
-    /// edge length, so the point stays in the **minimal face adjacent to that
-    /// edge** rather than crossing into a neighbouring face — this is essential
-    /// when the loop is the outer boundary of a thin annulus (e.g. a wall ring
-    /// around an opening): a large step would land in the opening and misclassify
-    /// the ring. The longest edge is used to make the offset numerically stable.
-    pub fn face_sample_point(&self) -> Point2 {
-        let n = self.vertices.len();
-        if n < 2 {
-            return self.centroid();
-        }
-        // Pick the longest edge for stability.
-        let mut best_i = 0usize;
-        let mut best_len = -1.0_f64;
-        for i in 0..n {
-            let a = self.vertices[i];
-            let b = self.vertices[(i + 1) % n];
-            let l = a.dist(b);
-            if l > best_len {
-                best_len = l;
-                best_i = i;
-            }
-        }
-        let a = self.vertices[best_i];
-        let b = self.vertices[(best_i + 1) % n];
-        let d = a.to(b);
-        let len = d.len();
-        if len <= 0.0 {
-            return self.centroid();
-        }
-        // Left normal of edge a→b is (-dy, dx)/len. Step a tiny fraction inward.
-        let nx = -d.y / len;
-        let ny = d.x / len;
-        let mx = (a.x + b.x) * 0.5;
-        let my = (a.y + b.y) * 0.5;
-        // A fixed `1e-4 · edge` step overshoots a face thinner than that — e.g. a
-        // legitimate 0.5 mm residual strip over a 10 m wall, where the step is
-        // 1 mm and lands in the neighbouring face — and the face is then
-        // misclassified. For a CCW loop (a face boundary, its own interior on the
-        // left) we verify the candidate is *inside the loop polygon* with the
-        // exact predicate and shrink the step geometrically until it is, so a
-        // sliver of any thickness above `eps` still classifies in its own face.
-        // A CW loop (a hole boundary) has the surrounding face on its left, not
-        // its own polygon, so the tiny-step heuristic is kept for it.
-        let mut step = 1e-4 * len;
-        let candidate = |s: f64| Point2::new(mx + nx * s, my + ny * s);
-        if signed_area_of(&self.vertices) > 0.0 {
-            for _ in 0..60 {
-                let p = candidate(step);
-                if point_in_polygon_exact(&self.vertices, p) {
-                    return p;
-                }
-                step *= 0.5;
-            }
-            return self.centroid();
-        }
-        candidate(step)
-    }
-
-    fn centroid(&self) -> Point2 {
-        let mut cx = 0.0_f64;
-        let mut cy = 0.0_f64;
-        for v in &self.vertices {
-            cx += v.x;
-            cy += v.y;
-        }
-        let k = self.vertices.len().max(1) as f64;
-        Point2::new(cx / k, cy / k)
-    }
-}
-
-/// Signed area of a polygon ring (positive = CCW). Used only to pick the
-/// sample-point strategy (own-interior vs surrounding face); the float sign is
-/// adequate here because a CCW face traced by the DCEL has strictly positive
-/// area well above round-off.
-fn signed_area_of(pts: &[Point2]) -> f64 {
-    let n = pts.len();
-    if n < 3 {
-        return 0.0;
-    }
-    let mut acc = 0.0_f64;
-    for i in 0..n {
-        let a = pts[i];
-        let b = pts[(i + 1) % n];
-        acc += a.x * b.y - b.x * a.y;
-    }
-    0.5 * acc
-}
-
-/// `true` if `p` is strictly inside the simple polygon `ring`, decided with the
-/// exact [`orient2d`] predicate for every edge crossing so a near-edge point is
-/// classified without a round-off flip.
-fn point_in_polygon_exact(ring: &[Point2], p: Point2) -> bool {
-    let n = ring.len();
-    if n < 3 {
-        return false;
-    }
-    let mut inside = false;
-    let mut j = n - 1;
-    for i in 0..n {
-        let a = ring[i];
-        let b = ring[j];
-        if (a.y > p.y) != (b.y > p.y) {
-            let upward = b.y > a.y;
-            let left = orient2d(a, b, p) == Orient::Left;
-            if left == upward {
-                inside = !inside;
-            }
-        }
-        j = i;
-    }
-    inside
 }
 
 #[cfg(test)]
@@ -799,8 +971,6 @@ mod tests {
 
     #[test]
     fn single_square_has_inner_and_outer_loop() {
-        // A single square yields two loops: the CCW interior (area +1) and the
-        // CW outer wrap (area −1).
         let tol = Tol::default();
         let a = square(0.0_f64, 0.0_f64, 1.0_f64);
         let b = Region::empty();
@@ -812,8 +982,6 @@ mod tests {
 
     #[test]
     fn overlapping_squares_have_three_bounded_faces() {
-        // Two unit squares overlapping in a quarter: 3 bounded (CCW) faces
-        // (A-only, B-only, overlap) plus the CW outer wrap.
         let tol = Tol::default();
         let a = square(0.0_f64, 0.0_f64, 1.0_f64);
         let b = square(0.5_f64, 0.5_f64, 1.0_f64);
@@ -830,5 +998,15 @@ mod tests {
         let arr = Arrangement::build(&a, &b, &tol).unwrap();
         assert_eq!(arr.winding(Point2::new(1.0_f64, 1.0_f64), Operand::A), 1);
         assert_eq!(arr.winding(Point2::new(5.0_f64, 5.0_f64), Operand::A), 0);
+    }
+
+    #[test]
+    fn circle_winding_inside_outside() {
+        let tol = Tol::default();
+        let a = Region::circle(Point2::new(0.0_f64, 0.0_f64), 1.0_f64);
+        let b = Region::empty();
+        let arr = Arrangement::build(&a, &b, &tol).unwrap();
+        assert_eq!(arr.winding(Point2::new(0.0_f64, 0.0_f64), Operand::A), 1);
+        assert_eq!(arr.winding(Point2::new(5.0_f64, 0.0_f64), Operand::A), 0);
     }
 }

@@ -318,20 +318,16 @@ fn near_coincident_within_eps_treated_as_coincident() {
 }
 
 #[test]
-fn arc_input_is_rejected() {
-    use archi_kernel::boolean::poly2d::{Arc, Contour, Edge2};
-    let arc_contour = Contour::new(vec![
-        Edge2::seg(Point2::new(0.0_f64, 0.0_f64), Point2::new(1.0_f64, 0.0_f64)),
-        Edge2::Arc(Arc::new(
-            Point2::new(0.5_f64, 0.0_f64),
-            0.5_f64,
-            0.0_f64,
-            std::f64::consts::PI,
-        )),
-        Edge2::seg(Point2::new(0.0_f64, 0.0_f64), Point2::new(0.0_f64, 0.0_f64)),
-    ]);
-    let a = Region::new(vec![arc_contour]);
-    let b = rect(0.0_f64, 0.0_f64, 1.0_f64, 1.0_f64);
-    let err = difference(&a, &b, &tol()).unwrap_err();
-    assert!(matches!(err, Poly2Error::ArcNotYetSupported));
+fn circular_arc_input_is_now_supported() {
+    // Phase 3c: arc edges are supported. A unit circle minus an empty region is
+    // itself; the result keeps its arc boundary and reports area π.
+    let _ = Poly2Error::ArcNotYetSupported; // keep the variant referenced
+    let circle = Region::circle(Point2::new(0.0_f64, 0.0_f64), 1.0_f64);
+    let r = difference(&circle, &Region::empty(), &tol()).unwrap();
+    let expected = std::f64::consts::PI;
+    assert!(
+        (r.area() - expected).abs() <= 1e-6_f64,
+        "circle area {} != π",
+        r.area()
+    );
 }

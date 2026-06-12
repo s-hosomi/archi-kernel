@@ -254,9 +254,19 @@ impl Leaf {
                 );
                 Ok(Region::new(vec![contour]))
             }
-            Ok(ProfileGeom::Circle { .. }) => Err(PrismError::CircularInvolved {
-                operand: Operand::A, // overwritten by the caller with the real side
-            }),
+            Ok(ProfileGeom::Circle { radius }) => {
+                // The circle is prismatic only along its own axis; the caller has
+                // already verified `frame.d` agrees with `self.axis` (else it was
+                // rejected as `CircularInvolved`). The cross-section is the circle
+                // centred at the projected extrusion origin, built from arcs so the
+                // arc-aware arrangement and the cylinder-wall build handle it.
+                let c2 = frame.project(self.origin);
+                let _ = l_max;
+                Ok(Region::circle(
+                    crate::boolean::poly2d::Point2::new(c2[0], c2[1]),
+                    radius,
+                ))
+            }
             Err(e) => Err(PrismError::Poly2(
                 crate::boolean::poly2d::Poly2Error::Internal {
                     what: leak_profile_error(e),
@@ -438,10 +448,13 @@ pub(crate) fn detect_many(
     }
     let d = chosen.ok_or(PrismError::NoCommonDirection)?;
 
-    // A circular section is only prismatic along its own axis; if a circle is
-    // involved at all, the 2-D side carries an arc → Phase 3c.
+    // A circular section is only prismatic along its **own axis**. Phase 3c
+    // supports a circle when the common direction is its axis (the 2-D side then
+    // carries arcs the arc-aware engine handles); along any other direction its
+    // section is not constant, so it is rejected as before (`DESIGN.md` §10
+    // Phase 3c, §4.2).
     for (i, leaf) in leaves.iter().enumerate() {
-        if leaf.is_circular() {
+        if leaf.is_circular() && !dirs_agree(leaf.axis, d, l_max, tol) {
             return Err(PrismError::CircularInvolved {
                 operand: operand_of(i),
             });

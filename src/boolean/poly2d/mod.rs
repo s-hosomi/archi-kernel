@@ -122,7 +122,7 @@ fn boolean(a: &Region, b: &Region, op: Op, tol: &Tol) -> Result<Region, Poly2Err
 
     let arr = Arrangement::build(a, b, tol)?;
 
-    let mut selected: Vec<Vec<snap::VertexId>> = Vec::new();
+    let mut selected: Vec<&arrangement::FaceLoop> = Vec::new();
     for face in &arr.faces {
         // Classify the face that lies to the *left* of this directed loop. A
         // kept CCW loop is an outer boundary; a kept CW loop is a hole boundary
@@ -132,7 +132,7 @@ fn boolean(a: &Region, b: &Region, op: Op, tol: &Tol) -> Result<Region, Poly2Err
         let in_a = inside(wa);
         let in_b = inside(wb);
         if op.keep(in_a, in_b) {
-            selected.push(face.vertex_ids.clone());
+            selected.push(face);
         }
     }
 

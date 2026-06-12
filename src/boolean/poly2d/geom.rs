@@ -204,12 +204,84 @@ impl Arc {
         self.point_at_angle(self.start_angle + self.sweep)
     }
 
+    /// The point on the circle at absolute angle `ang` (radians, measured from
+    /// +x about the centre).
     #[inline]
-    fn point_at_angle(&self, ang: f64) -> Point2 {
+    pub fn point_at_angle(&self, ang: f64) -> Point2 {
         Point2::new(
             self.center.x + self.radius * ang.cos(),
             self.center.y + self.radius * ang.sin(),
         )
+    }
+
+    /// A point on the arc at fraction `t ∈ [0, 1]` of its sweep.
+    #[inline]
+    pub fn point_at(&self, t: f64) -> Point2 {
+        self.point_at_angle(self.start_angle + self.sweep * t)
+    }
+
+    /// The arc's midpoint (`t = 0.5`).
+    #[inline]
+    pub fn mid_point(&self) -> Point2 {
+        self.point_at(0.5)
+    }
+
+    /// The end angle (`start_angle + sweep`).
+    #[inline]
+    pub fn end_angle(&self) -> f64 {
+        self.start_angle + self.sweep
+    }
+
+    /// Recover the angle of a point `p` (assumed on the circle) **as a parameter
+    /// within this arc's sweep**, i.e. the value `θ` in `[start, start+sweep]`
+    /// (modulo 2π) that maps to `p`. Returns `None` if the point is not within
+    /// the angular span (allowing a small `tol`-derived slack at the ends).
+    ///
+    /// The 2π wrap is handled by measuring the signed offset of `p`'s raw angle
+    /// from `start_angle` in the sweep's direction and folding it into `[0, 2π)`,
+    /// then comparing against `|sweep|`.
+    pub fn angle_of_point(&self, p: Point2, tol: &Tol) -> Option<f64> {
+        let raw = (p.y - self.center.y).atan2(p.x - self.center.x);
+        // Angular slack so an endpoint coincidence counts: tol.length / radius
+        // is the angle subtending a chord of length tol at this radius.
+        let ang_slack = if self.radius > 0.0 {
+            tol.length / self.radius
+        } else {
+            0.0
+        };
+        let span = self.sweep.abs();
+        if self.sweep >= 0.0 {
+            // CCW: offset = raw − start folded into [0, 2π).
+            let mut off = raw - self.start_angle;
+            off = off.rem_euclid(std::f64::consts::TAU);
+            // Near the full-turn wrap, a point at the start reads ~2π; pull it back.
+            if off > span && off > std::f64::consts::TAU - ang_slack {
+                off -= std::f64::consts::TAU;
+            }
+            if off >= -ang_slack && off <= span + ang_slack {
+                Some(self.start_angle + off)
+            } else {
+                None
+            }
+        } else {
+            // CW: offset measured in the negative direction.
+            let mut off = self.start_angle - raw;
+            off = off.rem_euclid(std::f64::consts::TAU);
+            if off > span && off > std::f64::consts::TAU - ang_slack {
+                off -= std::f64::consts::TAU;
+            }
+            if off >= -ang_slack && off <= span + ang_slack {
+                Some(self.start_angle - off)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// A sub-arc of `self` spanning the absolute angles `[a, b]`, traversed in
+    /// `self`'s direction, sharing `self`'s centre and radius.
+    pub fn sub_arc(&self, a: f64, b: f64) -> Arc {
+        Arc::new(self.center, self.radius, a, b - a)
     }
 }
 
@@ -263,6 +335,57 @@ impl Edge2 {
     #[inline]
     pub fn is_arc(&self) -> bool {
         matches!(self, Edge2::Arc(_))
+    }
+
+    /// The arc, if this edge is one.
+    #[inline]
+    pub fn as_arc(&self) -> Option<&Arc> {
+        match self {
+            Edge2::Arc(a) => Some(a),
+            Edge2::Seg { .. } => None,
+        }
+    }
+
+    /// A representative midpoint of the edge (`t = 0.5`), used for left/right
+    /// sampling and stable normals.
+    #[inline]
+    pub fn mid_point(&self) -> Point2 {
+        match self {
+            Edge2::Seg { start, end } => start.lerp(*end, 0.5),
+            Edge2::Arc(a) => a.mid_point(),
+        }
+    }
+
+    /// The point at fraction `t ∈ [0, 1]` along the edge.
+    #[inline]
+    pub fn point_at(&self, t: f64) -> Point2 {
+        match self {
+            Edge2::Seg { start, end } => start.lerp(*end, t),
+            Edge2::Arc(a) => a.point_at(t),
+        }
+    }
+
+    /// The unit tangent at the edge midpoint, in the traversal direction.
+    /// Returns the zero vector for a degenerate edge.
+    pub fn mid_tangent(&self) -> Vec2 {
+        match self {
+            Edge2::Seg { start, end } => {
+                let d = start.to(*end);
+                let l = d.len();
+                if l > 0.0 {
+                    Vec2::new(d.x / l, d.y / l)
+                } else {
+                    Vec2::new(0.0, 0.0)
+                }
+            }
+            Edge2::Arc(a) => {
+                // Tangent of a CCW circle at angle θ is (−sinθ, cosθ); the sweep
+                // sign flips it for a CW arc.
+                let theta = a.start_angle + a.sweep * 0.5;
+                let s = if a.sweep >= 0.0 { 1.0 } else { -1.0 };
+                Vec2::new(-theta.sin() * s, theta.cos() * s)
+            }
+        }
     }
 }
 

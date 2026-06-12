@@ -340,7 +340,10 @@ fn orthogonal_h_sections_are_unsupported() {
 }
 
 #[test]
-fn circular_operand_is_unsupported() {
+fn circular_operand_along_common_axis_now_works() {
+    // Phase 3c: a round column whose axis is the common prismatic direction (here
+    // z, the only direction the circle is prismatic along) reduces to a 2-D arc
+    // boolean and is supported — the beam gets a circular notch/hole.
     let tol = Tol::default();
     let beam = beam_x(0.0_f64, 2.0_f64, 0.3_f64);
     let round_column = ExtrudeLeaf {
@@ -349,9 +352,33 @@ fn circular_operand_is_unsupported() {
         axis: Vec3::Z,
         length: 2.0_f64,
     };
+    let result = prismatic::difference(&beam, &round_column, &tol).expect("circular difference");
+    result
+        .validate(&tol, ValidateLevel::Full)
+        .expect("watertight circular notch");
+    assert!(result.signed_volume() > 0.0_f64);
+}
+
+#[test]
+fn two_circles_with_different_axes_have_no_common_direction() {
+    // A circle is prismatic only along its own axis; two circles with different
+    // axes share none, so the difference does not reduce to 2.5-D.
+    let tol = Tol::default();
+    let cz = ExtrudeLeaf {
+        profile: Profile2d::circle(0.1_f64).expect("circle"),
+        origin: Point3::new(0.0_f64, 0.0_f64, -1.0_f64),
+        axis: Vec3::Z,
+        length: 2.0_f64,
+    };
+    let cx = ExtrudeLeaf {
+        profile: Profile2d::circle(0.1_f64).expect("circle"),
+        origin: Point3::new(-1.0_f64, 0.0_f64, 0.0_f64),
+        axis: Vec3::X,
+        length: 2.0_f64,
+    };
     assert!(matches!(
-        prismatic::difference(&beam, &round_column, &tol),
-        Err(PrismError::CircularInvolved { .. })
+        prismatic::difference(&cz, &cx, &tol),
+        Err(PrismError::NoCommonDirection)
     ));
 }
 

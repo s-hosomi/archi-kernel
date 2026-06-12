@@ -13,7 +13,7 @@
 //! [`crate::boolean::poly2d::reconstruct`]). [`Contour::signed_area`] is the tool
 //! used for that.
 
-use crate::boolean::poly2d::geom::{Edge2, Point2};
+use crate::boolean::poly2d::geom::{Arc, Edge2, Point2};
 use crate::tolerance::Tol;
 
 /// A closed ring of edges.
@@ -50,6 +50,28 @@ impl Contour {
         Self { edges }
     }
 
+    /// Construct a CCW circular contour from a centre and radius, as two
+    /// semicircular arcs over a two-point seam, matching the extruder's seam
+    /// convention (`DESIGN.md` §6-1). The result is a closed ring of two
+    /// [`Edge2::Arc`] edges traversed counter-clockwise.
+    ///
+    /// The seam is placed **vertically** (φ = π/2 and φ = 3π/2, i.e. the top and
+    /// bottom of the circle) rather than horizontally, so the everyday
+    /// horizontally-adjacent tangent-sleeve case (two voids side by side touching
+    /// on the x axis) does not put the tangent contact on a seam vertex — which
+    /// would pinch the arrangement. A tangency landing exactly on a seam is still
+    /// reported as an explicit degeneracy rather than mis-answered.
+    pub fn circle(center: Point2, radius: f64) -> Self {
+        use std::f64::consts::PI;
+        let half = PI;
+        Self {
+            edges: vec![
+                Edge2::Arc(Arc::new(center, radius, PI / 2.0, half)),
+                Edge2::Arc(Arc::new(center, radius, 3.0 * PI / 2.0, half)),
+            ],
+        }
+    }
+
     /// The vertices of the ring (each edge's start point, in order).
     ///
     /// Only meaningful for all-segment contours; arc edges contribute only their
@@ -58,12 +80,14 @@ impl Contour {
         self.edges.iter().map(|e| e.start()).collect()
     }
 
-    /// Signed area of the ring via the shoelace formula over edge endpoints.
+    /// Signed area of the ring via the shoelace formula over edge endpoints,
+    /// **plus a circular-segment correction for every arc edge**.
     ///
-    /// Positive for a CCW ring, negative for a CW ring. For all-segment
-    /// contours this is exact (up to rounding); arc edges use their chord, which
-    /// is acceptable for the orientation sign but not for true area — arcs are
-    /// not yet supported, so this is moot today.
+    /// Positive for a CCW ring, negative for a CW ring. The shoelace term
+    /// integrates the chord polygon; each arc additionally contributes the signed
+    /// lens area between the arc and its chord, `½r²(Δθ − sinΔθ)` with `Δθ` the
+    /// arc's signed sweep — so a contour mixing straight edges and arcs reports
+    /// its exact enclosed area (the same formula `mass::volume` uses).
     pub fn signed_area(&self) -> f64 {
         let mut acc = 0.0_f64;
         for e in &self.edges {
@@ -71,7 +95,14 @@ impl Contour {
             let b = e.end();
             acc += a.x * b.y - b.x * a.y;
         }
-        0.5 * acc
+        let mut area = 0.5 * acc;
+        for e in &self.edges {
+            if let Edge2::Arc(arc) = e {
+                let dtheta = arc.sweep;
+                area += 0.5 * arc.radius * arc.radius * (dtheta - dtheta.sin());
+            }
+        }
+        area
     }
 
     /// Reverse the ring's traversal direction (flips orientation sign).
@@ -153,6 +184,13 @@ impl Region {
     pub fn from_points(points: &[Point2]) -> Self {
         Self {
             contours: vec![Contour::from_points(points)],
+        }
+    }
+
+    /// Construct a single-contour circular region (CCW), as two semicircle arcs.
+    pub fn circle(center: Point2, radius: f64) -> Self {
+        Self {
+            contours: vec![Contour::circle(center, radius)],
         }
     }
 

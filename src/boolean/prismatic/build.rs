@@ -47,17 +47,61 @@ use std::collections::HashMap;
 use crate::boolean::poly2d::Op;
 use crate::boolean::support::{key, CoordKey};
 use crate::brep::Brep;
-use crate::geom::{CurveGeom, CurveId, VertexGeom};
-use crate::math::{Point3, Vec3};
-use crate::primitives::{Line3, Plane};
+use crate::geom::{CurveGeom, CurveId, SurfaceGeom, VertexGeom};
+use crate::math::{Point3, Unit3, Vec3};
+use crate::primitives::{Circle3, Cylinder, Line3, Plane};
 use crate::tolerance::Tol;
 use crate::topo::arena::Id;
 use crate::topo::validate::ValidateLevel;
 use crate::topo::{Face, HalfEdge, Loop, Sense, Shell, Solid, Vertex};
 
-use super::arrange::Arrangement;
+use super::arrange::{Arrangement, EdgeGeom, RingEdge};
 use super::detect::{Frame, PrismOperand};
 use super::error::PrismError;
+
+/// A 2-D directed boundary edge of a cap ring, in the shared frame's plane,
+/// carrying the geometry needed to build the matching 3-D edge (a straight line
+/// or a circular arc).
+#[derive(Debug, Clone, Copy)]
+pub(super) enum BoundaryEdge2 {
+    /// A straight segment `a → b` (2-D frame coords).
+    Seg { a: [f64; 2], b: [f64; 2] },
+    /// An arc `a → b` on a circle of `center` / `radius`, swept `ccw` or not.
+    Arc {
+        a: [f64; 2],
+        b: [f64; 2],
+        center: [f64; 2],
+        radius: f64,
+        ccw: bool,
+    },
+}
+
+/// Convert a cell ring of [`RingEdge`]s into 2-D [`BoundaryEdge2`]s.
+fn ring_to_bedges(arr: &Arrangement, ring: &[RingEdge]) -> Vec<BoundaryEdge2> {
+    ring.iter()
+        .map(|e| {
+            let pa = arr.point(e.a);
+            let pb = arr.point(e.b);
+            match e.geom {
+                EdgeGeom::Seg => BoundaryEdge2::Seg {
+                    a: [pa.x, pa.y],
+                    b: [pb.x, pb.y],
+                },
+                EdgeGeom::Arc {
+                    center,
+                    radius,
+                    ccw,
+                } => BoundaryEdge2::Arc {
+                    a: [pa.x, pa.y],
+                    b: [pb.x, pb.y],
+                    center: [center.x, center.y],
+                    radius,
+                    ccw,
+                },
+            }
+        })
+        .collect()
+}
 
 /// Build the prismatic boolean result for a binary `op` from two operands.
 ///
@@ -186,6 +230,8 @@ pub(super) fn build_combined(
     let comp_of = |ci: usize, k: usize, vp: &mut Vec<usize>| uf_find(vp, voxel_id(ci, k));
 
     // ── walls: per arrangement edge, per band ──────────────────────────────
+    // A straight edge becomes a planar wall quad; an **arc** edge becomes a
+    // cylinder wall (Phase 3c). Both face outward toward the void side.
     for e in &arr.edges {
         let pa = arr.point(e.a);
         let pb = arr.point(e.b);
@@ -195,41 +241,51 @@ pub(super) fn build_combined(
             if left == right {
                 continue;
             }
-            // The wall belongs to the resident (material) side's voxel.
             let comp = if left {
                 comp_of(e.left.unwrap(), k, &mut vparent)
             } else {
                 comp_of(e.right.unwrap(), k, &mut vparent)
             };
-            // Material is on the side that is resident; the wall faces the void.
-            // Edge a→b has its `left` cell on the left. Build the quad so its
-            // outward normal points away from the material.
-            builder.wall(
-                comp,
-                [pa.x, pa.y],
-                [pb.x, pb.y],
-                bd.z0,
-                bd.z1,
-                /* material_on_left = */ left,
-            );
+            match e.geom {
+                EdgeGeom::Seg => {
+                    builder.wall(
+                        comp,
+                        [pa.x, pa.y],
+                        [pb.x, pb.y],
+                        bd.z0,
+                        bd.z1,
+                        /* material_on_left = */ left,
+                    );
+                }
+                EdgeGeom::Arc {
+                    center,
+                    radius,
+                    ccw,
+                } => {
+                    builder.cylinder_wall(
+                        comp,
+                        [pa.x, pa.y],
+                        [pb.x, pb.y],
+                        [center.x, center.y],
+                        radius,
+                        ccw,
+                        bd.z0,
+                        bd.z1,
+                        /* material_on_left = */ left,
+                    );
+                }
+            }
         }
     }
 
     // ── interfaces: per cell, per level (band boundaries, incl. bottom/top) ─
     let nbands = bands.len();
-    let to_xy = |v| {
-        let p = arr.point(v);
-        [p.x, p.y]
-    };
     for (ci, cell) in arr.cells.iter().enumerate() {
-        let ring2: Vec<[f64; 2]> = cell.vertex_ids.iter().copied().map(to_xy).collect();
-        // Inner hole rings of the cell (an annulus interface), so a contained
-        // tool's cap is the parent's polygon *with the hole*, not the full
-        // polygon (which would re-cover the void).
-        let inner2: Vec<Vec<[f64; 2]>> = cell
+        let outer = ring_to_bedges(&arr, &cell.outer);
+        let inners: Vec<Vec<BoundaryEdge2>> = cell
             .inner_rings
             .iter()
-            .map(|ring| ring.iter().copied().map(to_xy).collect())
+            .map(|ring| ring_to_bedges(&arr, ring))
             .collect();
         for k in 0..=nbands {
             let below = if k == 0 { false } else { resident[ci][k - 1] };
@@ -238,16 +294,12 @@ pub(super) fn build_combined(
                 continue;
             }
             let z = level_z(&bands, k);
-            // The cap belongs to the resident voxel it bounds: the band below
-            // (k−1) when material is below, else the band above (k).
             let comp = if below {
                 comp_of(ci, k - 1, &mut vparent)
             } else {
                 comp_of(ci, k, &mut vparent)
             };
-            // below && !above: top of lower material, outward normal +d (up).
-            // above && !below: bottom of upper material, outward normal −d.
-            builder.interface(comp, &ring2, &inner2, z, /* up = */ below && !above);
+            builder.interface(comp, &outer, &inners, z, /* up = */ below && !above);
         }
     }
 
@@ -305,20 +357,56 @@ fn level_z(bands: &[Band], k: usize) -> f64 {
     }
 }
 
-/// A deferred planar face: its outer ring, inner hole rings, and outward normal,
-/// all in 3-D world coordinates. Faces are collected first, grouped into
-/// connected components, and only *then* turned into B-rep topology — each
-/// component interning its own vertices and curves. This keeps two solids that
-/// merely touch at a corner (a checkerboard subtraction) geometrically
-/// **independent**: their shared corner edge is interned twice (once per solid),
-/// so no curve carries the four half-edges that would otherwise make the corner
-/// non-manifold and trip the validator's sibling pairing.
+/// A directed 3-D boundary edge of a deferred face: a straight line or an arc of
+/// a circle (Phase 3c). Arc edges carry the [`Circle3`] they lie on so that a
+/// cap's boundary arc and the cylinder wall's rim arc reach the **same**
+/// interned curve and sibling-pair.
+#[derive(Debug, Clone, Copy)]
+enum BEdge3 {
+    /// A straight edge `a → b`.
+    Line { a: Point3, b: Point3 },
+    /// An arc `a → b` on `circle`, swept from `a_ang` to `b_ang` (radians, the
+    /// circle's own parameterisation).
+    Arc {
+        circle: Circle3,
+        a: Point3,
+        b: Point3,
+        a_ang: f64,
+        b_ang: f64,
+    },
+}
+
+impl BEdge3 {
+    fn start(&self) -> Point3 {
+        match self {
+            BEdge3::Line { a, .. } => *a,
+            BEdge3::Arc { a, .. } => *a,
+        }
+    }
+}
+
+/// The surface a deferred face lies on.
+#[derive(Debug, Clone, Copy)]
+enum FaceSurf {
+    /// A plane with outward normal `n_out` through a reference point.
+    Plane { n_out: Vec3, point: Point3 },
+    /// A cylinder surface (built verbatim, no canonicalisation), with the face
+    /// sense relating its outward normal to the cylinder's radial-out normal:
+    /// `Same` for a solid column (material inside), `Reversed` for a void wall.
+    Cylinder { cyl: Cylinder, sense: Sense },
+}
+
+/// A deferred face: its outer ring, inner hole rings (each a list of typed
+/// boundary edges), and the surface it lies on. Faces are collected first,
+/// grouped into connected components, and only *then* turned into B-rep topology
+/// — each component interning its own vertices, curves and surfaces. This keeps
+/// two solids that merely touch at a corner geometrically **independent**.
 struct FaceSpec {
     /// The connected component (solid) this face belongs to.
     comp: usize,
-    outer: Vec<Point3>,
-    holes: Vec<Vec<Point3>>,
-    n_out: Vec3,
+    outer: Vec<BEdge3>,
+    holes: Vec<Vec<BEdge3>>,
+    surf: FaceSurf,
 }
 
 /// Number of axial bands, clamped to at least one for voxel indexing.
@@ -366,37 +454,88 @@ impl Builder {
         self.frame.lift(xy, t)
     }
 
-    /// Record a planar face from an ordered 3-D ring with the given outward
-    /// normal (deferred; built per-component in [`finish`]).
-    fn planar_face(&mut self, comp: usize, ring: &[Point3], n_out: Vec3) {
-        self.planar_face_with_holes(comp, ring, &[], n_out);
+    /// The circle angle (matching [`Circle3::point_at`]) of a 2-D frame point
+    /// about a 2-D centre, normalised to `[0, 2π)`. Because the frame's
+    /// `(e1, e2)` basis is exactly the `plane_basis(d)` that `Circle3` uses, the
+    /// 2-D polar angle is the circle's own parameter, so the lifted endpoint and
+    /// `circle.point_at(angle)` agree.
+    #[inline]
+    fn circle_angle(center: [f64; 2], p: [f64; 2]) -> f64 {
+        (p[1] - center[1])
+            .atan2(p[0] - center[0])
+            .rem_euclid(std::f64::consts::TAU)
     }
 
-    /// Record a planar face with an outer ring and any inner hole rings
-    /// (deferred). Holes are already wound opposite to the outer ring for
-    /// `n_out`.
-    fn planar_face_with_holes(
+    /// The `(start, end)` angular boundary of a directed arc `pa → pb` on a circle
+    /// of `center`, swept in the `ccw` direction.
+    ///
+    /// The endpoints are **anchored on the arc's own midpoint**, not on the
+    /// direction: `start` and `end` are chosen as the unique angles (modulo the
+    /// `0`/`2π` seam) whose interval contains the midpoint angle and spans the true
+    /// (≤ 2π) sweep. Because the midpoint is the same physical point for a forward
+    /// arc and its reverse, both produce the **same unordered** angle pair, so the
+    /// reverse arc's `(end, start)` reverse-matches the forward's `(start, end)`
+    /// for sibling pairing — and the two semicircles of one circle (which share
+    /// their seam endpoints) get *distinct* pairs (one through the seam, one not),
+    /// resolving the otherwise-ambiguous `MultipleSiblings`.
+    fn arc_angles(center: [f64; 2], pa: [f64; 2], pb: [f64; 2], ccw: bool) -> (f64, f64) {
+        use std::f64::consts::TAU;
+        let a = Self::circle_angle(center, pa);
+        let b_raw = Self::circle_angle(center, pb);
+        // Midpoint of the directed arc in the (e1,e2) frame.
+        let s = directed_sweep_angles(a, b_raw, ccw); // signed, in (-2π, 2π)
+                                                      // End angle = start + signed sweep (may leave [0,2π); that is exactly how
+                                                      // the seam-crossing arc is distinguished — it reads e.g. [π, 2π] while the
+                                                      // other semicircle reads [0, π]). The reverse arc, anchored on the same
+                                                      // midpoint, yields the swapped pair.
+        let end = a + s;
+        // Normalise the *pair* so it is independent of which endpoint we started
+        // from: rotate so the smaller angle is the start's canonical value. We key
+        // on the midpoint so forward/reverse agree.
+        let mid = a + 0.5 * s;
+        let mid_norm = mid.rem_euclid(TAU);
+        // Recompute start/end as mid ± half-sweep with start being mid − |s|/2 in
+        // the canonical frame, then orient by ccw so the reverse swaps them.
+        let half = 0.5 * s.abs();
+        let lo = mid_norm - half;
+        let hi = mid_norm + half;
+        let _ = (a, end);
+        if ccw {
+            (lo, hi)
+        } else {
+            (hi, lo)
+        }
+    }
+
+    /// A [`Circle3`] for a 2-D circle (centre + radius) lifted to axial height `t`,
+    /// with normal `+d`.
+    fn circle3(&self, center: [f64; 2], radius: f64, t: f64) -> Circle3 {
+        let c = self.lift(center, t);
+        Circle3::new_unchecked(c, Unit3::new_unchecked(self.frame.d), radius)
+    }
+
+    /// Record a planar face from typed boundary edges with the given outward
+    /// normal (deferred; built per-component in [`finish`]).
+    fn planar_face(
         &mut self,
         comp: usize,
-        ring: &[Point3],
-        holes: &[Vec<Point3>],
+        outer: Vec<BEdge3>,
+        holes: Vec<Vec<BEdge3>>,
         n_out: Vec3,
     ) {
-        if ring.len() < 3 {
+        if outer.len() < 2 {
             return;
         }
+        let point = outer[0].start();
         self.specs.push(FaceSpec {
             comp,
-            outer: ring.to_vec(),
-            holes: holes.iter().filter(|h| h.len() >= 3).cloned().collect(),
-            n_out,
+            outer,
+            holes: holes.into_iter().filter(|h| h.len() >= 2).collect(),
+            surf: FaceSurf::Plane { n_out, point },
         });
     }
 
     /// Emit a vertical wall quad on the 2-D segment `p0→p1` spanning `[z0, z1]`.
-    ///
-    /// `material_on_left` says the resident cell is to the left of `p0→p1`; the
-    /// wall's outward normal must point to the void (right) side.
     #[allow(clippy::too_many_arguments)]
     fn wall(
         &mut self,
@@ -411,69 +550,202 @@ impl Builder {
         let b1 = self.lift(p1, z0);
         let t1 = self.lift(p1, z1);
         let t0 = self.lift(p0, z1);
-        // Quad b0→b1→t1→t0 has, with d the up axis, an outward normal of
-        // (edge × d) for the right side of p0→p1. If material is on the left,
-        // the void is on the right and that is the correct outward direction;
-        // otherwise reverse the loop so the normal flips.
         let edge = b1 - b0;
         let right_normal = edge.cross(self.frame.d);
+        let lines = |pts: [Point3; 4]| {
+            vec![
+                BEdge3::Line {
+                    a: pts[0],
+                    b: pts[1],
+                },
+                BEdge3::Line {
+                    a: pts[1],
+                    b: pts[2],
+                },
+                BEdge3::Line {
+                    a: pts[2],
+                    b: pts[3],
+                },
+                BEdge3::Line {
+                    a: pts[3],
+                    b: pts[0],
+                },
+            ]
+        };
         if material_on_left {
-            self.planar_face(comp, &[b0, b1, t1, t0], right_normal);
+            self.planar_face(comp, lines([b0, b1, t1, t0]), Vec::new(), right_normal);
         } else {
-            self.planar_face(comp, &[b0, t0, t1, b1], -right_normal);
+            self.planar_face(comp, lines([b0, t0, t1, b1]), Vec::new(), -right_normal);
         }
+    }
+
+    /// Emit a **cylinder wall** patch over the 2-D arc `p0→p1` (on a circle of
+    /// `center` / `radius`, swept `ccw`) spanning `[z0, z1]` (Phase 3c).
+    ///
+    /// The patch is bounded by the bottom rim arc (at `z0`), a vertical seam, the
+    /// top rim arc (at `z1`), and a vertical seam — exactly the half-cylinder face
+    /// shape the extruder produces, so [`mass::signed_volume`] integrates it in
+    /// closed form. The rim arcs lie on [`Circle3`]s shared (by interning) with the
+    /// cap interfaces, and the surface is a [`Cylinder`] shared across bands, so
+    /// every sibling pairs.
+    #[allow(clippy::too_many_arguments)]
+    fn cylinder_wall(
+        &mut self,
+        comp: usize,
+        p0: [f64; 2],
+        p1: [f64; 2],
+        center: [f64; 2],
+        radius: f64,
+        ccw: bool,
+        z0: f64,
+        z1: f64,
+        material_on_left: bool,
+    ) {
+        let (a0, a1) = Self::arc_angles(center, p0, p1, ccw);
+        let bottom = self.circle3(center, radius, z0);
+        let top = self.circle3(center, radius, z1);
+        let b0 = self.lift(p0, z0);
+        let b1 = self.lift(p1, z0);
+        let t1 = self.lift(p1, z1);
+        let t0 = self.lift(p0, z1);
+        // Cylinder axis line through the 2-D centre, direction +d.
+        let axis = Line3::new(self.lift(center, 0.0), self.frame.d).expect("cylinder axis");
+        let cyl = Cylinder::new_unchecked(axis, radius);
+
+        // The four rim arcs use the canonical endpoint angles (a0 at p0, a1 at
+        // p1), so each pairs with the matching cap-ring arc (same circle, reversed
+        // boundary). Loop: b0 →(arc)→ b1 →(seam up)→ t1 →(arc back)→ t0 →(seam
+        // down)→ b0 when material is on the left, else reversed.
+        let arc_bottom_fwd = BEdge3::Arc {
+            circle: bottom,
+            a: b0,
+            b: b1,
+            a_ang: a0,
+            b_ang: a1,
+        };
+        let arc_top_back = BEdge3::Arc {
+            circle: top,
+            a: t1,
+            b: t0,
+            a_ang: a1,
+            b_ang: a0,
+        };
+        let arc_bottom_rev = BEdge3::Arc {
+            circle: bottom,
+            a: b1,
+            b: b0,
+            a_ang: a1,
+            b_ang: a0,
+        };
+        let arc_top_fwd = BEdge3::Arc {
+            circle: top,
+            a: t0,
+            b: t1,
+            a_ang: a0,
+            b_ang: a1,
+        };
+        let outer = if material_on_left {
+            vec![
+                arc_bottom_fwd,
+                BEdge3::Line { a: b1, b: t1 },
+                arc_top_back,
+                BEdge3::Line { a: t0, b: b0 },
+            ]
+        } else {
+            vec![
+                arc_bottom_rev,
+                BEdge3::Line { a: b0, b: t0 },
+                arc_top_fwd,
+                BEdge3::Line { a: t1, b: b1 },
+            ]
+        };
+        // The cylinder surface's stored normal is radial-out. The face's *outward*
+        // normal must point to the void. The circle interior is on the left of a
+        // CCW arc, so the material occupies the interior iff `material_on_left ==
+        // ccw`. A solid column (material inside) faces radial-out (`Same`); a void
+        // (material outside) faces radial-in (`Reversed`). This is recorded in the
+        // spec so the cap/wall both carry the correct outward sense, which the
+        // volume integral relies on.
+        let material_inside = material_on_left == ccw;
+        let cyl_sense = if material_inside {
+            Sense::Same
+        } else {
+            Sense::Reversed
+        };
+        self.specs.push(FaceSpec {
+            comp,
+            outer,
+            holes: Vec::new(),
+            surf: FaceSurf::Cylinder {
+                cyl,
+                sense: cyl_sense,
+            },
+        });
     }
 
     /// Emit a horizontal interface face for a cell ring at axial level `z`.
     ///
-    /// `up` selects an outward normal of `+d` (material below, face is the lid)
-    /// versus `−d` (material above, face is the floor). The CCW ring is wound so
-    /// its normal matches.
+    /// `up` selects an outward normal of `+d` (material below) versus `−d`
+    /// (material above). Arc ring edges become arc boundary edges on a shared
+    /// [`Circle3`], so the cap's circular boundary pairs with the cylinder wall's
+    /// rim arc.
     fn interface(
         &mut self,
         comp: usize,
-        ring2: &[[f64; 2]],
-        inner2: &[Vec<[f64; 2]>],
+        outer2: &[BoundaryEdge2],
+        inner2: &[Vec<BoundaryEdge2>],
         z: f64,
         up: bool,
     ) {
-        let ring: Vec<Point3> = ring2.iter().map(|&xy| self.lift(xy, z)).collect();
-        // The cell's inner rings arrive CW in the (e1, e2) frame (hole
-        // boundaries), which is the correct *opposite-to-outer* hole sense for an
-        // outer-CCW / normal-+d face — so the inner-ring edges are
-        // reversed-coincident with the hole's vertical wall edges and sibling
-        // pairing closes (the watertightness contract).
-        let holes: Vec<Vec<Point3>> = inner2
-            .iter()
-            .map(|h| h.iter().map(|&xy| self.lift(xy, z)).collect())
-            .collect();
-        // ring2 is CCW in the (e1, e2) frame, whose normal is +d. So a CCW lift
-        // has outward normal +d (up). For a down-facing floor, reverse every
-        // ring so the outer is CW and the holes CCW, matching the −d normal.
+        let outer = self.bedges_at(outer2, z);
+        let holes: Vec<Vec<BEdge3>> = inner2.iter().map(|h| self.bedges_at(h, z)).collect();
+        // outer2 is CCW in the (e1, e2) frame, normal +d. A down-facing floor
+        // reverses every ring so the outer is CW and holes CCW, matching −d.
         if up {
-            self.planar_face_with_holes(comp, &ring, &holes, self.frame.d);
+            self.planar_face(comp, outer, holes, self.frame.d);
         } else {
-            let rev: Vec<Point3> = ring.iter().rev().copied().collect();
-            let rev_holes: Vec<Vec<Point3>> = holes
-                .iter()
-                .map(|h| h.iter().rev().copied().collect())
-                .collect();
-            self.planar_face_with_holes(comp, &rev, &rev_holes, -self.frame.d);
+            let rev_outer = reverse_bedges(&outer);
+            let rev_holes: Vec<Vec<BEdge3>> = holes.iter().map(|h| reverse_bedges(h)).collect();
+            self.planar_face(comp, rev_outer, rev_holes, -self.frame.d);
         }
+    }
+
+    /// Lift a list of 2-D boundary edges to 3-D at axial height `z`.
+    fn bedges_at(&self, edges: &[BoundaryEdge2], z: f64) -> Vec<BEdge3> {
+        edges
+            .iter()
+            .map(|e| match *e {
+                BoundaryEdge2::Seg { a, b } => BEdge3::Line {
+                    a: self.lift(a, z),
+                    b: self.lift(b, z),
+                },
+                BoundaryEdge2::Arc {
+                    a,
+                    b,
+                    center,
+                    radius,
+                    ccw,
+                } => {
+                    let circle = self.circle3(center, radius, z);
+                    let (a_ang, b_ang) = Self::arc_angles(center, a, b, ccw);
+                    BEdge3::Arc {
+                        circle,
+                        a: self.lift(a, z),
+                        b: self.lift(b, z),
+                        a_ang,
+                        b_ang,
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Build the B-rep from the deferred face specs, one independent solid per
     /// connected component, and validate the result at `Full`.
-    ///
-    /// Each component interns its **own** vertices and curves, so two solids that
-    /// touch at a corner (a checkerboard subtraction) do not share the corner
-    /// curve: every curve carries exactly two half-edges within its component,
-    /// and sibling pairing closes per solid.
     fn finish(self, tol: &Tol) -> Result<Brep, PrismError> {
         if self.specs.is_empty() {
             return Ok(Brep::new());
         }
-        // Group spec indices by their component id (deterministic order).
         let mut comp_ids: Vec<usize> = self.specs.iter().map(|s| s.comp).collect();
         comp_ids.sort_unstable();
         comp_ids.dedup();
@@ -483,7 +755,7 @@ impl Builder {
         for comp in comp_ids {
             let mut cb = ComponentBuilder::new(&mut brep, self.tol);
             for spec in self.specs.iter().filter(|s| s.comp == comp) {
-                cb.add_face(&spec.outer, &spec.holes, spec.n_out);
+                cb.add_face(&spec.outer, &spec.holes, spec.surf);
             }
             let faces = cb.faces;
             if faces.is_empty() {
@@ -502,14 +774,55 @@ impl Builder {
     }
 }
 
+/// Signed sweep (radians, in `(-2π, 2π)`) from angle `a` to angle `b_raw`
+/// (both in `[0, 2π)`) in the `ccw` direction.
+fn directed_sweep_angles(a: f64, b_raw: f64, ccw: bool) -> f64 {
+    use std::f64::consts::TAU;
+    if ccw {
+        (b_raw - a).rem_euclid(TAU)
+    } else {
+        -((a - b_raw).rem_euclid(TAU))
+    }
+}
+
+/// Reverse a list of directed boundary edges (for a down-facing cap).
+fn reverse_bedges(edges: &[BEdge3]) -> Vec<BEdge3> {
+    edges
+        .iter()
+        .rev()
+        .map(|e| match *e {
+            BEdge3::Line { a, b } => BEdge3::Line { a: b, b: a },
+            BEdge3::Arc {
+                circle,
+                a,
+                b,
+                a_ang,
+                b_ang,
+            } => BEdge3::Arc {
+                circle,
+                a: b,
+                b: a,
+                a_ang: b_ang,
+                b_ang: a_ang,
+            },
+        })
+        .collect()
+}
+
+/// Key identifying a shared circle curve: quantised centre + radius. Two arcs of
+/// the same rim circle (a cap arc and a cylinder-wall rim arc) reach the same key
+/// and share the curve, so their half-edges sibling-pair.
+type CircleKey = (CoordKey, i64);
+
 /// Builds one connected component's faces into a shared [`Brep`], interning its
-/// own vertices and curves (a fresh namespace per component).
+/// own vertices, curves and surfaces (a fresh namespace per component).
 struct ComponentBuilder<'a> {
     brep: &'a mut Brep,
     tol: Tol,
     vert_by_key: HashMap<CoordKey, Id<Vertex>>,
     coord_by_key: HashMap<CoordKey, Point3>,
     line_by_key: HashMap<(CoordKey, CoordKey), (CurveId, CoordKey)>,
+    circle_by_key: HashMap<CircleKey, CurveId>,
     faces: Vec<Id<Face>>,
 }
 
@@ -521,6 +834,7 @@ impl<'a> ComponentBuilder<'a> {
             vert_by_key: HashMap::new(),
             coord_by_key: HashMap::new(),
             line_by_key: HashMap::new(),
+            circle_by_key: HashMap::new(),
             faces: Vec::new(),
         }
     }
@@ -551,7 +865,22 @@ impl<'a> ComponentBuilder<'a> {
         entry
     }
 
-    fn half_edge(&mut self, a: Point3, b: Point3) -> Id<HalfEdge> {
+    /// Intern a circle curve by its centre + radius key.
+    fn circle_curve(&mut self, circle: Circle3) -> CurveId {
+        let k: CircleKey = (
+            key(circle.center()),
+            (circle.radius() * 1.0e9_f64).round() as i64,
+        );
+        if let Some(&cid) = self.circle_by_key.get(&k) {
+            return cid;
+        }
+        let cid = self.brep.geom.insert_curve(CurveGeom::Circle(circle));
+        self.circle_by_key.insert(k, cid);
+        cid
+    }
+
+    /// A straight half-edge from `a` to `b`.
+    fn line_half_edge(&mut self, a: Point3, b: Point3) -> Id<HalfEdge> {
         let start = self.vertex(a);
         let _ = self.vertex(b);
         let (curve, origin_key) = self.line_curve(a, b);
@@ -569,35 +898,75 @@ impl<'a> ComponentBuilder<'a> {
         })
     }
 
-    fn add_face(&mut self, ring: &[Point3], holes: &[Vec<Point3>], n_out: Vec3) {
-        let n = ring.len();
-        if n < 3 {
+    /// An arc half-edge on a shared circle, with the given angular boundary.
+    fn arc_half_edge(
+        &mut self,
+        circle: Circle3,
+        a: Point3,
+        b: Point3,
+        a_ang: f64,
+        b_ang: f64,
+    ) -> Id<HalfEdge> {
+        let start = self.vertex(a);
+        let _ = self.vertex(b);
+        let curve = self.circle_curve(circle);
+        self.brep.topo.add_half_edge(HalfEdge {
+            start,
+            curve,
+            boundary: [a_ang, b_ang],
+        })
+    }
+
+    /// Build the half-edges of one boundary ring.
+    fn ring_half_edges(&mut self, ring: &[BEdge3]) -> Vec<Id<HalfEdge>> {
+        ring.iter()
+            .map(|e| match *e {
+                BEdge3::Line { a, b } => self.line_half_edge(a, b),
+                BEdge3::Arc {
+                    circle,
+                    a,
+                    b,
+                    a_ang,
+                    b_ang,
+                } => self.arc_half_edge(circle, a, b, a_ang, b_ang),
+            })
+            .collect()
+    }
+
+    fn add_face(&mut self, outer: &[BEdge3], holes: &[Vec<BEdge3>], surf: FaceSurf) {
+        if outer.len() < 2 {
             return;
         }
-        let hes: Vec<Id<HalfEdge>> = (0..n)
-            .map(|i| self.half_edge(ring[i], ring[(i + 1) % n]))
-            .collect();
+        let hes = self.ring_half_edges(outer);
         let lp = self.brep.topo.add_loop(Loop { half_edges: hes });
         let mut inner_loops: Vec<Id<Loop>> = Vec::with_capacity(holes.len());
         for hole in holes {
-            let m = hole.len();
-            if m < 3 {
+            if hole.len() < 2 {
                 continue;
             }
-            let hhes: Vec<Id<HalfEdge>> = (0..m)
-                .map(|i| self.half_edge(hole[i], hole[(i + 1) % m]))
-                .collect();
+            let hhes = self.ring_half_edges(hole);
             inner_loops.push(self.brep.topo.add_loop(Loop { half_edges: hhes }));
         }
-        let plane = match Plane::new(ring[0], n_out) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        let (surface, flipped) = self.brep.geom.insert_plane(plane, &self.tol);
-        let sense = if flipped {
-            Sense::Reversed
-        } else {
-            Sense::Same
+        let (surface, sense) = match surf {
+            FaceSurf::Plane { n_out, point } => {
+                let plane = match Plane::new(point, n_out) {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let (surface, flipped) = self.brep.geom.insert_plane(plane, &self.tol);
+                (
+                    surface,
+                    if flipped {
+                        Sense::Reversed
+                    } else {
+                        Sense::Same
+                    },
+                )
+            }
+            FaceSurf::Cylinder { cyl, sense } => {
+                let surface = self.brep.geom.insert_surface(SurfaceGeom::Cylinder(cyl));
+                (surface, sense)
+            }
         };
         let f = self.brep.topo.add_face(Face {
             surface,

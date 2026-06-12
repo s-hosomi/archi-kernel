@@ -179,7 +179,14 @@ fn for_each_face_contribution(brep: &Brep, mut f: impl FnMut(Result<f64, VolumeE
 fn planar_loop_integral(brep: &Brep, loop_id: crate::topo::arena::Id<Loop>, n_out: Vec3) -> f64 {
     if let Some((centre, radius)) = disk_loop(brep, loop_id) {
         let d = (centre - Point3::origin()).dot(n_out);
-        return d * std::f64::consts::PI * radius * radius;
+        // The disk area is **signed** by the loop's traversal about `n_out`: a CCW
+        // round cap (outer boundary) encloses `+πr²`, a CW round hole encloses
+        // `−πr²`. Read the sign from the total swept central angle of the arcs
+        // (±2π) oriented to `n_out`, so a circular *hole* subtracts rather than
+        // adds (the bug a fixed `+πr²` caused for a void cap).
+        let total = disk_signed_sweep(brep, loop_id, n_out);
+        let sign = if total >= 0.0 { 1.0 } else { -1.0 };
+        return d * sign * std::f64::consts::PI * radius * radius;
     }
     let verts = loop_vertices(brep, loop_id);
     // Polygon part: Σ q0 · (qi × qi₊₁) / 2 = d · PolyArea (the planar integral
@@ -223,6 +230,24 @@ fn planar_loop_integral(brep: &Brep, loop_id: crate::topo::arena::Id<Loop>, n_ou
         }
     }
     integral
+}
+
+/// The total signed central angle swept by a disk loop's arcs, oriented to
+/// `n_out` (positive ≈ +2π for a CCW round cap, negative ≈ −2π for a CW hole).
+fn disk_signed_sweep(brep: &Brep, loop_id: crate::topo::arena::Id<Loop>, n_out: Vec3) -> f64 {
+    let mut total = 0.0_f64;
+    for &he_id in &lp_half_edges(brep, loop_id) {
+        let Some(he) = brep.topo.half_edges.get(he_id) else {
+            continue;
+        };
+        if let Some(CurveGeom::Circle(c)) = brep.geom.curve(he.curve) {
+            let dtheta = he.boundary[1] - he.boundary[0];
+            let about = c.normal().as_vec().dot(n_out);
+            let sign = if about >= 0.0 { 1.0 } else { -1.0 };
+            total += sign * dtheta;
+        }
+    }
+    total
 }
 
 /// The half-edge ids of a loop (helper for the arc-correction pass).

@@ -40,6 +40,16 @@ pub enum Poly2Error {
         /// Human-readable description of the violated invariant.
         what: &'static str,
     },
+    /// A circular-arc degeneracy outside the supported set was encountered
+    /// (`DESIGN.md` §4.2, §13-3). Phase 3c supports the rectangle × circular-void
+    /// family and the everyday circle/circle cases (separate, overlapping,
+    /// tangent, concentric); a genuinely ambiguous tangent / nested configuration
+    /// that the closed-form path cannot resolve is reported here rather than
+    /// silently mis-answered. The string names the specific degeneracy.
+    UnsupportedArcDegeneracy {
+        /// Human-readable description of the unsupported degeneracy.
+        what: &'static str,
+    },
 }
 
 impl fmt::Display for Poly2Error {
@@ -59,6 +69,9 @@ impl fmt::Display for Poly2Error {
             }
             Poly2Error::Internal { what } => {
                 write!(f, "internal arrangement invariant violated: {what}")
+            }
+            Poly2Error::UnsupportedArcDegeneracy { what } => {
+                write!(f, "unsupported circular-arc degeneracy: {what}")
             }
         }
     }
