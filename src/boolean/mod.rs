@@ -21,6 +21,7 @@
 //! The output is always a fresh [`Brep`](crate::brep::Brep) with its own
 //! geometry store (the input is read-only — `DESIGN.md` §5.2 ownership model).
 
+pub mod coplanar_rules;
 pub mod half_space;
 pub mod poly2d;
 pub mod prismatic;

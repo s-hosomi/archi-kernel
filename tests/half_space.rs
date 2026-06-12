@@ -691,16 +691,16 @@ fn section_of_cube_is_single_square_loop() {
     let tol = Tol::default();
     let (brep, solid) = build_box(2.0, 2.0, 2.0);
     let sec_plane = plane(Point3::new(0.0, 0.0, 1.0), Vec3::Z);
-    let loops = section(&brep, solid, &sec_plane, &tol).expect("section");
+    let result = section(&brep, solid, &sec_plane, &tol).expect("section");
 
-    assert_eq!(loops.outlines.len(), 1usize, "one outline");
-    assert_eq!(loops.loop_count(), 1usize, "one loop total (no holes)");
-    let outline = &loops.outlines[0];
-    assert!(outline.holes.is_empty(), "cube section has no holes");
-    assert_eq!(outline.outer.points_2d.len(), 4usize, "square (4 corners)");
+    assert_eq!(result.profiles.len(), 1usize, "one profile");
+    assert_eq!(result.loop_count(), 1usize, "one loop total (no holes)");
+    let profile = &result.profiles[0];
+    assert!(profile.holes.is_empty(), "cube section has no holes");
+    assert_eq!(profile.outer.points_2d.len(), 4usize, "square (4 corners)");
 
     // The 2-D area of the section equals the cross-section: 2 × 2 = 4.
-    let area = shoelace(&outline.outer.points_2d).abs();
+    let area = shoelace(&profile.outer.points_2d).abs();
     assert!((area - 4.0_f64).abs() < VOL_EPS, "section area {area}");
 }
 
@@ -716,19 +716,19 @@ fn section_of_circular_column_is_arc_loop() {
     let solid = brep.solids[0];
 
     let sec_plane = plane(Point3::new(0.0, 0.0, 1.0), Vec3::Z);
-    let loops = section(&brep, solid, &sec_plane, &tol).expect("section");
+    let result = section(&brep, solid, &sec_plane, &tol).expect("section");
 
-    assert_eq!(loops.outlines.len(), 1usize, "one outline");
-    assert_eq!(loops.loop_count(), 1usize, "one loop (the round outline)");
-    let outline = &loops.outlines[0];
-    assert!(outline.holes.is_empty(), "solid column has no holes");
+    assert_eq!(result.profiles.len(), 1usize, "one profile");
+    assert_eq!(result.loop_count(), 1usize, "one loop (the round outline)");
+    let profile = &result.profiles[0];
+    assert!(profile.holes.is_empty(), "solid column has no holes");
 
     // Every boundary edge is a circular arc of the column radius.
     assert!(
-        !outline.outer.edges.is_empty(),
+        !profile.outer.edges.is_empty(),
         "the round section must expose its arc edges"
     );
-    for e in &outline.outer.edges {
+    for e in &profile.outer.edges {
         match e {
             SectionEdge::Arc { radius: r, .. } => assert!(
                 (r - radius).abs() < VOL_EPS_CURVED,
@@ -745,21 +745,21 @@ fn section_of_holed_box_has_outer_and_hole() {
     let tol = Tol::default();
     let (brep, solid) = build_box_with_hole();
     let sec_plane = plane(Point3::new(0.0, 0.0, 0.5), Vec3::Z);
-    let loops = section(&brep, solid, &sec_plane, &tol).expect("section");
+    let result = section(&brep, solid, &sec_plane, &tol).expect("section");
 
-    // One outline (outer square) with exactly one hole (the through hole).
-    assert_eq!(loops.outlines.len(), 1usize, "one outline");
-    let outline = &loops.outlines[0];
+    // One profile (outer square) with exactly one hole (the through hole).
+    assert_eq!(result.profiles.len(), 1usize, "one profile");
+    let profile = &result.profiles[0];
     assert_eq!(
-        outline.holes.len(),
+        profile.holes.len(),
         1usize,
         "the through hole appears as one hole loop"
     );
-    assert_eq!(loops.loop_count(), 2usize, "outer + 1 hole = 2 loops");
+    assert_eq!(result.loop_count(), 2usize, "outer + 1 hole = 2 loops");
 
     // Net cross-section area = outer (9) − hole (1) = 8.
-    let outer_area = shoelace(&outline.outer.points_2d).abs();
-    let hole_area = shoelace(&outline.holes[0].points_2d).abs();
+    let outer_area = shoelace(&profile.outer.points_2d).abs();
+    let hole_area = shoelace(&profile.holes[0].points_2d).abs();
     assert!(
         (outer_area - 9.0_f64).abs() < VOL_EPS,
         "outer area {outer_area}"

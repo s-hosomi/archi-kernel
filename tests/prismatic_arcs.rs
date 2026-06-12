@@ -214,8 +214,8 @@ fn horizontal_section_of_circular_void_has_arc_loop() {
         .expect("watertight voided column");
 
     let plane = Plane::new(Point3::new(0.0_f64, 0.0_f64, 1.0_f64), Vec3::Z).expect("plane");
-    let loops = section(&result, result.solids[0], &plane, &tol).expect("section");
-    let has_arc = loops.outlines.iter().any(|o| {
+    let result_sec = section(&result, result.solids[0], &plane, &tol).expect("section");
+    let has_arc = result_sec.profiles.iter().any(|o| {
         o.outer
             .edges
             .iter()

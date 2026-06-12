@@ -131,6 +131,32 @@ pub(crate) fn point_in_polygon(p: [f64; 2], poly: &[[f64; 2]]) -> bool {
     inside
 }
 
+/// `true` if the 2-D point `p` lies strictly inside the closed loop given by its
+/// ordered vertex ring `ring`. A re-export of [`point_in_polygon`] under a name
+/// the section module uses for loops; arc bulges are ignored (the ring's chord
+/// polygon is tested), which is exact for the containment of an interior
+/// representative point well away from the boundary.
+pub(crate) fn point_in_loop_2d(p: [f64; 2], ring: &[[f64; 2]]) -> bool {
+    point_in_polygon(p, ring)
+}
+
+/// Signed area of a loop in a 2-D frame: the shoelace area of the vertex `ring`
+/// **plus a circular-segment correction for every arc edge**.
+///
+/// This mirrors [`crate::boolean::poly2d`] `Contour::signed_area`: the shoelace
+/// term integrates the chord polygon, and each arc adds the signed lens area
+/// `½r²(Δθ − sinΔθ)` between the arc and its chord. `arcs` carries one
+/// `(radius, signed_sweep)` per arc edge, the sweep already in `(−π, π]` (a
+/// section arc spans at most a semicircle). So a loop mixing straight edges and
+/// arcs reports its exact enclosed area, and its sign is the loop's winding.
+pub(crate) fn loop_signed_area_2d(ring: &[[f64; 2]], arcs: &[(f64, f64)]) -> f64 {
+    let mut area = signed_area_2d(ring);
+    for &(radius, dtheta) in arcs {
+        area += 0.5 * radius * radius * (dtheta - dtheta.sin());
+    }
+    area
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
