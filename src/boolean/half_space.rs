@@ -65,7 +65,7 @@ use crate::topo::validate::ValidateLevel;
 use crate::topo::{Face, HalfEdge, Loop, Sense, Shell, Solid, Vertex};
 
 use super::support::{
-    key, loop_signed_area_2d, point_in_polygon, signed_area_2d, CoordKey, PlaneFrame,
+    key, loop_signed_area_2d, point_in_polygon, quantize, signed_area_2d, CoordKey, PlaneFrame,
 };
 
 /// A section connector leaving a vertex: `(far vertex, far point, near point)`.
@@ -74,6 +74,13 @@ type SegLink = (Id<Vertex>, Point3, Point3);
 type SegFrom = HashMap<Id<Vertex>, Vec<SegLink>>;
 /// A conic's centre and its two in-plane semi-axis vectors.
 type ConicAxes = (Point3, Vec3, Vec3);
+
+/// A quantised key identifying a section conic by its defining geometry, so two
+/// distinct cylinders' section conics intern as distinct output curves while the
+/// two half-faces and cap of *one* cylinder share theirs. `0` tags a circle and
+/// `1` an ellipse so the two kinds never collide. Quantisation uses the shared
+/// [`super::support::quantize`] scale (1e9), matching every other coordinate key.
+type ConicKey = (u8, [i64; 3], [i64; 3], i64, i64);
 
 /// Which side of the cutting plane to keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,9 +186,14 @@ struct Cutter<'a> {
     /// Collected section arcs (on the cut plane) for a disk / annular cap when
     /// the section curve is a circle or ellipse (cylinder cuts).
     section_arcs: Vec<SectionArc>,
-    /// The shared output curve for the section conic (circle / ellipse), so the
-    /// half-cylinder faces and the cap reference one curve.
-    section_conic_curve: Option<CurveId>,
+    /// The shared output curves for the section conics (circle / ellipse), keyed
+    /// on the conic's defining geometry so the two half-cylinder faces of *one*
+    /// cylinder and its cap reference one curve — while distinct cylinders (e.g.
+    /// a wall severed by several round columns into separate segments, each
+    /// bordering more than one column) each get their *own* section conic. A
+    /// single shared slot here silently merged every cylinder's section circle
+    /// into the first one, putting the wrong circle under an arc half-edge.
+    section_conic_curve: HashMap<ConicKey, CurveId>,
     /// Faces accumulated into the output shell.
     faces: Vec<Id<Face>>,
 }
@@ -213,6 +225,33 @@ impl SectionConic {
                 cy.atan2(cx)
             }
         }
+    }
+}
+
+/// A quantised key for a section conic, distinguishing distinct cylinders'
+/// section conics. A circle keys on `(centre, normal, radius)`; an ellipse on
+/// `(centre, normal, major_dir, semi_major)` packed into the same tuple shape
+/// (the second axis slot carries the quantised major direction, the two scalar
+/// slots the radius/major and minor). The leading tag byte keeps the two kinds
+/// from ever colliding.
+fn conic_key(section: &SectionConic) -> ConicKey {
+    let q3 = |p: Point3| [quantize(p.x), quantize(p.y), quantize(p.z)];
+    let q3v = |v: Vec3| [quantize(v.x), quantize(v.y), quantize(v.z)];
+    match section {
+        SectionConic::Circle(c) => (
+            0,
+            q3(c.center()),
+            q3v(c.normal().as_vec()),
+            quantize(c.radius()),
+            0,
+        ),
+        SectionConic::Ellipse(e) => (
+            1,
+            q3(e.center()),
+            q3v(e.major_dir().as_vec()),
+            quantize(e.semi_major()),
+            quantize(e.semi_minor()),
+        ),
     }
 }
 
@@ -269,7 +308,7 @@ impl<'a> Cutter<'a> {
             section_line_by_key: HashMap::new(),
             section_edges: Vec::new(),
             section_arcs: Vec::new(),
-            section_conic_curve: None,
+            section_conic_curve: HashMap::new(),
             faces: Vec::new(),
         }
     }
@@ -1985,10 +2024,14 @@ impl<'a> Cutter<'a> {
         Some(self.out.topo.add_loop(Loop { half_edges: hes }))
     }
 
-    /// Get-or-create the output curve for the section conic (shared across the
-    /// half-cylinder faces and the cap).
+    /// Get-or-create the output curve for the section conic, keyed on the conic's
+    /// geometry. The two half-cylinder faces of one cylinder and that cylinder's
+    /// cap all resolve to the same conic key and so share one curve (paired
+    /// siblings); a different cylinder's section conic has a different key and a
+    /// different curve.
     fn section_arc_curve(&mut self, section: &SectionConic) -> CurveId {
-        if let Some(c) = self.section_conic_curve {
+        let k = conic_key(section);
+        if let Some(&c) = self.section_conic_curve.get(&k) {
             return c;
         }
         let geom = match section {
@@ -1996,7 +2039,7 @@ impl<'a> Cutter<'a> {
             SectionConic::Ellipse(e) => CurveGeom::Ellipse(*e),
         };
         let cid = self.out.geom.insert_curve(geom);
-        self.section_conic_curve = Some(cid);
+        self.section_conic_curve.insert(k, cid);
         cid
     }
 

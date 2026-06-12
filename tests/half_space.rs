@@ -1151,3 +1151,138 @@ fn horizontal_sleeve_section_near_tangent() {
         "section must produce a profile"
     );
 }
+
+// ── Wall severed by several round columns: each segment borders two cylinders ─
+//
+// Regression for the viewer-found bug where a thin facade wall, clipped by round
+// columns on its centreline into separate segments, raised `BoundaryVertexMismatch
+// { distance ≈ bay width }` + `LoopGeometryGap` when cut. Root cause: the cut held
+// the section conic curve in a *single* slot, so the first cylinder's section
+// circle was reused for every other cylinder — an arc half-edge then carried the
+// neighbouring column's circle (centre a full bay away), and its boundary endpoint
+// evaluated a bay's width from the vertex. The fix keys the section conic by its
+// geometry, so each column gets its own.
+
+/// A thin wall (`thick` along Y, `len` along X, height `h`, base at z = 0) cut by
+/// round columns of radius `r` centred on the wall centreline (`y = 0`) at the
+/// given x positions, severing the wall into separate segments. Returns the
+/// multi-solid B-rep; every segment borders the two columns flanking it, so two
+/// distinct section conics meet in one solid (the case the single-slot cache
+/// merged).
+fn wall_severed_by_columns(thick: f64, len: f64, h: f64, r: f64, col_x: &[f64]) -> Brep {
+    let tol = Tol::default();
+    let base = ExtrudeLeaf {
+        // rect half_w → world-Y (thickness), half_h → world-X (length).
+        profile: Profile2d::rect(0.5 * thick, 0.5 * len).expect("wall rect"),
+        origin: Point3::new(0.5 * len, 0.0, 0.0),
+        axis: Vec3::Z,
+        length: h,
+    };
+    let clippers: Vec<ExtrudeLeaf> = col_x
+        .iter()
+        .map(|&cx| ExtrudeLeaf {
+            profile: Profile2d::circle(r).expect("column circle"),
+            origin: Point3::new(cx, 0.0, -0.5),
+            axis: Vec3::Z,
+            length: h + 1.0,
+        })
+        .collect();
+    let brep = prismatic::clip(&base, &[], &clippers, &tol).expect("wall − columns");
+    brep.validate(&tol, ValidateLevel::Full)
+        .expect("input is watertight");
+    brep
+}
+
+/// Cut every solid of a multi-solid B-rep by a horizontal plane at `z_cut` and
+/// assert both halves of each solid are watertight and conserve volume.
+fn assert_each_solid_perp_cut_conserves(brep: &Brep, z_cut: f64, h: f64) {
+    let tol = Tol::default();
+    let cut_plane = plane(Point3::new(0.0, 0.0, z_cut), Vec3::Z);
+    let mut any_arc = false;
+    for &solid in &brep.solids {
+        let one = {
+            // The volume of just this solid (the per-solid whole).
+            let mut b = brep.clone();
+            b.solids = vec![solid];
+            b.signed_volume()
+        };
+        let below = cut(brep, solid, &cut_plane, KeepSide::Below, &tol).expect("below");
+        let above = cut(brep, solid, &cut_plane, KeepSide::Above, &tol).expect("above");
+        let CutResult::Cut {
+            brep: bb,
+            caps: caps_b,
+        } = &below
+        else {
+            panic!("expected a real cut below for {solid:?}, got {below:?}");
+        };
+        let CutResult::Cut { brep: ab, .. } = &above else {
+            panic!("expected a real cut above for {solid:?}, got {above:?}");
+        };
+        bb.validate(&tol, ValidateLevel::Full)
+            .expect("below segment is watertight");
+        ab.validate(&tol, ValidateLevel::Full)
+            .expect("above segment is watertight");
+        any_arc |= cap_has_arc(bb, caps_b);
+        let vb = bb.signed_volume();
+        let va = ab.signed_volume();
+        assert!(
+            (vb + va - one).abs() < VOL_EPS_CURVED,
+            "segment halves must sum to the whole: {vb} + {va} vs {one}"
+        );
+        let frac = z_cut / h;
+        assert!(
+            (vb - one * frac).abs() < VOL_EPS_CURVED,
+            "below segment volume {vb}, expected {}",
+            one * frac
+        );
+    }
+    assert!(
+        any_arc,
+        "at least one segment's cap must expose a section arc (the column rim)"
+    );
+}
+
+#[test]
+fn wall_severed_by_columns_horizontal_cut_conserves() {
+    // Two bays (columns at x = 0, 6.4, 12.8), r = 0.325 severs the 0.18 wall.
+    // The bug fired at *every* z height; check both a generic height and one that
+    // would sit in a window band.
+    let h = 3.45_f64;
+    let brep = wall_severed_by_columns(0.18, 12.8, h, 0.325, &[0.0, 6.4, 12.8]);
+    assert!(brep.solids.len() >= 2, "the columns sever the wall");
+    assert_each_solid_perp_cut_conserves(&brep, 2.0, h);
+    assert_each_solid_perp_cut_conserves(&brep, 0.5, h);
+}
+
+#[test]
+fn wall_severed_by_two_columns_minimal_repro() {
+    // The reduced reproduction: one wall bay flanked by two columns → a single
+    // segment bordering two distinct section circles. This is the smallest case
+    // that exercised the merged-conic-curve bug.
+    let h = 1.0_f64;
+    let brep = wall_severed_by_columns(0.18, 6.4, h, 0.325, &[0.0, 6.4]);
+    assert!(
+        brep.solids.len() == 1,
+        "two flanking columns leave one wall segment, got {}",
+        brep.solids.len()
+    );
+    assert_each_solid_perp_cut_conserves(&brep, 0.4, h);
+}
+
+#[test]
+fn wall_severed_by_columns_section_each_segment() {
+    // The same multi-cylinder wall exercised through `section()`: every segment
+    // must produce a section profile (the cut runs twice and intersects caps, so
+    // a merged conic would surface as an empty / invalid profile).
+    let tol = Tol::default();
+    let h = 3.45_f64;
+    let brep = wall_severed_by_columns(0.18, 12.8, h, 0.325, &[0.0, 6.4, 12.8]);
+    let sec_plane = plane(Point3::new(0.0, 0.0, 1.5), Vec3::Z);
+    for &solid in &brep.solids {
+        let result = section(&brep, solid, &sec_plane, &tol).expect("section a wall segment");
+        assert!(
+            !result.profiles.is_empty(),
+            "each wall segment must section to a profile"
+        );
+    }
+}

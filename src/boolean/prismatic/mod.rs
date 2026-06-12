@@ -45,13 +45,16 @@ use detect::{detect, detect_many, Leaf};
 
 /// Default boundary-complexity budget (`DESIGN.md` §4.5).
 ///
-/// The build's cost is bounded by `edges·bands + cells·levels`. A single member
-/// boolean in the building domain stays in the low hundreds (a few dozen profile
-/// edges × a handful of bands); `100_000` isolates a pathological input (e.g. a
-/// member accidentally given thousands of openings) long before it grinds, while
-/// never tripping on a legitimate wall-with-windows. It is a guard, not a tuning
-/// knob — chosen two orders of magnitude above any real member.
-pub const DEFAULT_BUDGET: usize = 100_000;
+/// The build's cost is bounded by `edges·bands + cells·levels`. A simple member
+/// boolean stays in the low hundreds, but the *quantity-take-off shape* of the
+/// domain is a floor slab deducted by every column, girder and beam of its
+/// storey: a real three-storey demo floor (40+ clippers) measures ≈ 180,000, and
+/// evaluates in well under a second. The guard exists to stop pathological
+/// input (thousands of accidental openings, measure 10⁸+) before it grinds, not
+/// to cap legitimate floor plates — so it sits two orders of magnitude above
+/// the largest real member observed, not above the *average* one. It is a
+/// guard, not a tuning knob.
+pub const DEFAULT_BUDGET: usize = 20_000_000;
 
 /// One extruded operand described by its CSG [`Extrude`](crate::csg::CsgNode)
 /// fields.
