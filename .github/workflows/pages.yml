@@ -1,0 +1,57 @@
+name: Deploy viewer to GitHub Pages
+
+# Builds the wasm bindings and publishes the Three.js viewer as a live demo.
+# Requires Pages to be enabled with "GitHub Actions" as the source
+# (Settings → Pages → Build and deployment → Source: GitHub Actions).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "wasm/**"
+      - "viewer/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build wasm package
+        run: wasm-pack build wasm --target web --out-dir ../viewer/pkg --release
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp viewer/index.html viewer/main.js viewer/building.js _site/
+          cp -r viewer/pkg _site/pkg
+          rm -f _site/pkg/.gitignore
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

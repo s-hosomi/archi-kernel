@@ -1,5 +1,9 @@
 # archi-kernel
 
+[![CI](https://github.com/s-hosomi/archi-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/s-hosomi/archi-kernel/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/rust-stable-orange)
+
 **English version: [README.md](README.md)** / 設計方針・調査記録・ロードマップの全文は [DESIGN.md](DESIGN.md)。
 
 建築シミュレーション特化の B-rep ジオメトリカーネル。Rust 製・実行時依存ゼロ(唯一の例外は Shewchuk 厳密述語の `robust` クレートで、述語窓口の内側に隔離)。ネイティブでも、WebAssembly 経由でブラウザでも動く。
@@ -49,6 +53,8 @@ CSG 木(正本)                       B-rep(派生・使い捨て)
 - **意味を持つノードがドメイン知識を運ぶ。** `OpeningSubtraction`(IFC の IfcRelVoidsElement 相当)は汎用 `Difference` と区別され、型枠面積が木走査で出る。`Clip` は優先順位控除(柱優先)を表し、`base ∧ ¬開口 ∧ ¬クリッパー` のフラットな集合演算として単一アレンジメントで評価される(冪等なので二重控除が起きない)。モデル層 DAG が「柱を動かしたら梁が再評価される」を実現し、循環依存は関係部材だけを隔離する
 
 ## ビューア(Three.js + wasm)
+
+**ライブデモ: <https://s-hosomi.github.io/archi-kernel/>**(Pages ワークフローが `main` から自動デプロイ)。
 
 `viewer/` はビルドステップ不要の Web アプリ。カーネルを WebAssembly にコンパイルし(`wasm/`: 薄い wasm-bindgen アダプタ — ジオメトリはフラット型付き配列、構造データはカーネル自身の serde JSON)、ES モジュールの Three.js シーンと組み合わせる。デモは **2 層 RC ラーメンを JavaScript 上で CSG モデルとして構築**する — 柱、柱優先でクリップされた大梁、梁に控除された開口付きスラブ(階段開口+丸ダクト)、窓付きの壁、丸柱、スリーブ付き梁 — あとはカーネルの仕事: 評価、watertight メッシュ化、ライブ断面(キャップはカーネル計算)、HUD のコンクリート量集計。
 

@@ -6,6 +6,10 @@ license = "MIT"
 authors = ["s-hosomi"]
 repository = "https://github.com/s-hosomi/archi-kernel"
 description = "Domain-specific B-rep geometry kernel for building simulation: analytic surfaces (planes + cylinders) with closed-form intersections"
+readme = "README.md"
+keywords = ["cad", "geometry", "b-rep", "bim", "csg"]
+categories = ["graphics", "mathematics", "science"]
+exclude = ["assets/*", "viewer/*", "wasm/*", ".github/*"]
 
 [dependencies]
 robust = "1"

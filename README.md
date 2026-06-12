@@ -1,5 +1,9 @@
 # archi-kernel
 
+[![CI](https://github.com/s-hosomi/archi-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/s-hosomi/archi-kernel/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/rust-stable-orange)
+
 **日本語版は [README.ja.md](README.ja.md) へ。** 設計方針・調査記録・ロードマップは [DESIGN.md](DESIGN.md)(日本語)。
 
 A domain-specific B-rep geometry kernel for building simulation, written in Rust with zero runtime dependencies (one exception: Shewchuk's exact predicates via the `robust` crate, isolated behind a single predicate facade). Runs natively and in the browser via WebAssembly.
@@ -49,6 +53,8 @@ CSG tree (source of truth)         B-rep (derived, disposable)
 - **Semantic nodes carry domain meaning.** `OpeningSubtraction` (an IFC `IfcRelVoidsElement` analogue) is distinct from generic `Difference` so formwork areas can be computed by tree walk; `Clip` expresses priority deduction (column over girder) and is evaluated as one flat set-theoretic expression `base ∧ ¬openings ∧ ¬clippers` in a single arrangement — idempotent, so no double deduction. The model-level DAG re-evaluates dependents when a clipped member moves and isolates dependency cycles to exactly the members involved.
 
 ## The viewer (Three.js + wasm)
+
+**Live demo: <https://s-hosomi.github.io/archi-kernel/>** (deployed from `main` by the Pages workflow).
 
 `viewer/` is a no-build-step web app: the kernel compiled to WebAssembly (`wasm/`, thin `wasm-bindgen` adapter — flat typed arrays for geometry, the kernel's serde JSON for everything structured) plus an ES-module Three.js scene. The demo constructs a two-storey RC frame *as a CSG model in JavaScript* — columns, girders clipped to columns with priority rules, slabs deducted by girders with a stair opening and a round duct, a wall with windows, a round column, sleeved beams — and lets the kernel do the rest: evaluation, watertight meshing, live section planes with kernel-computed caps, and a running concrete-volume total in the HUD.
 
