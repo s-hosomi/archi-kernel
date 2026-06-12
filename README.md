@@ -13,10 +13,10 @@ A domain-specific B-rep geometry kernel for building simulation, written in Rust
 </p>
 
 <p align="center">
-  <img src="assets/section.png" alt="The same model cut by a horizontal section plane: vermilion caps and outlines are computed by the kernel's closed-form section(), not by screen-space clipping tricks" width="850">
+  <img src="assets/section-sweep.gif" alt="The section plane sweeping down through the model: every frame's vermilion caps and outlines are recomputed by the kernel's closed-form section() — wall windows, the round column and slab voids appear and vanish as the plane passes them" width="850">
 </p>
 
-*Both images are the bundled Three.js viewer rendering the kernel's own output: watertight tessellation for the solids, and closed-form `section()` profiles (vermilion caps and outlines) for the cut — every opening, notch and round face you see was produced by the kernel's booleans.*
+*Both images are the bundled Three.js viewer rendering the kernel's own output: watertight tessellation for the solids, and closed-form `section()` profiles (vermilion caps and outlines) recomputed live as the plane moves — every opening, notch and round face you see was produced by the kernel's booleans.*
 
 ## The thesis
 

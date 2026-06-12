@@ -173,6 +173,7 @@ async function build() {
     (failed.length ? ` · <span style="color:#c0392b">${failed.length} failed</span>` : '');
   document.getElementById('hud').classList.add('ready');
   window.__model = model; // debug hook
+  window.__sectionGroup = sectionGroup;
 
   applyShotMode();
 }
@@ -188,12 +189,20 @@ function setSection(on, z = sectionZ) {
 }
 
 function rebuildSectionGraphics() {
+  // Dispose before dropping: the slider rebuilds caps dozens of times per
+  // sweep, and undisposed GPU buffers accumulate until allocations start
+  // failing silently (visible as randomly missing caps in long sessions).
+  for (const child of sectionGroup.children) {
+    child.geometry?.dispose();
+    child.material?.dispose();
+  }
   sectionGroup.clear();
   lineMaterials.length = 0;
   if (!sectionOn || !model) return;
 
   const { members: out, errors } = JSON.parse(model.section_all(0, 0, sectionZ, 0, 0, 1));
-  if (errors.length) console.warn('section errors:', errors);
+  window.__lastSectionErrors = errors;
+  if (errors.length) console.warn('section errors:', JSON.stringify(errors).slice(0, 300));
   const capMaterial = new THREE.MeshBasicMaterial({
     color: VERMILION,
     side: THREE.DoubleSide,
