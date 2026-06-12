@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ja">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -44,13 +44,13 @@
 
   <div id="hud" class="card">
     <h1>archi-kernel <span class="accent">viewer</span></h1>
-    <div class="sub">建築特化 B-rep カーネル — CSG 正本 / 閉形式交差 / watertight メッシュ</div>
+    <div class="sub">Domain-specific B-rep kernel — CSG source of truth / closed-form intersections / watertight meshes</div>
     <div id="hud-stats">loading wasm…</div>
-    <div id="hud-hint">drag: orbit / scroll: zoom — 断面は下のスライダーで(キャップと輪郭はカーネルの閉形式 section() の出力)</div>
+    <div id="hud-hint">drag: orbit / scroll: zoom — cut the model with the slider below (caps and outlines come from the kernel's closed-form section())</div>
   </div>
 
   <div id="panel" class="card">
-    <label><input type="checkbox" id="section-toggle" /> 断面 section</label>
+    <label><input type="checkbox" id="section-toggle" /> section</label>
     <input type="range" id="section-z" min="0.2" max="6.9" step="0.05" value="1.5" />
     <span id="section-z-label">z = 1.50 m</span>
   </div>
