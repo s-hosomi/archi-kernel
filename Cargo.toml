@@ -1,0 +1,11 @@
+[package]
+name = "archi-kernel"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["s-hosomi"]
+repository = "https://github.com/s-hosomi/archi-kernel"
+description = "Domain-specific B-rep geometry kernel for building simulation: analytic surfaces (planes + cylinders) with closed-form intersections"
+
+[dependencies]
+nalgebra = "0.33"
