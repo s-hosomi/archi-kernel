@@ -143,6 +143,44 @@ fn overlapping_holes_are_rejected() {
 }
 
 #[test]
+fn separate_circular_holes_with_overlapping_bounds_are_accepted() {
+    let tol = Tol::default();
+    let a = TrimLoop2d::circle([0.45_f64, 1.0_f64], 0.25_f64, &tol).expect("a");
+    let b = TrimLoop2d::circle([0.82_f64, 1.37_f64], 0.25_f64, &tol).expect("b");
+    // Bounding boxes overlap in both axes, but centre distance is greater than
+    // the sum of radii, so the circular holes are genuinely disjoint.
+    let panel = CylinderPanel::new(
+        cylinder(),
+        0.0_f64,
+        1.2_f64,
+        0.0_f64,
+        3.0_f64,
+        vec![a, b],
+        &tol,
+    )
+    .expect("disjoint circles must be accepted");
+    assert_eq!(panel.holes.len(), 2);
+}
+
+#[test]
+fn overlapping_circular_holes_are_rejected() {
+    let tol = Tol::default();
+    let a = TrimLoop2d::circle([0.45_f64, 1.0_f64], 0.25_f64, &tol).expect("a");
+    let b = TrimLoop2d::circle([0.70_f64, 1.0_f64], 0.25_f64, &tol).expect("b");
+    let err = CylinderPanel::new(
+        cylinder(),
+        0.0_f64,
+        1.2_f64,
+        0.0_f64,
+        3.0_f64,
+        vec![a, b],
+        &tol,
+    )
+    .expect_err("overlapping circles");
+    assert!(matches!(err, CurvedError::HoleOverlap));
+}
+
+#[test]
 fn thick_cylinder_panel_without_holes_is_closed_and_has_volume() {
     let tol = Tol::default();
     let mid = CylinderPanel::new(
@@ -203,6 +241,30 @@ fn thick_cylinder_panel_with_rectangular_hole_is_closed() {
         mesh.signed_volume(),
         panel.volume()
     );
+}
+
+#[test]
+fn thick_cylinder_panel_rejects_arc_holes_until_ruled_arc_sides_exist() {
+    let tol = Tol::default();
+    let hole = TrimLoop2d::circle([0.7_f64, 1.5_f64], 0.2_f64, &tol).expect("hole");
+    let mid = CylinderPanel::new(
+        cylinder(),
+        0.0_f64,
+        1.4_f64,
+        0.0_f64,
+        3.0_f64,
+        vec![hole],
+        &tol,
+    )
+    .expect("mid");
+    let panel = ThickCylinderPanel::new(mid, 0.2_f64).expect("thick");
+    let err = tessellate_thick_cylinder_panel(
+        &panel,
+        &CylinderPanelOptions::with_chord_tolerance(5e-4_f64),
+        &tol,
+    )
+    .expect_err("arc hole side walls not yet implemented");
+    assert!(matches!(err, CurvedError::UnsupportedArcTrim));
 }
 
 #[test]

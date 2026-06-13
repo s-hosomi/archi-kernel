@@ -23,10 +23,6 @@ pub enum TrimEdge2d {
         end: [f64; 2],
     },
     /// A circular arc in UV space.
-    ///
-    /// This variant is reserved for the next implementation phase. Constructors
-    /// accept it, but tessellation currently returns
-    /// [`CurvedError::UnsupportedArcTrim`].
     Arc {
         /// Arc centre `[u, v]`.
         center: [f64; 2],
@@ -101,6 +97,7 @@ impl TrimEdge2d {
                     && start_angle.is_finite()
                     && end_angle.is_finite()
                     && (end_angle - start_angle).abs() > 0.0
+                    && (end_angle - start_angle).abs() <= TAU + 1e-12_f64
                 {
                     Ok(())
                 } else {
@@ -243,6 +240,13 @@ impl TrimLoop2d {
     #[inline]
     pub fn area(&self) -> f64 {
         self.signed_area().abs()
+    }
+
+    /// `true` if this loop contains an arc edge.
+    pub fn has_arc(&self) -> bool {
+        self.edges
+            .iter()
+            .any(|e| matches!(e, TrimEdge2d::Arc { .. }))
     }
 
     /// Return a reversed copy.
