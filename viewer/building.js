@@ -68,6 +68,14 @@ function add(kind, label, node) {
   return id;
 }
 
+let nextCurvedId = 10001;
+const curvedPanels = [];
+function addCurved(kind, label, node) {
+  const id = nextCurvedId++;
+  curvedPanels.push({ id, kind, label, node });
+  return id;
+}
+
 // Storey exists at (x, s)? Top storey (s=2) is set back beyond SETBACK_X.
 const inStorey = (s, x) => s < 2 || x <= SETBACK_X + 1e-9;
 
@@ -384,12 +392,72 @@ function parapet(label, cx, cy, lenX, lenY, zTop) {
   }
 }
 
+// ── Analytic curved panel layer ──────────────────────────────────────────────
+// These elements use the kernel's trimmed analytic surface tessellators rather
+// than the CSG evaluator. They demonstrate the current curved-panel path:
+// barrel-vault cylinder with punched skylights, a spherical lounge dome with
+// UV oculi, and a conical entry canopy with slotted trims.
+addCurved('curved-roof', 'thick barrel-vault roof with skylights', {
+  cylinder: {
+    axis_origin: P(0.0, 5.6, 8.95),
+    axis_dir: P(1.0, 0.0, 0.0),
+    radius: 4.2,
+    theta_min: -0.94,
+    theta_max: 0.94,
+    z_min: -0.35,
+    z_max: SETBACK_X + 0.35,
+    thickness: 0.16,
+    holes: [
+      { rectangle: { u_min: -0.22, u_max: 0.22, v_min: 1.2, v_max: 2.75, reverse: true } },
+      { rectangle: { u_min: -0.22, u_max: 0.22, v_min: 4.05, v_max: 5.6, reverse: true } },
+      { rectangle: { u_min: -0.22, u_max: 0.22, v_min: 6.9, v_max: 8.45, reverse: true } },
+      { rectangle: { u_min: -0.22, u_max: 0.22, v_min: 9.75, v_max: 11.3, reverse: true } },
+    ],
+  },
+});
+
+addCurved('curved-dome', 'spherical terrace lounge dome with round UV oculi', {
+  sphere: {
+    center: P(16.2, 5.6, 7.55),
+    radius: 3.0,
+    pole: P(0.0, 0.0, 1.0),
+    theta_min: 0.25,
+    theta_max: 6.03,
+    phi_min: 0.18,
+    phi_max: 1.23,
+    holes: [
+      { circle: { center: [1.45, 0.82], radius: 0.12, reverse: true } },
+      { circle: { center: [3.15, 0.82], radius: 0.12, reverse: true } },
+      { circle: { center: [4.85, 0.82], radius: 0.12, reverse: true } },
+    ],
+  },
+});
+
+addCurved('curved-cone', 'conical entry canopy with slotted trims', {
+  cone: {
+    apex: P(9.6, -1.25, 2.25),
+    axis: P(0.0, 0.0, 1.0),
+    half_angle: 0.62,
+    theta_min: 0.15,
+    theta_max: 4.55,
+    height_min: 1.0,
+    height_max: 2.35,
+    holes: [
+      { rectangle: { u_min: 0.85, u_max: 1.25, v_min: 1.2, v_max: 1.85, reverse: true } },
+      { rectangle: { u_min: 2.05, u_max: 2.45, v_min: 1.2, v_max: 1.85, reverse: true } },
+      { rectangle: { u_min: 3.25, u_max: 3.65, v_min: 1.2, v_max: 1.85, reverse: true } },
+    ],
+  },
+});
+
 // ── Exports ──────────────────────────────────────────────────────────────────
 export const KIND_OF = new Map(members.map((m) => [m.id, m.kind]));
+export const CURVED_KIND_OF = new Map(curvedPanels.map((m) => [m.id, m.kind]));
 export const LABEL_OF = new Map(members.map((m) => [m.id, m.label]));
 export const MEMBERS = members;
+export const CURVED_PANELS = curvedPanels;
 export const BOUNDS = {
   x: [GX[0] - MARGIN, GX[3] + MARGIN],
-  y: [GY[0] - MARGIN, GY[2] + MARGIN],
-  zMax: LEVELS_Z[2] + PAR_H,
+  y: [GY[0] - 3.2, GY[2] + MARGIN],
+  zMax: 13.4,
 };
