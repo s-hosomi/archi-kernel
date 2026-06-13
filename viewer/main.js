@@ -13,7 +13,7 @@ import { Line2 } from 'three/addons/lines/Line2.js';
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import init, { KernelModel } from './pkg/archi_kernel_wasm.js';
-import { MEMBERS, KIND_OF, BOUNDS } from './building.js';
+import { MEMBERS, CURVED_PANELS, KIND_OF, CURVED_KIND_OF, BOUNDS } from './building.js';
 
 THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
 
@@ -35,6 +35,9 @@ const TONES = {
   canopy: 0xc9c6bf,
   parapet: 0xcfccc5,
   steel: 0x5d6671,
+  'curved-roof': 0x9fb6bd,
+  'curved-dome': 0x8bb7c7,
+  'curved-cone': 0xb7a77b,
 };
 
 // ── Renderer / scene ─────────────────────────────────────────────────────────
@@ -117,10 +120,14 @@ const lineMaterials = []; // LineMaterials needing resolution updates
 const meshMaterials = [];
 
 function memberMaterial(kind) {
+  const transparent = kind === 'curved-dome' || kind === 'curved-roof';
   const m = new THREE.MeshStandardMaterial({
     color: TONES[kind] ?? 0xbdb9b0,
-    roughness: 0.88,
+    roughness: kind?.startsWith('curved') ? 0.48 : 0.88,
     metalness: 0.0,
+    side: kind?.startsWith('curved') ? THREE.DoubleSide : THREE.FrontSide,
+    transparent,
+    opacity: kind === 'curved-dome' ? 0.58 : kind === 'curved-roof' ? 0.88 : 1.0,
   });
   // Clip the shadow casters along with the geometry, or the removed upper
   // storeys would keep casting onto the ground in section mode.
@@ -137,6 +144,7 @@ async function build() {
   await init();
   model = new KernelModel();
   for (const m of MEMBERS) model.insert(BigInt(m.id), JSON.stringify(m.node));
+  for (const m of CURVED_PANELS) model.insert_curved(BigInt(m.id), JSON.stringify(m.node));
 
   const statuses = JSON.parse(model.evaluate_all());
   const failed = statuses.filter((s) => !s.ok);
@@ -170,9 +178,37 @@ async function build() {
     mesh.add(edges);
   }
 
+  for (const m of CURVED_PANELS) {
+    let data;
+    try {
+      data = model.curved_mesh(BigInt(m.id), 0.035);
+    } catch (e) {
+      console.warn(`curved panel ${m.id} (${m.label}) failed:`, e);
+      continue;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(data.positions, 3));
+    geo.setIndex(new THREE.BufferAttribute(data.indices, 1));
+    geo.computeVertexNormals();
+    triangleTotal += data.indices.length / 3;
+
+    const mesh = new THREE.Mesh(geo, memberMaterial(CURVED_KIND_OF.get(m.id)));
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.userData.id = m.id;
+    memberGroup.add(mesh);
+
+    const edges = new THREE.LineSegments(
+      new THREE.EdgesGeometry(geo, 18),
+      edgeMaterial,
+    );
+    mesh.add(edges);
+  }
+
   const dt = performance.now() - t0;
   hud.innerHTML =
-    `${MEMBERS.length} members · ${triangleTotal.toLocaleString()} tris · ` +
+    `${MEMBERS.length} CSG members + ${CURVED_PANELS.length} curved panels · ` +
+    `${triangleTotal.toLocaleString()} tris · ` +
     `evaluated in ${dt.toFixed(0)} ms<br>` +
     `concrete ${concrete.toFixed(2)} m³` +
     (failed.length ? ` · <span style="color:#c0392b">${failed.length} failed</span>` : '');
@@ -253,10 +289,13 @@ function rebuildSectionGraphics() {
 const toggle = document.getElementById('section-toggle');
 const slider = document.getElementById('section-z');
 slider.max = String(BOUNDS.zMax - 0.25);
+function updateSectionLabel(z) {
+  document.getElementById('section-z-label').textContent =
+    `z = ${Number(z).toFixed(2)} m`;
+}
 toggle.addEventListener('change', () => setSection(toggle.checked));
 slider.addEventListener('input', () => {
-  document.getElementById('section-z-label').textContent =
-    `z = ${Number(slider.value).toFixed(2)} m`;
+  updateSectionLabel(slider.value);
   if (sectionOn) setSection(true, Number(slider.value));
   else sectionZ = Number(slider.value);
 });
@@ -264,14 +303,15 @@ slider.addEventListener('input', () => {
 // ── Shots (deterministic states for screenshots) ─────────────────────────────
 function applyShotMode() {
   if (SHOT === 'section') {
-    camera.position.set(27.0, -19.5, 18.5);
-    controls.target.set(8.8, 5.4, 2.4);
+    camera.position.set(28.5, -22.0, 19.2);
+    controls.target.set(9.0, 5.1, 4.0);
     toggle.checked = true;
-    slider.value = '4.10';
-    setSection(true, 4.10);
+    slider.value = '8.45';
+    updateSectionLabel(slider.value);
+    setSection(true, 8.45);
   } else {
-    camera.position.set(33.5, -23.5, 15.5);
-    controls.target.set(9.6, 5.4, 5.0);
+    camera.position.set(34.5, -26.0, 18.6);
+    controls.target.set(10.4, 5.0, 6.5);
   }
   controls.update();
   if (SHOT) {

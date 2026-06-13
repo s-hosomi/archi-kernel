@@ -10,12 +10,19 @@
 
 use archi_kernel::clash::{clash_check, ClashKind, ClashOptions};
 use archi_kernel::csg::{CsgNode, Member, StableId};
+use archi_kernel::curved::{
+    tessellate_cone_panel, tessellate_cylinder_panel, tessellate_sphere_panel,
+    tessellate_thick_cylinder_panel, tessellate_thick_sphere_panel, ConePanel, ConePanelOptions,
+    ConePanelSpec, CylinderPanel, CylinderPanelOptions, SpherePanel, SpherePanelOptions,
+    SpherePanelSpec, ThickCylinderPanel, ThickSpherePanel, TrimLoop2d,
+};
 use archi_kernel::model::{takeoff, Model};
-use archi_kernel::primitives::Plane;
+use archi_kernel::primitives::{Cylinder, Line3, Plane};
 use archi_kernel::section::{section, SectionEdge, SectionResult};
 use archi_kernel::tess::{tessellate, TessOptions};
 use archi_kernel::tolerance::Tol;
 use archi_kernel::{Point3, Vec3};
+use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
 /// One member's merged render mesh (all solids of the member, one buffer).
@@ -97,6 +104,7 @@ struct ClashOut {
 #[wasm_bindgen]
 pub struct KernelModel {
     model: Model,
+    curved: HashMap<StableId, CurvedPanelInput>,
     tol: Tol,
 }
 
@@ -113,6 +121,7 @@ impl KernelModel {
     pub fn new() -> Self {
         Self {
             model: Model::new(),
+            curved: HashMap::new(),
             tol: Tol::default(),
         }
     }
@@ -126,9 +135,28 @@ impl KernelModel {
             .map_err(|e| JsError::new(&format!("insert: {e:?}")))
     }
 
+    /// Insert or replace a curved analytic panel from JSON.
+    ///
+    /// Curved panels are a renderable surface layer at this phase: they can be
+    /// tessellated through [`curved_mesh`](Self::curved_mesh), but are not yet
+    /// part of the CSG/B-rep evaluator used by sections, take-off or clashes.
+    pub fn insert_curved(&mut self, id: u64, curved_json: &str) -> Result<(), JsError> {
+        let node: CurvedPanelInput = serde_json::from_str(curved_json)
+            .map_err(|e| JsError::new(&format!("bad curved panel: {e}")))?;
+        self.curved.insert(StableId(id), node);
+        Ok(())
+    }
+
     /// Member ids currently in the model, ascending.
     pub fn ids(&self) -> Vec<u64> {
         self.model.ids().map(|s| s.0).collect()
+    }
+
+    /// Curved panel ids currently registered in the render layer, ascending.
+    pub fn curved_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.curved.keys().map(|s| s.0).collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Evaluate every member; returns a JSON array of per-member statuses
@@ -175,6 +203,19 @@ impl KernelModel {
             indices.extend(mesh.indices.iter().map(|&i| i + base));
         }
         Ok(MeshData { positions, indices })
+    }
+
+    /// Tessellate one registered curved analytic panel into a render mesh.
+    pub fn curved_mesh(&self, id: u64, chord_tolerance: f64) -> Result<MeshData, JsError> {
+        let node = self
+            .curved
+            .get(&StableId(id))
+            .ok_or_else(|| JsError::new(&format!("unknown curved panel id: {id}")))?;
+        if chord_tolerance <= 0.0 || !chord_tolerance.is_finite() {
+            return Err(JsError::new("chord_tolerance must be positive and finite"));
+        }
+        let mesh = node.mesh(chord_tolerance, &self.tol)?;
+        Ok(surface_mesh_to_mesh_data(mesh))
     }
 
     /// Quantity take-off of one member, as JSON
@@ -250,6 +291,251 @@ impl KernelModel {
             .collect();
         serde_json::to_string(&out).map_err(|e| JsError::new(&e.to_string()))
     }
+}
+
+fn surface_mesh_to_mesh_data(mesh: archi_kernel::curved::SurfaceMesh) -> MeshData {
+    MeshData {
+        positions: mesh.positions.iter().map(|&v| v as f32).collect(),
+        indices: mesh.indices,
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CurvedPanelInput {
+    Cylinder {
+        axis_origin: Point3Input,
+        axis_dir: Point3Input,
+        radius: f64,
+        theta_min: f64,
+        theta_max: f64,
+        z_min: f64,
+        z_max: f64,
+        #[serde(default)]
+        holes: Vec<TrimLoopInput>,
+        thickness: Option<f64>,
+    },
+    Sphere {
+        center: Point3Input,
+        radius: f64,
+        pole: Point3Input,
+        theta_min: f64,
+        theta_max: f64,
+        phi_min: f64,
+        phi_max: f64,
+        #[serde(default)]
+        holes: Vec<TrimLoopInput>,
+        thickness: Option<f64>,
+    },
+    Cone {
+        apex: Point3Input,
+        axis: Point3Input,
+        half_angle: f64,
+        theta_min: f64,
+        theta_max: f64,
+        height_min: f64,
+        height_max: f64,
+        #[serde(default)]
+        holes: Vec<TrimLoopInput>,
+        thickness: Option<f64>,
+    },
+}
+
+impl CurvedPanelInput {
+    fn mesh(
+        &self,
+        chord_tolerance: f64,
+        tol: &Tol,
+    ) -> Result<archi_kernel::curved::SurfaceMesh, JsError> {
+        match self {
+            CurvedPanelInput::Cylinder {
+                axis_origin,
+                axis_dir,
+                radius,
+                theta_min,
+                theta_max,
+                z_min,
+                z_max,
+                holes,
+                thickness,
+            } => {
+                let axis = Line3::new(axis_origin.point(), axis_dir.vec())
+                    .map_err(|e| JsError::new(&format!("cylinder axis: {e}")))?;
+                let cylinder = Cylinder::new(axis, *radius)
+                    .map_err(|e| JsError::new(&format!("cylinder: {e}")))?;
+                let panel = CylinderPanel::new(
+                    cylinder,
+                    *theta_min,
+                    *theta_max,
+                    *z_min,
+                    *z_max,
+                    trim_loops(holes, tol)?,
+                    tol,
+                )
+                .map_err(curved_error)?;
+                let opts = CylinderPanelOptions::with_chord_tolerance(chord_tolerance);
+                if let Some(thickness) = thickness {
+                    let thick = ThickCylinderPanel::new(panel, *thickness).map_err(curved_error)?;
+                    tessellate_thick_cylinder_panel(&thick, &opts, tol).map_err(curved_error)
+                } else {
+                    tessellate_cylinder_panel(&panel, &opts, tol).map_err(curved_error)
+                }
+            }
+            CurvedPanelInput::Sphere {
+                center,
+                radius,
+                pole,
+                theta_min,
+                theta_max,
+                phi_min,
+                phi_max,
+                holes,
+                thickness,
+            } => {
+                let pole = pole
+                    .vec()
+                    .try_unit()
+                    .ok_or_else(|| JsError::new("sphere pole must be a finite non-zero vector"))?;
+                let panel = SpherePanel::new(
+                    SpherePanelSpec {
+                        center: center.point(),
+                        radius: *radius,
+                        pole,
+                        theta_min: *theta_min,
+                        theta_max: *theta_max,
+                        phi_min: *phi_min,
+                        phi_max: *phi_max,
+                    },
+                    trim_loops(holes, tol)?,
+                    tol,
+                )
+                .map_err(curved_error)?;
+                let opts = SpherePanelOptions::with_chord_tolerance(chord_tolerance);
+                if let Some(thickness) = thickness {
+                    let thick = ThickSpherePanel::new(panel, *thickness).map_err(curved_error)?;
+                    tessellate_thick_sphere_panel(&thick, &opts, tol).map_err(curved_error)
+                } else {
+                    tessellate_sphere_panel(&panel, &opts, tol).map_err(curved_error)
+                }
+            }
+            CurvedPanelInput::Cone {
+                apex,
+                axis,
+                half_angle,
+                theta_min,
+                theta_max,
+                height_min,
+                height_max,
+                holes,
+                thickness,
+            } => {
+                if thickness.is_some() {
+                    return Err(JsError::new("thick cone panels are not supported yet"));
+                }
+                let axis = axis
+                    .vec()
+                    .try_unit()
+                    .ok_or_else(|| JsError::new("cone axis must be a finite non-zero vector"))?;
+                let panel = ConePanel::new(
+                    ConePanelSpec {
+                        apex: apex.point(),
+                        axis,
+                        half_angle: *half_angle,
+                        theta_min: *theta_min,
+                        theta_max: *theta_max,
+                        height_min: *height_min,
+                        height_max: *height_max,
+                    },
+                    trim_loops(holes, tol)?,
+                    tol,
+                )
+                .map_err(curved_error)?;
+                tessellate_cone_panel(
+                    &panel,
+                    &ConePanelOptions::with_chord_tolerance(chord_tolerance),
+                    tol,
+                )
+                .map_err(curved_error)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+struct Point3Input {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+impl Point3Input {
+    fn point(self) -> Point3 {
+        Point3::new(self.x, self.y, self.z)
+    }
+
+    fn vec(self) -> Vec3 {
+        Vec3::new(self.x, self.y, self.z)
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TrimLoopInput {
+    Rectangle {
+        u_min: f64,
+        u_max: f64,
+        v_min: f64,
+        v_max: f64,
+        #[serde(default)]
+        reverse: bool,
+    },
+    Circle {
+        center: [f64; 2],
+        radius: f64,
+        #[serde(default)]
+        reverse: bool,
+    },
+    Polygon {
+        points: Vec<[f64; 2]>,
+        #[serde(default)]
+        reverse: bool,
+    },
+}
+
+fn trim_loops(inputs: &[TrimLoopInput], tol: &Tol) -> Result<Vec<TrimLoop2d>, JsError> {
+    inputs.iter().map(|input| trim_loop(input, tol)).collect()
+}
+
+fn trim_loop(input: &TrimLoopInput, tol: &Tol) -> Result<TrimLoop2d, JsError> {
+    let (loop_, reverse) = match input {
+        TrimLoopInput::Rectangle {
+            u_min,
+            u_max,
+            v_min,
+            v_max,
+            reverse,
+        } => (
+            TrimLoop2d::rectangle(*u_min, *u_max, *v_min, *v_max, tol).map_err(curved_error)?,
+            *reverse,
+        ),
+        TrimLoopInput::Circle {
+            center,
+            radius,
+            reverse,
+        } => (
+            TrimLoop2d::circle(*center, *radius, tol).map_err(curved_error)?,
+            *reverse,
+        ),
+        TrimLoopInput::Polygon { points, reverse } => (
+            TrimLoop2d::from_points(points, tol).map_err(curved_error)?,
+            *reverse,
+        ),
+    };
+    Ok(if reverse { loop_.reversed() } else { loop_ })
+}
+
+fn curved_error(e: archi_kernel::curved::CurvedError) -> JsError {
+    JsError::new(&format!("curved panel: {e}"))
 }
 
 /// Flatten a kernel [`SectionResult`] into world-space display polylines.
