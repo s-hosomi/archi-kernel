@@ -6,6 +6,7 @@
 //! General surface-surface boolean evaluation remains out of scope.
 
 mod cylinder_panel;
+mod domain;
 mod error;
 mod mesh;
 mod trim;

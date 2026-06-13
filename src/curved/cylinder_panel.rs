@@ -1,13 +1,12 @@
 //! Cylindrical panels with UV-space holes.
 
-use std::f64::consts::{PI, TAU};
+use std::f64::consts::TAU;
 
-use crate::boolean::poly2d::geom::{Arc, Edge2, Point2};
-use crate::boolean::poly2d::intersect::intersect;
 use crate::math::{Point3, Vec3};
 use crate::primitives::{plane_basis, Cylinder};
 use crate::tolerance::Tol;
 
+use super::domain::{angular_step, parameter_values, validate_holes_in_rect, validate_range};
 use super::mesh::SurfaceMeshBuilder;
 use super::{CurvedError, SurfaceMesh, TrimLoop2d};
 
@@ -86,25 +85,18 @@ impl CylinderPanel {
     }
 
     fn validate_holes(&self, tol: &Tol) -> Result<(), CurvedError> {
+        validate_holes_in_rect(
+            &self.holes,
+            self.theta_min,
+            self.theta_max,
+            self.z_min,
+            self.z_max,
+            tol,
+        )?;
         for hole in &self.holes {
-            hole.validate(tol)?;
             let (min, max) = hole.bounds();
-            if min[0] < self.theta_min - tol.length
-                || max[0] > self.theta_max + tol.length
-                || min[1] < self.z_min - tol.length
-                || max[1] > self.z_max + tol.length
-            {
-                return Err(CurvedError::HoleOutsidePanel);
-            }
             if min[0] <= self.theta_min + tol.length && max[0] >= self.theta_max - tol.length {
                 return Err(CurvedError::SeamCrossing);
-            }
-        }
-        for i in 0..self.holes.len() {
-            for j in (i + 1)..self.holes.len() {
-                if loops_overlap(&self.holes[i], &self.holes[j], tol) {
-                    return Err(CurvedError::HoleOverlap);
-                }
             }
         }
         Ok(())
@@ -328,44 +320,6 @@ pub fn tessellate_thick_cylinder_panel(
     Ok(builder.finish())
 }
 
-fn validate_range(name: &'static str, min: f64, max: f64) -> Result<(), CurvedError> {
-    if !min.is_finite() || !max.is_finite() || max <= min {
-        return Err(CurvedError::InvalidRange { name, min, max });
-    }
-    Ok(())
-}
-
-fn angular_step(radius: f64, chord_tol: f64) -> f64 {
-    if chord_tol >= radius {
-        PI / 8.0
-    } else {
-        (2.0_f64 * (1.0_f64 - chord_tol / radius).acos()).clamp(PI / 180.0, PI / 8.0)
-    }
-}
-
-fn parameter_values(
-    min: f64,
-    max: f64,
-    step: f64,
-    extra: impl IntoIterator<Item = f64>,
-    tol: &Tol,
-) -> Vec<f64> {
-    let span = max - min;
-    let n = ((span / step).ceil() as usize).max(1);
-    let mut values = Vec::with_capacity(n + 1);
-    for i in 0..=n {
-        values.push(min + span * (i as f64) / (n as f64));
-    }
-    for v in extra {
-        if v > min + tol.length && v < max - tol.length && v.is_finite() {
-            values.push(v);
-        }
-    }
-    values.sort_by(|a, b| a.total_cmp(b));
-    values.dedup_by(|a, b| (*a - *b).abs() <= tol.length);
-    values
-}
-
 fn emit_outer_cell(
     b: &mut SurfaceMeshBuilder,
     panel: &CylinderPanel,
@@ -443,57 +397,6 @@ fn emit_z_side(
     } else {
         b.triangle(a, c, bb);
         b.triangle(a, d, c);
-    }
-}
-
-fn loops_overlap(a: &TrimLoop2d, b: &TrimLoop2d, tol: &Tol) -> bool {
-    if !bounds_overlap(a, b, tol) {
-        return false;
-    }
-    for ea in &a.edges {
-        let edge_a = edge2(*ea);
-        for eb in &b.edges {
-            let edge_b = edge2(*eb);
-            let Ok(crossings) = intersect(&edge_a, &edge_b, tol) else {
-                // Tangent arc degeneracies mean the holes touch; reject that as
-                // overlap rather than accepting an ambiguous zero-width gap.
-                return true;
-            };
-            if !crossings.points.is_empty() {
-                return true;
-            }
-        }
-    }
-    let pa = a.vertices()[0];
-    let pb = b.vertices()[0];
-    a.contains_point(pb, tol) || b.contains_point(pa, tol)
-}
-
-fn bounds_overlap(a: &TrimLoop2d, b: &TrimLoop2d, tol: &Tol) -> bool {
-    let (amin, amax) = a.bounds();
-    let (bmin, bmax) = b.bounds();
-    amin[0] <= bmax[0] + tol.length
-        && amax[0] + tol.length >= bmin[0]
-        && amin[1] <= bmax[1] + tol.length
-        && amax[1] + tol.length >= bmin[1]
-}
-
-fn edge2(edge: super::TrimEdge2d) -> Edge2 {
-    match edge {
-        super::TrimEdge2d::Line { start, end } => {
-            Edge2::seg(Point2::new(start[0], start[1]), Point2::new(end[0], end[1]))
-        }
-        super::TrimEdge2d::Arc {
-            center,
-            radius,
-            start_angle,
-            end_angle,
-        } => Edge2::Arc(Arc::new(
-            Point2::new(center[0], center[1]),
-            radius,
-            start_angle,
-            end_angle - start_angle,
-        )),
     }
 }
 
