@@ -27,3 +27,21 @@ jobs:
         run: cargo check --no-default-features
       - name: Topology isolation check
         run: "! grep -rE 'crate::(math|primitives)' src/topo/"
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Wasm clippy
+        run: cargo clippy --manifest-path wasm/Cargo.toml --all-targets -- -D warnings
+      - name: Wasm tests
+        run: cargo test --manifest-path wasm/Cargo.toml
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build wasm package
+        run: wasm-pack build wasm --target web --out-dir ../viewer/pkg --release
