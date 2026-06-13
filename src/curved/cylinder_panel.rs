@@ -155,20 +155,24 @@ pub fn tessellate_cylinder_panel(
         panel.theta_min,
         panel.theta_max,
         angular_step(panel.cylinder.radius(), opts.chord_tolerance),
-        panel
-            .holes
-            .iter()
-            .flat_map(|h| h.vertices().into_iter().map(|p| p[0]).collect::<Vec<f64>>()),
+        panel.holes.iter().flat_map(|h| {
+            h.sample_points(opts.chord_tolerance)
+                .into_iter()
+                .map(|p| p[0])
+                .collect::<Vec<f64>>()
+        }),
         tol,
     );
     let z_values = parameter_values(
         panel.z_min,
         panel.z_max,
         opts.chord_tolerance.max(tol.length),
-        panel
-            .holes
-            .iter()
-            .flat_map(|h| h.vertices().into_iter().map(|p| p[1]).collect::<Vec<f64>>()),
+        panel.holes.iter().flat_map(|h| {
+            h.sample_points(opts.chord_tolerance)
+                .into_iter()
+                .map(|p| p[1])
+                .collect::<Vec<f64>>()
+        }),
         tol,
     );
 

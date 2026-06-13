@@ -1,6 +1,5 @@
 use archi_kernel::curved::{
-    tessellate_cylinder_panel, CurvedError, CylinderPanel, CylinderPanelOptions, TrimEdge2d,
-    TrimLoop2d,
+    tessellate_cylinder_panel, CurvedError, CylinderPanel, CylinderPanelOptions, TrimLoop2d,
 };
 use archi_kernel::{Cylinder, Line3, Point3, Tol, Vec3};
 
@@ -93,19 +92,33 @@ fn hole_outside_panel_is_rejected() {
 }
 
 #[test]
-fn arc_trim_is_explicitly_unsupported_in_c1() {
+fn circular_uv_hole_removes_panel_area() {
     let tol = Tol::default();
-    let err = TrimLoop2d::new(
-        vec![TrimEdge2d::Arc {
-            center: [0.5_f64, 0.5_f64],
-            radius: 0.1_f64,
-            start_angle: 0.0_f64,
-            end_angle: std::f64::consts::TAU,
-        }],
+    let hole = TrimLoop2d::circle([0.7_f64, 1.5_f64], 0.2_f64, &tol).expect("circle");
+    let panel = CylinderPanel::new(
+        cylinder(),
+        0.0_f64,
+        1.4_f64,
+        0.0_f64,
+        3.0_f64,
+        vec![hole],
         &tol,
     )
-    .expect_err("arc trim");
-    assert!(matches!(err, CurvedError::UnsupportedArcTrim));
+    .expect("panel");
+    let mesh = tessellate_cylinder_panel(
+        &panel,
+        &CylinderPanelOptions::with_chord_tolerance(1e-3_f64),
+        &tol,
+    )
+    .expect("mesh");
+
+    let exact = 2.0_f64 * (1.4_f64 * 3.0_f64 - std::f64::consts::PI * 0.2_f64 * 0.2_f64);
+    assert!((panel.surface_area() - exact).abs() <= 1e-12_f64);
+    assert!(
+        (mesh.surface_area() - exact).abs() <= 4e-2_f64,
+        "mesh area {} vs exact {exact}",
+        mesh.surface_area()
+    );
 }
 
 #[test]

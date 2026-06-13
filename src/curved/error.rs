@@ -23,6 +23,8 @@ pub enum CurvedError {
     },
     /// A trim loop has no edges.
     EmptyLoop,
+    /// A trim edge has invalid parameters.
+    InvalidTrimEdge,
     /// Consecutive trim edges do not connect within tolerance.
     OpenLoop,
     /// The trim loop's signed area is too small to define a stable region.
@@ -30,7 +32,8 @@ pub enum CurvedError {
         /// Signed UV-space area.
         area: f64,
     },
-    /// Arc trim edges are represented but not tessellated in the current phase.
+    /// Arc trim edges are represented but not supported by the requested
+    /// operation.
     UnsupportedArcTrim,
     /// A hole is not fully contained in the panel's outer UV rectangle.
     HoleOutsidePanel,
@@ -54,6 +57,7 @@ impl fmt::Display for CurvedError {
                 write!(f, "chord tolerance must be strictly positive, got {value}")
             }
             CurvedError::EmptyLoop => write!(f, "trim loop must contain at least one edge"),
+            CurvedError::InvalidTrimEdge => write!(f, "trim edge has invalid parameters"),
             CurvedError::OpenLoop => write!(f, "trim loop edges must form a closed chain"),
             CurvedError::DegenerateLoop { area } => {
                 write!(f, "trim loop area is degenerate: {area}")

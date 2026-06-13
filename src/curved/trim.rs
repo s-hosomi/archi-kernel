@@ -1,5 +1,7 @@
 //! UV-space trim loops for curved panels.
 
+use std::f64::consts::TAU;
+
 use crate::boolean::poly2d::geom::Point2;
 use crate::tolerance::Tol;
 
@@ -78,9 +80,56 @@ impl TrimEdge2d {
         }
     }
 
-    #[inline]
-    pub(crate) fn has_arc(self) -> bool {
-        matches!(self, TrimEdge2d::Arc { .. })
+    pub(crate) fn validate(self) -> Result<(), CurvedError> {
+        match self {
+            TrimEdge2d::Line { start, end } => {
+                if finite_point(start) && finite_point(end) {
+                    Ok(())
+                } else {
+                    Err(CurvedError::InvalidTrimEdge)
+                }
+            }
+            TrimEdge2d::Arc {
+                center,
+                radius,
+                start_angle,
+                end_angle,
+            } => {
+                if finite_point(center)
+                    && radius.is_finite()
+                    && radius > 0.0
+                    && start_angle.is_finite()
+                    && end_angle.is_finite()
+                    && (end_angle - start_angle).abs() > 0.0
+                {
+                    Ok(())
+                } else {
+                    Err(CurvedError::InvalidTrimEdge)
+                }
+            }
+        }
+    }
+
+    fn sample_points(self, chord_tolerance: f64) -> Vec<[f64; 2]> {
+        match self {
+            TrimEdge2d::Line { start, .. } => vec![start],
+            TrimEdge2d::Arc {
+                center,
+                radius,
+                start_angle,
+                end_angle,
+            } => {
+                let sweep = end_angle - start_angle;
+                let n = arc_segment_count(radius, sweep.abs(), chord_tolerance).max(1);
+                (0..n)
+                    .map(|i| {
+                        let t = (i as f64) / (n as f64);
+                        let a = start_angle + sweep * t;
+                        [center[0] + radius * a.cos(), center[1] + radius * a.sin()]
+                    })
+                    .collect()
+            }
+        }
     }
 }
 
@@ -133,6 +182,19 @@ impl TrimLoop2d {
         )
     }
 
+    /// Construct a circular trim loop in UV space.
+    pub fn circle(center: [f64; 2], radius: f64, tol: &Tol) -> Result<Self, CurvedError> {
+        Self::new(
+            vec![TrimEdge2d::Arc {
+                center,
+                radius,
+                start_angle: 0.0,
+                end_angle: TAU,
+            }],
+            tol,
+        )
+    }
+
     /// Construct a straight-edged loop from vertices.
     ///
     /// The closing vertex must be omitted; the loop closes implicitly.
@@ -161,7 +223,20 @@ impl TrimLoop2d {
             let b = edge.end();
             acc += a[0] * b[1] - b[0] * a[1];
         }
-        0.5 * acc
+        let mut area = 0.5 * acc;
+        for edge in &self.edges {
+            if let TrimEdge2d::Arc {
+                radius,
+                start_angle,
+                end_angle,
+                ..
+            } = *edge
+            {
+                let sweep = end_angle - start_angle;
+                area += 0.5 * radius * radius * (sweep - sweep.sin());
+            }
+        }
+        area
     }
 
     /// Absolute UV-space area.
@@ -200,9 +275,7 @@ impl TrimLoop2d {
             return Err(CurvedError::EmptyLoop);
         }
         for edge in &self.edges {
-            if edge.has_arc() {
-                return Err(CurvedError::UnsupportedArcTrim);
-            }
+            edge.validate()?;
         }
         for i in 0..self.edges.len() {
             let a = self.edges[i].end();
@@ -222,19 +295,35 @@ impl TrimLoop2d {
         let q = Point2::new(p[0], p[1]);
         let mut inside = false;
         for edge in &self.edges {
-            let TrimEdge2d::Line { start, end } = *edge else {
-                continue;
-            };
-            let a = Point2::new(start[0], start[1]);
-            let b = Point2::new(end[0], end[1]);
-            if point_on_segment(q, a, b, tol) {
-                return true;
-            }
-            let crosses = (a.y > q.y) != (b.y > q.y);
-            if crosses {
-                let x = a.x + (q.y - a.y) * (b.x - a.x) / (b.y - a.y);
-                if x >= q.x - tol.length {
-                    inside = !inside;
+            match *edge {
+                TrimEdge2d::Line { start, end } => {
+                    let a = Point2::new(start[0], start[1]);
+                    let b = Point2::new(end[0], end[1]);
+                    if point_on_segment(q, a, b, tol) {
+                        return true;
+                    }
+                    let crosses = (a.y > q.y) != (b.y > q.y);
+                    if crosses {
+                        let x = a.x + (q.y - a.y) * (b.x - a.x) / (b.y - a.y);
+                        if x >= q.x - tol.length {
+                            inside = !inside;
+                        }
+                    }
+                }
+                TrimEdge2d::Arc {
+                    center,
+                    radius,
+                    start_angle,
+                    end_angle,
+                } => {
+                    if point_on_arc(q, center, radius, start_angle, end_angle, tol) {
+                        return true;
+                    }
+                    for x in ray_arc_crossings(q, center, radius, start_angle, end_angle, tol) {
+                        if x >= q.x - tol.length {
+                            inside = !inside;
+                        }
+                    }
                 }
             }
         }
@@ -244,13 +333,40 @@ impl TrimLoop2d {
     pub(crate) fn bounds(&self) -> ([f64; 2], [f64; 2]) {
         let mut min = [f64::INFINITY, f64::INFINITY];
         let mut max = [f64::NEG_INFINITY, f64::NEG_INFINITY];
-        for p in self.vertices() {
+        for p in self.bound_points() {
             min[0] = min[0].min(p[0]);
             min[1] = min[1].min(p[1]);
             max[0] = max[0].max(p[0]);
             max[1] = max[1].max(p[1]);
         }
         (min, max)
+    }
+
+    pub(crate) fn sample_points(&self, chord_tolerance: f64) -> Vec<[f64; 2]> {
+        self.edges
+            .iter()
+            .flat_map(|e| e.sample_points(chord_tolerance))
+            .collect()
+    }
+
+    fn bound_points(&self) -> Vec<[f64; 2]> {
+        let mut points = self.vertices();
+        for edge in &self.edges {
+            if let TrimEdge2d::Arc {
+                center,
+                radius,
+                start_angle,
+                end_angle,
+            } = *edge
+            {
+                for a in [0.0_f64, TAU / 4.0, TAU / 2.0, 3.0 * TAU / 4.0] {
+                    if angle_on_sweep(a, start_angle, end_angle, 0.0) {
+                        points.push([center[0] + radius * a.cos(), center[1] + radius * a.sin()]);
+                    }
+                }
+            }
+        }
+        points
     }
 }
 
@@ -269,4 +385,68 @@ fn point_on_segment(p: Point2, a: Point2, b: Point2, tol: &Tol) -> bool {
     }
     let dot = ap.dot(ab);
     dot >= -tol.length && dot <= ab.len_sq() + tol.length
+}
+
+fn finite_point(p: [f64; 2]) -> bool {
+    p[0].is_finite() && p[1].is_finite()
+}
+
+fn point_on_arc(
+    p: Point2,
+    center: [f64; 2],
+    radius: f64,
+    start_angle: f64,
+    end_angle: f64,
+    tol: &Tol,
+) -> bool {
+    let dx = p.x - center[0];
+    let dy = p.y - center[1];
+    let d = (dx * dx + dy * dy).sqrt();
+    if (d - radius).abs() > tol.length {
+        return false;
+    }
+    let angle = dy.atan2(dx);
+    angle_on_sweep(angle, start_angle, end_angle, tol.length / radius)
+}
+
+fn ray_arc_crossings(
+    p: Point2,
+    center: [f64; 2],
+    radius: f64,
+    start_angle: f64,
+    end_angle: f64,
+    tol: &Tol,
+) -> Vec<f64> {
+    let dy = p.y - center[1];
+    if dy.abs() >= radius - tol.length {
+        return Vec::new();
+    }
+    let dx = (radius * radius - dy * dy).sqrt();
+    let mut xs = Vec::new();
+    for x in [center[0] - dx, center[0] + dx] {
+        let angle = (p.y - center[1]).atan2(x - center[0]);
+        if angle_on_sweep(angle, start_angle, end_angle, tol.length / radius) {
+            xs.push(x);
+        }
+    }
+    xs
+}
+
+fn angle_on_sweep(angle: f64, start: f64, end: f64, slack: f64) -> bool {
+    let sweep = end - start;
+    if sweep >= 0.0 {
+        let off = (angle - start).rem_euclid(TAU);
+        off <= sweep.abs() + slack || (sweep.abs() >= TAU - slack && off <= TAU)
+    } else {
+        let off = (start - angle).rem_euclid(TAU);
+        off <= sweep.abs() + slack || (sweep.abs() >= TAU - slack && off <= TAU)
+    }
+}
+
+fn arc_segment_count(radius: f64, sweep: f64, chord_tolerance: f64) -> usize {
+    if chord_tolerance <= 0.0 || chord_tolerance >= radius {
+        return ((sweep / (TAU / 32.0)).ceil() as usize).max(8);
+    }
+    let step = 2.0_f64 * (1.0_f64 - chord_tolerance / radius).acos();
+    ((sweep / step).ceil() as usize).max(8)
 }
