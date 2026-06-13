@@ -21,6 +21,16 @@ pub enum CurvedError {
         /// The offending value.
         value: f64,
     },
+    /// A panel thickness was not strictly positive and finite.
+    NonPositiveThickness {
+        /// The offending value.
+        value: f64,
+    },
+    /// The inner offset radius of a thick cylindrical panel is not positive.
+    NonPositiveInnerRadius {
+        /// The computed inner radius.
+        radius: f64,
+    },
     /// A trim loop has no edges.
     EmptyLoop,
     /// A trim edge has invalid parameters.
@@ -55,6 +65,12 @@ impl fmt::Display for CurvedError {
             }
             CurvedError::NonPositiveChordTolerance { value } => {
                 write!(f, "chord tolerance must be strictly positive, got {value}")
+            }
+            CurvedError::NonPositiveThickness { value } => {
+                write!(f, "panel thickness must be strictly positive, got {value}")
+            }
+            CurvedError::NonPositiveInnerRadius { radius } => {
+                write!(f, "inner cylinder radius must stay positive, got {radius}")
             }
             CurvedError::EmptyLoop => write!(f, "trim loop must contain at least one edge"),
             CurvedError::InvalidTrimEdge => write!(f, "trim edge has invalid parameters"),

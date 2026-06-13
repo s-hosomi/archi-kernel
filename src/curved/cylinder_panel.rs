@@ -74,12 +74,14 @@ impl CylinderPanel {
 
     /// Map `(theta, z)` to a world-space point on the cylinder.
     pub fn point_at(&self, theta: f64, z: f64) -> Point3 {
+        self.point_at_radius(self.cylinder.radius(), theta, z)
+    }
+
+    fn point_at_radius(&self, radius: f64, theta: f64, z: f64) -> Point3 {
         let axis = self.cylinder.axis();
         let origin = axis.point_at(z);
         let (u, v) = plane_basis(axis.dir());
-        origin
-            + u * (self.cylinder.radius() * theta.cos())
-            + v * (self.cylinder.radius() * theta.sin())
+        origin + u * (radius * theta.cos()) + v * (radius * theta.sin())
     }
 
     fn validate_holes(&self, tol: &Tol) -> Result<(), CurvedError> {
@@ -110,6 +112,44 @@ impl CylinderPanel {
     fn material_contains(&self, theta: f64, z: f64, tol: &Tol) -> bool {
         let p = [theta, z];
         !self.holes.iter().any(|h| h.contains_point(p, tol))
+    }
+}
+
+/// A cylindrical panel with finite radial thickness.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ThickCylinderPanel {
+    /// The mid-surface panel that defines the UV domain and holes.
+    pub mid: CylinderPanel,
+    /// Radial thickness in metres, centred on [`mid`](Self::mid).
+    pub thickness: f64,
+}
+
+impl ThickCylinderPanel {
+    /// Construct a thick cylindrical panel by offsetting the mid-surface radius
+    /// by `± thickness / 2`.
+    pub fn new(mid: CylinderPanel, thickness: f64) -> Result<Self, CurvedError> {
+        if thickness <= 0.0 || !thickness.is_finite() {
+            return Err(CurvedError::NonPositiveThickness { value: thickness });
+        }
+        let inner = mid.cylinder.radius() - 0.5 * thickness;
+        if inner <= 0.0 {
+            return Err(CurvedError::NonPositiveInnerRadius { radius: inner });
+        }
+        Ok(Self { mid, thickness })
+    }
+
+    /// Exact volume represented by the thick panel.
+    pub fn volume(&self) -> f64 {
+        self.mid.cylinder.radius() * self.thickness * self.mid.uv_area()
+    }
+
+    fn inner_radius(&self) -> f64 {
+        self.mid.cylinder.radius() - 0.5 * self.thickness
+    }
+
+    fn outer_radius(&self) -> f64 {
+        self.mid.cylinder.radius() + 0.5 * self.thickness
     }
 }
 
@@ -203,6 +243,87 @@ pub fn tessellate_cylinder_panel(
     Ok(builder.finish())
 }
 
+/// Tessellate a thick cylindrical panel into a closed display mesh.
+pub fn tessellate_thick_cylinder_panel(
+    panel: &ThickCylinderPanel,
+    opts: &CylinderPanelOptions,
+    tol: &Tol,
+) -> Result<SurfaceMesh, CurvedError> {
+    if opts.chord_tolerance <= 0.0 || !opts.chord_tolerance.is_finite() {
+        return Err(CurvedError::NonPositiveChordTolerance {
+            value: opts.chord_tolerance,
+        });
+    }
+
+    let mid = &panel.mid;
+    let theta_values = parameter_values(
+        mid.theta_min,
+        mid.theta_max,
+        angular_step(mid.cylinder.radius(), opts.chord_tolerance),
+        mid.holes.iter().flat_map(|h| {
+            h.sample_points(opts.chord_tolerance)
+                .into_iter()
+                .map(|p| p[0])
+                .collect::<Vec<f64>>()
+        }),
+        tol,
+    );
+    let z_values = parameter_values(
+        mid.z_min,
+        mid.z_max,
+        opts.chord_tolerance.max(tol.length),
+        mid.holes.iter().flat_map(|h| {
+            h.sample_points(opts.chord_tolerance)
+                .into_iter()
+                .map(|p| p[1])
+                .collect::<Vec<f64>>()
+        }),
+        tol,
+    );
+    let nt = theta_values.len() - 1;
+    let nz = z_values.len() - 1;
+    let mut material = vec![vec![false; nz]; nt];
+    for i in 0..nt {
+        for j in 0..nz {
+            let theta_mid = 0.5 * (theta_values[i] + theta_values[i + 1]);
+            let z_mid = 0.5 * (z_values[j] + z_values[j + 1]);
+            material[i][j] = mid.material_contains(theta_mid, z_mid, tol);
+        }
+    }
+
+    let mut builder = SurfaceMeshBuilder::default();
+    let ri = panel.inner_radius();
+    let ro = panel.outer_radius();
+    for i in 0..nt {
+        for j in 0..nz {
+            if !material[i][j] {
+                continue;
+            }
+            let t0 = theta_values[i];
+            let t1 = theta_values[i + 1];
+            let z0 = z_values[j];
+            let z1 = z_values[j + 1];
+            emit_outer_cell(&mut builder, mid, ro, t0, t1, z0, z1);
+            emit_inner_cell(&mut builder, mid, ri, t0, t1, z0, z1);
+
+            if i == 0 || !material[i - 1][j] {
+                emit_radial_side(&mut builder, mid, [ri, ro], t0, [z0, z1], false);
+            }
+            if i + 1 == nt || !material[i + 1][j] {
+                emit_radial_side(&mut builder, mid, [ri, ro], t1, [z0, z1], true);
+            }
+            if j == 0 || !material[i][j - 1] {
+                emit_z_side(&mut builder, mid, [ri, ro], [t0, t1], z0, false);
+            }
+            if j + 1 == nz || !material[i][j + 1] {
+                emit_z_side(&mut builder, mid, [ri, ro], [t0, t1], z1, true);
+            }
+        }
+    }
+
+    Ok(builder.finish())
+}
+
 fn validate_range(name: &'static str, min: f64, max: f64) -> Result<(), CurvedError> {
     if !min.is_finite() || !max.is_finite() || max <= min {
         return Err(CurvedError::InvalidRange { name, min, max });
@@ -239,6 +360,86 @@ fn parameter_values(
     values.sort_by(|a, b| a.total_cmp(b));
     values.dedup_by(|a, b| (*a - *b).abs() <= tol.length);
     values
+}
+
+fn emit_outer_cell(
+    b: &mut SurfaceMeshBuilder,
+    panel: &CylinderPanel,
+    radius: f64,
+    t0: f64,
+    t1: f64,
+    z0: f64,
+    z1: f64,
+) {
+    let a = b.vertex(panel.point_at_radius(radius, t0, z0));
+    let bb = b.vertex(panel.point_at_radius(radius, t1, z0));
+    let c = b.vertex(panel.point_at_radius(radius, t1, z1));
+    let d = b.vertex(panel.point_at_radius(radius, t0, z1));
+    b.triangle(a, bb, c);
+    b.triangle(a, c, d);
+}
+
+fn emit_inner_cell(
+    b: &mut SurfaceMeshBuilder,
+    panel: &CylinderPanel,
+    radius: f64,
+    t0: f64,
+    t1: f64,
+    z0: f64,
+    z1: f64,
+) {
+    let a = b.vertex(panel.point_at_radius(radius, t0, z0));
+    let bb = b.vertex(panel.point_at_radius(radius, t1, z0));
+    let c = b.vertex(panel.point_at_radius(radius, t1, z1));
+    let d = b.vertex(panel.point_at_radius(radius, t0, z1));
+    b.triangle(a, c, bb);
+    b.triangle(a, d, c);
+}
+
+fn emit_radial_side(
+    b: &mut SurfaceMeshBuilder,
+    panel: &CylinderPanel,
+    radii: [f64; 2],
+    theta: f64,
+    z: [f64; 2],
+    theta_max_side: bool,
+) {
+    let [ri, ro] = radii;
+    let [z0, z1] = z;
+    let a = b.vertex(panel.point_at_radius(ri, theta, z0));
+    let bb = b.vertex(panel.point_at_radius(ro, theta, z0));
+    let c = b.vertex(panel.point_at_radius(ro, theta, z1));
+    let d = b.vertex(panel.point_at_radius(ri, theta, z1));
+    if theta_max_side {
+        b.triangle(a, bb, c);
+        b.triangle(a, c, d);
+    } else {
+        b.triangle(a, c, bb);
+        b.triangle(a, d, c);
+    }
+}
+
+fn emit_z_side(
+    b: &mut SurfaceMeshBuilder,
+    panel: &CylinderPanel,
+    radii: [f64; 2],
+    theta: [f64; 2],
+    z: f64,
+    z_max_side: bool,
+) {
+    let [ri, ro] = radii;
+    let [t0, t1] = theta;
+    let a = b.vertex(panel.point_at_radius(ri, t0, z));
+    let bb = b.vertex(panel.point_at_radius(ro, t0, z));
+    let c = b.vertex(panel.point_at_radius(ro, t1, z));
+    let d = b.vertex(panel.point_at_radius(ri, t1, z));
+    if z_max_side {
+        b.triangle(a, bb, c);
+        b.triangle(a, c, d);
+    } else {
+        b.triangle(a, c, bb);
+        b.triangle(a, d, c);
+    }
 }
 
 fn loops_overlap(a: &TrimLoop2d, b: &TrimLoop2d, tol: &Tol) -> bool {

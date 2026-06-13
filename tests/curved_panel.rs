@@ -1,7 +1,9 @@
 use archi_kernel::curved::{
-    tessellate_cylinder_panel, CurvedError, CylinderPanel, CylinderPanelOptions, TrimLoop2d,
+    tessellate_cylinder_panel, tessellate_thick_cylinder_panel, CurvedError, CylinderPanel,
+    CylinderPanelOptions, SurfaceMesh, ThickCylinderPanel, TrimLoop2d,
 };
 use archi_kernel::{Cylinder, Line3, Point3, Tol, Vec3};
+use std::collections::HashMap;
 
 fn cylinder() -> Cylinder {
     Cylinder::new(
@@ -137,4 +139,85 @@ fn overlapping_holes_are_rejected() {
     )
     .expect_err("overlap");
     assert!(matches!(err, CurvedError::HoleOverlap));
+}
+
+#[test]
+fn thick_cylinder_panel_without_holes_is_closed_and_has_volume() {
+    let tol = Tol::default();
+    let mid = CylinderPanel::new(
+        cylinder(),
+        0.0_f64,
+        1.0_f64,
+        0.0_f64,
+        3.0_f64,
+        Vec::new(),
+        &tol,
+    )
+    .expect("mid");
+    let panel = ThickCylinderPanel::new(mid, 0.2_f64).expect("thick");
+    let mesh = tessellate_thick_cylinder_panel(
+        &panel,
+        &CylinderPanelOptions::with_chord_tolerance(5e-4_f64),
+        &tol,
+    )
+    .expect("mesh");
+
+    assert_mesh_edges_closed(&mesh);
+    assert!(
+        (mesh.signed_volume().abs() - panel.volume()).abs() <= 3e-3_f64,
+        "mesh volume {} vs exact {}",
+        mesh.signed_volume(),
+        panel.volume()
+    );
+}
+
+#[test]
+fn thick_cylinder_panel_with_rectangular_hole_is_closed() {
+    let tol = Tol::default();
+    let hole = TrimLoop2d::rectangle(0.4_f64, 0.8_f64, 1.0_f64, 2.0_f64, &tol)
+        .expect("hole")
+        .reversed();
+    let mid = CylinderPanel::new(
+        cylinder(),
+        0.0_f64,
+        1.2_f64,
+        0.0_f64,
+        3.0_f64,
+        vec![hole],
+        &tol,
+    )
+    .expect("mid");
+    let panel = ThickCylinderPanel::new(mid, 0.2_f64).expect("thick");
+    let mesh = tessellate_thick_cylinder_panel(
+        &panel,
+        &CylinderPanelOptions::with_chord_tolerance(5e-4_f64),
+        &tol,
+    )
+    .expect("mesh");
+
+    assert_mesh_edges_closed(&mesh);
+    assert!(
+        (mesh.signed_volume().abs() - panel.volume()).abs() <= 5e-3_f64,
+        "mesh volume {} vs exact {}",
+        mesh.signed_volume(),
+        panel.volume()
+    );
+}
+
+fn assert_mesh_edges_closed(mesh: &SurfaceMesh) {
+    let mut counts: HashMap<(u32, u32), usize> = HashMap::new();
+    for tri in mesh.indices.chunks_exact(3) {
+        for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+            let key = if a <= b { (a, b) } else { (b, a) };
+            *counts.entry(key).or_default() += 1;
+        }
+    }
+    assert!(
+        counts.values().all(|&n| n == 2),
+        "non-closed edges: {:?}",
+        counts
+            .iter()
+            .filter_map(|(k, &n)| (n != 2).then_some((*k, n)))
+            .collect::<Vec<_>>()
+    );
 }

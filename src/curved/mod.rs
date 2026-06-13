@@ -10,7 +10,10 @@ mod error;
 mod mesh;
 mod trim;
 
-pub use cylinder_panel::{tessellate_cylinder_panel, CylinderPanel, CylinderPanelOptions};
+pub use cylinder_panel::{
+    tessellate_cylinder_panel, tessellate_thick_cylinder_panel, CylinderPanel,
+    CylinderPanelOptions, ThickCylinderPanel,
+};
 pub use error::CurvedError;
 pub use mesh::SurfaceMesh;
 pub use trim::{TrimEdge2d, TrimLoop2d};
