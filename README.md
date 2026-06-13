@@ -9,7 +9,7 @@
 A domain-specific B-rep geometry kernel for building simulation, written in Rust with zero runtime dependencies (one exception: Shewchuk's exact predicates via the `robust` crate, isolated behind a single predicate facade). Runs natively and in the browser via WebAssembly.
 
 <p align="center">
-  <img src="assets/hero.png?v=3" alt="A three-storey RC office block — set-back roof terrace with a steel pergola, round-column colonnade, window-grid facades, core walls — modelled as kernel CSG and rendered in the Three.js viewer" width="850">
+  <img src="assets/hero.png?v=4" alt="A three-storey RC office block with a thick barrel-vault roof with skylight openings, a spherical terrace dome, and a conical entry canopy; CSG solids and analytic curved panels are rendered in the Three.js viewer" width="850">
 </p>
 
 <p align="center">
@@ -17,10 +17,10 @@ A domain-specific B-rep geometry kernel for building simulation, written in Rust
 </p>
 
 <p align="center">
-  <img src="assets/section-sweep.gif?v=3" alt="The section plane sweeping down through the model: every frame's vermilion caps and outlines are recomputed by the kernel's closed-form section() — wall windows, the round column and slab voids appear and vanish as the plane passes them" width="850">
+  <img src="assets/section-sweep.gif?v=4" alt="The section plane sweeping down through the model: every frame's vermilion caps and outlines are recomputed by the kernel's closed-form section(), while the analytic curved-panel layer is clipped for display" width="850">
 </p>
 
-*Both images are the bundled Three.js viewer rendering the kernel's own output: watertight tessellation for the solids, and closed-form `section()` profiles (vermilion caps and outlines) recomputed live as the plane moves — every opening, notch and round face you see was produced by the kernel's booleans.*
+*Both images are the bundled Three.js viewer rendering kernel output: watertight tessellation for CSG solids, closed-form `section()` profiles (vermilion caps and outlines) recomputed live as the plane moves, plus a generic curved-panel render layer driven through wasm JSON (`CylinderPanel`, `SpherePanel`, `ConePanel`). The curved roof skylights, dome oculi and conical canopy slots are UV trims on analytic surfaces, not hand-modelled Three.js geometry.*
 
 ## The thesis
 
@@ -62,7 +62,7 @@ flowchart LR
 
 **Live demo: <https://s-hosomi.github.io/archi-kernel/>** (deployed from `main` by the Pages workflow).
 
-`viewer/` is a no-build-step web app: the kernel compiled to WebAssembly (`wasm/`, thin `wasm-bindgen` adapter — flat typed arrays for geometry, the kernel's serde JSON for everything structured) plus an ES-module Three.js scene. The demo constructs a three-storey RC office block *as a CSG model in JavaScript* (~160 members): a set-back top floor with a roof terrace and a steel H-section pergola, a round-column colonnade along the front, window-grid facades with an entrance and canopy, a stair/elevator core whose voids stack through every slab, sleeved girders, and the full quantity-take-off deduction chain — columns over girders over beams over slabs. The kernel does the rest: evaluation, watertight meshing, live section planes with kernel-computed caps, and a running concrete-volume total in the HUD.
+`viewer/` is a no-build-step web app: the kernel compiled to WebAssembly (`wasm/`, thin `wasm-bindgen` adapter — flat typed arrays for geometry, the kernel's serde JSON for CSG, and JSON-defined curved panels for the analytic surface layer) plus an ES-module Three.js scene. The demo constructs a three-storey RC office block *as a CSG model in JavaScript* (~160 members): a set-back top floor with a roof terrace and a steel H-section pergola, a round-column colonnade along the front, window-grid facades with an entrance and canopy, a stair/elevator core whose voids stack through every slab, sleeved girders, and the full quantity-take-off deduction chain — columns over girders over beams over slabs. On top of that it registers three curved analytic panels through the same wasm boundary: a thick cylindrical barrel vault with rectangular skylight trims, a spherical terrace dome with circular UV oculi, and a conical entry canopy with slotted trims. The kernel does the rest: evaluation, watertight meshing for CSG solids, curved-panel tessellation, live section planes with kernel-computed caps for the CSG layer, and a running concrete-volume total in the HUD.
 
 ```bash
 rustup target add wasm32-unknown-unknown   # once
@@ -72,7 +72,7 @@ cd viewer && python3 -m http.server 8741
 # open http://localhost:8741 — drag to orbit, toggle "section" to cut the model live
 ```
 
-The section slider is an honest demo of the kernel: every time you move it, the viewer calls `section_all()` and rebuilds the vermilion caps from the returned closed-form profiles (with holes and arcs), while Three.js clipping merely hides the geometry above the plane.
+The section slider is an honest demo of the current split: every time you move it, the viewer calls `section_all()` and rebuilds the vermilion caps from the returned closed-form CSG profiles (with holes and arcs), while Three.js clipping hides the geometry above the plane. Curved panels are clipped visually in this phase; they are not yet part of the B-rep/section evaluator.
 
 ## Status (v0.3.x — roadmap Phases 0–7 implemented)
 
@@ -86,6 +86,7 @@ The section slider is an honest demo of the kernel: every time you move it, the 
 - Watertight tessellation (per-curve discretisation shared between siblings; every mesh edge verified to appear in exactly two opposite triangles); flat arrays for Three.js / FEM
 - Clash detection (AABB broad phase → exact prismatic intersection volume; honest `PotentialClash` degradation) and sleeve rule checks
 - wasm bindings + Three.js viewer (this page's screenshots)
+- Curved analytic panel render layer in wasm: cylindrical panels with thick rectangular UV openings, spherical panels with UV oculi, and conical frustum panels for display tessellation
 - ~290 tests: hand-computed analytic references, adversarial degeneracy suites (born from an adversarial review that found and fixed 10 real defects — and a viewer that immediately found two more), >1,000-case volume-identity property tests
 
 Out of scope, by design, until real data demands them: general 3-D booleans between non-prismatic pairs (explicit error today), cylinder × cylinder, exact plane arithmetic (the data structures reserve the seam — `VertexGeom` is an open enum and predicates accept implicit points — but the investment waits for measured failure rates).
