@@ -60,6 +60,14 @@ pub enum CurvedError {
     /// A spherical panel includes a pole where the longitude parameter
     /// collapses.
     PoleCrossing,
+    /// A conical panel includes or crosses the apex where the longitude
+    /// parameter collapses.
+    ApexCrossing,
+    /// A cone half-angle was not in the open interval `(0, π/2)`.
+    InvalidConeAngle {
+        /// The offending value.
+        value: f64,
+    },
 }
 
 impl fmt::Display for CurvedError {
@@ -99,6 +107,12 @@ impl fmt::Display for CurvedError {
             }
             CurvedError::PoleCrossing => {
                 write!(f, "spherical panel must not include a parameter pole")
+            }
+            CurvedError::ApexCrossing => {
+                write!(f, "conical panel must not include the apex")
+            }
+            CurvedError::InvalidConeAngle { value } => {
+                write!(f, "cone half-angle must be between 0 and π/2, got {value}")
             }
         }
     }
