@@ -13,12 +13,24 @@ import { Line2 } from 'three/addons/lines/Line2.js';
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import init, { KernelModel } from './pkg/archi_kernel_wasm.js';
-import { MEMBERS, CURVED_PANELS, KIND_OF, CURVED_KIND_OF, BOUNDS } from './building.js';
 
 THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
 
 const params = new URLSearchParams(location.search);
+const DEMO_ID = params.get('demo') === 'curved' ? 'curved' : 'office';
 const SHOT = params.get('shot'); // 'hero' | 'section' | null
+const demoModule = DEMO_ID === 'curved'
+  ? await import('./curved-building.js')
+  : await import('./building.js');
+const {
+  MEMBERS,
+  CURVED_PANELS = [],
+  KIND_OF,
+  CURVED_KIND_OF = new Map(),
+  BOUNDS,
+  DEMO = { id: DEMO_ID, label: DEMO_ID },
+  VIEW = {},
+} = demoModule;
 
 // ── Palette ──────────────────────────────────────────────────────────────────
 const PAPER = 0xedebe6;
@@ -33,11 +45,15 @@ const TONES = {
   wall: 0xd2cec6,
   'wall-core': 0xbcb4a6,
   canopy: 0xc9c6bf,
+  plinth: 0xbdb7aa,
+  glass: 0x9fc6d0,
+  mullion: 0x54616d,
+  'roof-frame': 0x68737c,
   parapet: 0xcfccc5,
   steel: 0x5d6671,
   'curved-roof': 0x9fb6bd,
   'curved-dome': 0x8bb7c7,
-  'curved-cone': 0xb7a77b,
+  'curved-cone': 0xb88f45,
 };
 
 // ── Renderer / scene ─────────────────────────────────────────────────────────
@@ -58,7 +74,7 @@ const camera = new THREE.PerspectiveCamera(34, 2, 0.1, 500);
 camera.up.set(0, 0, 1);
 
 const controls = new OrbitControls(camera, canvas);
-controls.target.set(9.6, 5.6, 4.6);
+controls.target.fromArray(VIEW.target ?? [9.6, 5.6, 4.6]);
 controls.enableDamping = true;
 controls.dampingFactor = 0.06;
 controls.maxPolarAngle = Math.PI * 0.55;
@@ -120,14 +136,14 @@ const lineMaterials = []; // LineMaterials needing resolution updates
 const meshMaterials = [];
 
 function memberMaterial(kind) {
-  const transparent = kind === 'curved-dome' || kind === 'curved-roof';
+  const transparent = kind === 'glass' || kind === 'curved-dome' || kind === 'curved-roof';
   const m = new THREE.MeshStandardMaterial({
     color: TONES[kind] ?? 0xbdb9b0,
-    roughness: kind?.startsWith('curved') ? 0.48 : 0.88,
+    roughness: kind === 'glass' ? 0.22 : kind?.startsWith('curved') ? 0.48 : 0.88,
     metalness: 0.0,
     side: kind?.startsWith('curved') ? THREE.DoubleSide : THREE.FrontSide,
     transparent,
-    opacity: kind === 'curved-dome' ? 0.58 : kind === 'curved-roof' ? 0.88 : 1.0,
+    opacity: kind === 'glass' ? 0.46 : kind === 'curved-dome' ? 0.58 : kind === 'curved-roof' ? 0.86 : 1.0,
   });
   // Clip the shadow casters along with the geometry, or the removed upper
   // storeys would keep casting onto the ground in section mode.
@@ -206,8 +222,9 @@ async function build() {
   }
 
   const dt = performance.now() - t0;
+  const curvedText = CURVED_PANELS.length ? ` + ${CURVED_PANELS.length} curved panels` : '';
   hud.innerHTML =
-    `${MEMBERS.length} CSG members + ${CURVED_PANELS.length} curved panels · ` +
+    `${DEMO.label} · ${MEMBERS.length} CSG members${curvedText} · ` +
     `${triangleTotal.toLocaleString()} tris · ` +
     `evaluated in ${dt.toFixed(0)} ms<br>` +
     `concrete ${concrete.toFixed(2)} m³` +
@@ -289,6 +306,8 @@ function rebuildSectionGraphics() {
 const toggle = document.getElementById('section-toggle');
 const slider = document.getElementById('section-z');
 slider.max = String(BOUNDS.zMax - 0.25);
+const activeDemoLink = document.querySelector(`[data-demo-link="${DEMO.id}"]`);
+activeDemoLink?.classList.add('active');
 function updateSectionLabel(z) {
   document.getElementById('section-z-label').textContent =
     `z = ${Number(z).toFixed(2)} m`;
@@ -303,20 +322,21 @@ slider.addEventListener('input', () => {
 // ── Shots (deterministic states for screenshots) ─────────────────────────────
 function applyShotMode() {
   if (SHOT === 'section') {
-    camera.position.set(28.5, -22.0, 19.2);
-    controls.target.set(9.0, 5.1, 4.0);
+    camera.position.fromArray(VIEW.sectionCamera ?? [28.5, -22.0, 19.2]);
+    controls.target.fromArray(VIEW.sectionTarget ?? [9.0, 5.1, 4.0]);
     toggle.checked = true;
-    slider.value = '8.45';
+    slider.value = String(VIEW.sectionZ ?? 8.45);
     updateSectionLabel(slider.value);
-    setSection(true, 8.45);
+    setSection(true, Number(slider.value));
   } else {
-    camera.position.set(34.5, -26.0, 18.6);
-    controls.target.set(10.4, 5.0, 6.5);
+    camera.position.fromArray(VIEW.heroCamera ?? [34.5, -26.0, 18.6]);
+    controls.target.fromArray(VIEW.heroTarget ?? [10.4, 5.0, 6.5]);
   }
   controls.update();
   if (SHOT) {
     controls.enableDamping = false;
     document.getElementById('hud-hint').style.display = 'none';
+    document.getElementById('demo-switch').style.display = 'none';
   }
   // Signal readiness for headless capture after a few settled frames.
   let frames = 0;
