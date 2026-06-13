@@ -9,6 +9,7 @@ mod cylinder_panel;
 mod domain;
 mod error;
 mod mesh;
+mod sphere_panel;
 mod trim;
 
 pub use cylinder_panel::{
@@ -17,4 +18,8 @@ pub use cylinder_panel::{
 };
 pub use error::CurvedError;
 pub use mesh::SurfaceMesh;
+pub use sphere_panel::{
+    tessellate_sphere_panel, tessellate_thick_sphere_panel, SpherePanel, SpherePanelOptions,
+    ThickSpherePanel,
+};
 pub use trim::{TrimEdge2d, TrimLoop2d};

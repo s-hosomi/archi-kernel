@@ -26,6 +26,11 @@ pub enum CurvedError {
         /// The offending value.
         value: f64,
     },
+    /// A radius was not strictly positive and finite.
+    NonPositiveRadius {
+        /// The offending value.
+        value: f64,
+    },
     /// The inner offset radius of a thick cylindrical panel is not positive.
     NonPositiveInnerRadius {
         /// The computed inner radius.
@@ -52,6 +57,9 @@ pub enum CurvedError {
     /// A trim loop crosses the cylinder parameter seam; this phase requires
     /// loops to live inside one unwrapped `theta` interval.
     SeamCrossing,
+    /// A spherical panel includes a pole where the longitude parameter
+    /// collapses.
+    PoleCrossing,
 }
 
 impl fmt::Display for CurvedError {
@@ -69,6 +77,9 @@ impl fmt::Display for CurvedError {
             CurvedError::NonPositiveThickness { value } => {
                 write!(f, "panel thickness must be strictly positive, got {value}")
             }
+            CurvedError::NonPositiveRadius { value } => {
+                write!(f, "radius must be strictly positive, got {value}")
+            }
             CurvedError::NonPositiveInnerRadius { radius } => {
                 write!(f, "inner cylinder radius must stay positive, got {radius}")
             }
@@ -85,6 +96,9 @@ impl fmt::Display for CurvedError {
             CurvedError::HoleOverlap => write!(f, "hole loops must not overlap or cross"),
             CurvedError::SeamCrossing => {
                 write!(f, "trim loop must not cross the cylinder theta seam")
+            }
+            CurvedError::PoleCrossing => {
+                write!(f, "spherical panel must not include a parameter pole")
             }
         }
     }
