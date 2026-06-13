@@ -5,15 +5,23 @@
 //! supplied as loops in the surface parameter domain and tessellated for display.
 //! General surface-surface boolean evaluation remains out of scope.
 
+mod cone_panel;
 mod cylinder_panel;
+mod domain;
 mod error;
 mod mesh;
+mod sphere_panel;
 mod trim;
 
+pub use cone_panel::{tessellate_cone_panel, ConePanel, ConePanelOptions, ConePanelSpec};
 pub use cylinder_panel::{
     tessellate_cylinder_panel, tessellate_thick_cylinder_panel, CylinderPanel,
     CylinderPanelOptions, ThickCylinderPanel,
 };
 pub use error::CurvedError;
 pub use mesh::SurfaceMesh;
+pub use sphere_panel::{
+    tessellate_sphere_panel, tessellate_thick_sphere_panel, SpherePanel, SpherePanelOptions,
+    SpherePanelSpec, ThickSpherePanel,
+};
 pub use trim::{TrimEdge2d, TrimLoop2d};
