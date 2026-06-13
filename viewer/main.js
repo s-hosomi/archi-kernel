@@ -46,6 +46,11 @@ const TONES = {
   'wall-core': 0xbcb4a6,
   canopy: 0xc9c6bf,
   plinth: 0xbdb7aa,
+  stone: 0xc8bea8,
+  buttress: 0xa99b83,
+  drum: 0xb8aa91,
+  minaret: 0xc2b59c,
+  window: 0x9fbcc3,
   glass: 0x9fc6d0,
   mullion: 0x54616d,
   'roof-frame': 0x68737c,
@@ -53,6 +58,8 @@ const TONES = {
   steel: 0x5d6671,
   'curved-roof': 0x9fb6bd,
   'curved-dome': 0x8bb7c7,
+  'curved-stone-dome': 0xbeb5a2,
+  'curved-stone-vault': 0xb7ad99,
   'curved-cone': 0xb88f45,
 };
 
@@ -136,14 +143,14 @@ const lineMaterials = []; // LineMaterials needing resolution updates
 const meshMaterials = [];
 
 function memberMaterial(kind) {
-  const transparent = kind === 'glass' || kind === 'curved-dome' || kind === 'curved-roof';
+  const transparent = kind === 'glass' || kind === 'window' || kind === 'curved-dome' || kind === 'curved-roof';
   const m = new THREE.MeshStandardMaterial({
     color: TONES[kind] ?? 0xbdb9b0,
-    roughness: kind === 'glass' ? 0.22 : kind?.startsWith('curved') ? 0.48 : 0.88,
+    roughness: kind === 'glass' || kind === 'window' ? 0.22 : kind?.startsWith('curved') ? 0.62 : 0.88,
     metalness: 0.0,
     side: kind?.startsWith('curved') ? THREE.DoubleSide : THREE.FrontSide,
     transparent,
-    opacity: kind === 'glass' ? 0.46 : kind === 'curved-dome' ? 0.58 : kind === 'curved-roof' ? 0.86 : 1.0,
+    opacity: kind === 'glass' || kind === 'window' ? 0.46 : kind === 'curved-dome' ? 0.58 : kind === 'curved-roof' ? 0.86 : 1.0,
   });
   // Clip the shadow casters along with the geometry, or the removed upper
   // storeys would keep casting onto the ground in section mode.
@@ -321,7 +328,11 @@ slider.addEventListener('input', () => {
 
 // ── Shots (deterministic states for screenshots) ─────────────────────────────
 function applyShotMode() {
-  if (SHOT === 'section') {
+  const fixedShot = VIEW.shots?.[SHOT];
+  if (fixedShot) {
+    camera.position.fromArray(fixedShot.camera);
+    controls.target.fromArray(fixedShot.target);
+  } else if (SHOT === 'section') {
     camera.position.fromArray(VIEW.sectionCamera ?? [28.5, -22.0, 19.2]);
     controls.target.fromArray(VIEW.sectionTarget ?? [9.0, 5.1, 4.0]);
     toggle.checked = true;
