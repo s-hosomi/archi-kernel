@@ -1,5 +1,5 @@
 // Records the section-plane sweep as PNG frames for the README GIF.
-// Usage: node record.mjs [outdir]   (server must be running on :8741)
+// Usage: node record.mjs [outdir] [office|curved]   (server must be running on :8741)
 //
 // Drives the real UI: sets the section slider and dispatches `input`, so every
 // frame's vermilion caps are honest kernel `section_all()` output.
@@ -8,6 +8,7 @@ import { chromium } from 'playwright';
 import { mkdirSync } from 'node:fs';
 
 const outdir = process.argv[2] ?? '/tmp/ak-frames';
+const demo = process.argv[3] === 'curved' ? 'curved' : 'office';
 mkdirSync(outdir, { recursive: true });
 
 const browser = await chromium.launch();
@@ -19,14 +20,21 @@ page.on('console', (m) => {
   const t = m.text();
   if (t.includes('section errors') || t.includes('failed')) console.log('[console]', t.slice(0, 200));
 });
-await page.goto('http://localhost:8741/index.html?shot=section');
+const url = new URL('http://localhost:8741/index.html');
+url.searchParams.set('shot', 'section');
+if (demo === 'curved') url.searchParams.set('demo', 'curved');
+await page.goto(String(url));
 await page.waitForFunction('window.__READY === true', { timeout: 60000 });
 
 // Sweep: pause at the top (full floor plate), glide down through the wall and
 // windows, pause at the bottom, then the frame list is ping-ponged by the
 // caller. Eased steps so the motion reads as deliberate, not linear.
-const Z_TOP = 11.15;
-const Z_BOT = 0.55;
+const [sliderMin, sliderMax] = await page.evaluate(() => {
+  const slider = document.getElementById('section-z');
+  return [Number(slider.min), Number(slider.max)];
+});
+const Z_TOP = sliderMax - 0.05;
+const Z_BOT = sliderMin + 0.35;
 const STEPS = 56;
 const ease = (t) => 0.5 - 0.5 * Math.cos(Math.PI * t); // smooth in/out
 

@@ -140,6 +140,37 @@ impl KernelModel {
     /// Curved panels are a renderable surface layer at this phase: they can be
     /// tessellated through [`curved_mesh`](Self::curved_mesh), but are not yet
     /// part of the CSG/B-rep evaluator used by sections, take-off or clashes.
+    ///
+    /// The JSON is an externally tagged object with one lowercase key:
+    /// `cylinder`, `sphere` or `cone`. Trim loops inside `holes` use the same
+    /// tagging style with `rectangle`, `circle` or `polygon`; reversed loops
+    /// act as holes. Cylinder and sphere panels may include `thickness`.
+    ///
+    /// ```json
+    /// {
+    ///   "cylinder": {
+    ///     "axis_origin": { "x": 0.0, "y": 5.6, "z": 8.95 },
+    ///     "axis_dir": { "x": 1.0, "y": 0.0, "z": 0.0 },
+    ///     "radius": 4.2,
+    ///     "theta_min": -0.94,
+    ///     "theta_max": 0.94,
+    ///     "z_min": -0.35,
+    ///     "z_max": 13.15,
+    ///     "thickness": 0.16,
+    ///     "holes": [
+    ///       {
+    ///         "rectangle": {
+    ///           "u_min": -0.22,
+    ///           "u_max": 0.22,
+    ///           "v_min": 1.2,
+    ///           "v_max": 2.75,
+    ///           "reverse": true
+    ///         }
+    ///       }
+    ///     ]
+    ///   }
+    /// }
+    /// ```
     pub fn insert_curved(&mut self, id: u64, curved_json: &str) -> Result<(), JsError> {
         let node: CurvedPanelInput = serde_json::from_str(curved_json)
             .map_err(|e| JsError::new(&format!("bad curved panel: {e}")))?;

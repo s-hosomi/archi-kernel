@@ -39,7 +39,7 @@ jobs:
       - name: Assemble site
         run: |
           mkdir -p _site
-          cp viewer/index.html viewer/main.js viewer/building.js _site/
+          cp viewer/index.html viewer/main.js viewer/building.js viewer/curved-building.js _site/
           cp -r viewer/pkg _site/pkg
           rm -f _site/pkg/.gitignore
       - uses: actions/upload-pages-artifact@v3
