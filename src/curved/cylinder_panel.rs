@@ -2,6 +2,8 @@
 
 use std::f64::consts::{PI, TAU};
 
+use crate::boolean::poly2d::geom::{Arc, Edge2, Point2};
+use crate::boolean::poly2d::intersect::intersect;
 use crate::math::{Point3, Vec3};
 use crate::primitives::{plane_basis, Cylinder};
 use crate::tolerance::Tol;
@@ -30,9 +32,8 @@ pub struct CylinderPanel {
 impl CylinderPanel {
     /// Construct a cylindrical panel with UV-space holes.
     ///
-    /// This phase accepts straight-edged trim loops only. Loops must be contained
-    /// in the unwrapped rectangle `[theta_min, theta_max] × [z_min, z_max]` and
-    /// must not cross or overlap.
+    /// Loops must be contained in the unwrapped rectangle
+    /// `[theta_min, theta_max] × [z_min, z_max]` and must not cross or overlap.
     pub fn new(
         cylinder: Cylinder,
         theta_min: f64,
@@ -256,6 +257,9 @@ pub fn tessellate_thick_cylinder_panel(
     }
 
     let mid = &panel.mid;
+    if mid.holes.iter().any(TrimLoop2d::has_arc) {
+        return Err(CurvedError::UnsupportedArcTrim);
+    }
     let theta_values = parameter_values(
         mid.theta_min,
         mid.theta_max,
@@ -447,14 +451,15 @@ fn loops_overlap(a: &TrimLoop2d, b: &TrimLoop2d, tol: &Tol) -> bool {
         return false;
     }
     for ea in &a.edges {
-        let super::TrimEdge2d::Line { start: a0, end: a1 } = *ea else {
-            return true;
-        };
+        let edge_a = edge2(*ea);
         for eb in &b.edges {
-            let super::TrimEdge2d::Line { start: b0, end: b1 } = *eb else {
+            let edge_b = edge2(*eb);
+            let Ok(crossings) = intersect(&edge_a, &edge_b, tol) else {
+                // Tangent arc degeneracies mean the holes touch; reject that as
+                // overlap rather than accepting an ambiguous zero-width gap.
                 return true;
             };
-            if segments_intersect(a0, a1, b0, b1, tol) {
+            if !crossings.points.is_empty() {
                 return true;
             }
         }
@@ -473,35 +478,23 @@ fn bounds_overlap(a: &TrimLoop2d, b: &TrimLoop2d, tol: &Tol) -> bool {
         && amax[1] + tol.length >= bmin[1]
 }
 
-fn segments_intersect(a0: [f64; 2], a1: [f64; 2], b0: [f64; 2], b1: [f64; 2], tol: &Tol) -> bool {
-    let o1 = orient(a0, a1, b0);
-    let o2 = orient(a0, a1, b1);
-    let o3 = orient(b0, b1, a0);
-    let o4 = orient(b0, b1, a1);
-    if o1.abs() <= tol.length && point_in_box(b0, a0, a1, tol) {
-        return true;
+fn edge2(edge: super::TrimEdge2d) -> Edge2 {
+    match edge {
+        super::TrimEdge2d::Line { start, end } => {
+            Edge2::seg(Point2::new(start[0], start[1]), Point2::new(end[0], end[1]))
+        }
+        super::TrimEdge2d::Arc {
+            center,
+            radius,
+            start_angle,
+            end_angle,
+        } => Edge2::Arc(Arc::new(
+            Point2::new(center[0], center[1]),
+            radius,
+            start_angle,
+            end_angle - start_angle,
+        )),
     }
-    if o2.abs() <= tol.length && point_in_box(b1, a0, a1, tol) {
-        return true;
-    }
-    if o3.abs() <= tol.length && point_in_box(a0, b0, b1, tol) {
-        return true;
-    }
-    if o4.abs() <= tol.length && point_in_box(a1, b0, b1, tol) {
-        return true;
-    }
-    (o1 > 0.0) != (o2 > 0.0) && (o3 > 0.0) != (o4 > 0.0)
-}
-
-fn orient(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
-    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-}
-
-fn point_in_box(p: [f64; 2], a: [f64; 2], b: [f64; 2], tol: &Tol) -> bool {
-    p[0] >= a[0].min(b[0]) - tol.length
-        && p[0] <= a[0].max(b[0]) + tol.length
-        && p[1] >= a[1].min(b[1]) - tol.length
-        && p[1] <= a[1].max(b[1]) + tol.length
 }
 
 #[allow(dead_code)]
