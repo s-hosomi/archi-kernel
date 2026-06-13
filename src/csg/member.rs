@@ -85,6 +85,9 @@ pub enum UnsupportedReason {
     /// union of three or more solids), which needs a general `Brep × Brep`
     /// boolean outside this phase.
     NonLeafOperands,
+    /// A curved panel is present in the CSG tree. Curved panels are tessellated
+    /// through `curved`, not evaluated as B-rep solids in this phase.
+    CurvedPanel,
 }
 
 impl From<KernelError> for EvalError {
@@ -289,6 +292,9 @@ impl Member {
                 }
                 Ok(prismatic::union(&leaves, tol)?)
             }
+            CsgNode::CurvedPanel(_) => Err(EvalError::Unsupported3dBoolean {
+                reason: UnsupportedReason::CurvedPanel,
+            }),
             _ => Err(EvalError::NotYetImplemented),
         }
     }
@@ -311,6 +317,7 @@ fn extrude_leaf(node: &CsgNode) -> Option<ExtrudeLeaf> {
             axis: *axis,
             length: *length,
         }),
+        CsgNode::CurvedPanel(_) => None,
         _ => None,
     }
 }

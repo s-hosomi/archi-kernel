@@ -347,7 +347,7 @@ fn collect_clippers(node: &CsgNode, out: &mut BTreeSet<StableId>) {
             collect_clippers(positive, out);
             collect_clippers(negative, out);
         }
-        CsgNode::Extrude { .. } => {}
+        CsgNode::Extrude { .. } | CsgNode::CurvedPanel(_) => {}
     }
 }
 

@@ -13,6 +13,7 @@ pub mod brep;
 pub mod build;
 pub mod clash;
 pub mod csg;
+pub mod curved;
 pub mod error;
 pub mod geom;
 pub mod intersect;
