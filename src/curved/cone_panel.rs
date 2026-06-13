@@ -35,22 +35,45 @@ pub struct ConePanel {
     pub holes: Vec<TrimLoop2d>,
 }
 
+/// Parameters for constructing a [`ConePanel`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ConePanelSpec {
+    /// Cone apex in metres.
+    pub apex: Point3,
+    /// Cone axis, pointing from the apex toward increasing height.
+    pub axis: Unit3,
+    /// Cone half-angle in radians.
+    pub half_angle: f64,
+    /// Minimum angular parameter in radians.
+    pub theta_min: f64,
+    /// Maximum angular parameter in radians.
+    pub theta_max: f64,
+    /// Minimum height from apex in metres.
+    pub height_min: f64,
+    /// Maximum height from apex in metres.
+    pub height_max: f64,
+}
+
 impl ConePanel {
     /// Construct a conical frustum panel with UV-space holes.
     ///
     /// This phase rejects domains touching the apex because longitude
     /// collapses there.
     pub fn new(
-        apex: Point3,
-        axis: Unit3,
-        half_angle: f64,
-        theta_min: f64,
-        theta_max: f64,
-        height_min: f64,
-        height_max: f64,
+        spec: ConePanelSpec,
         holes: Vec<TrimLoop2d>,
         tol: &Tol,
     ) -> Result<Self, CurvedError> {
+        let ConePanelSpec {
+            apex,
+            axis,
+            half_angle,
+            theta_min,
+            theta_max,
+            height_min,
+            height_max,
+        } = spec;
         if !half_angle.is_finite() || half_angle <= 0.0 || half_angle >= FRAC_PI_2 - tol.length {
             return Err(CurvedError::InvalidConeAngle { value: half_angle });
         }

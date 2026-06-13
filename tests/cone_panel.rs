@@ -1,18 +1,20 @@
 use archi_kernel::curved::{
-    tessellate_cone_panel, ConePanel, ConePanelOptions, CurvedError, TrimLoop2d,
+    tessellate_cone_panel, ConePanel, ConePanelOptions, ConePanelSpec, CurvedError, TrimLoop2d,
 };
 use archi_kernel::{Point3, Tol, Unit3};
 
 fn cone_panel(holes: Vec<TrimLoop2d>) -> ConePanel {
     let tol = Tol::default();
     ConePanel::new(
-        Point3::origin(),
-        Unit3::Z,
-        0.35_f64,
-        0.0_f64,
-        1.0_f64,
-        1.0_f64,
-        2.2_f64,
+        ConePanelSpec {
+            apex: Point3::origin(),
+            axis: Unit3::Z,
+            half_angle: 0.35_f64,
+            theta_min: 0.0_f64,
+            theta_max: 1.0_f64,
+            height_min: 1.0_f64,
+            height_max: 2.2_f64,
+        },
         holes,
         &tol,
     )
@@ -70,13 +72,15 @@ fn rectangular_uv_hole_removes_conical_area() {
 fn cone_panel_rejects_apex_crossing_domain() {
     let tol = Tol::default();
     let err = ConePanel::new(
-        Point3::origin(),
-        Unit3::Z,
-        0.35_f64,
-        0.0_f64,
-        1.0_f64,
-        0.0_f64,
-        2.0_f64,
+        ConePanelSpec {
+            apex: Point3::origin(),
+            axis: Unit3::Z,
+            half_angle: 0.35_f64,
+            theta_min: 0.0_f64,
+            theta_max: 1.0_f64,
+            height_min: 0.0_f64,
+            height_max: 2.0_f64,
+        },
         Vec::new(),
         &tol,
     )
@@ -88,13 +92,15 @@ fn cone_panel_rejects_apex_crossing_domain() {
 fn cone_panel_rejects_invalid_half_angle() {
     let tol = Tol::default();
     let err = ConePanel::new(
-        Point3::origin(),
-        Unit3::Z,
-        std::f64::consts::FRAC_PI_2,
-        0.0_f64,
-        1.0_f64,
-        1.0_f64,
-        2.0_f64,
+        ConePanelSpec {
+            apex: Point3::origin(),
+            axis: Unit3::Z,
+            half_angle: std::f64::consts::FRAC_PI_2,
+            theta_min: 0.0_f64,
+            theta_max: 1.0_f64,
+            height_min: 1.0_f64,
+            height_max: 2.0_f64,
+        },
         Vec::new(),
         &tol,
     )

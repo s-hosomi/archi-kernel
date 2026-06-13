@@ -1,6 +1,6 @@
 use archi_kernel::curved::{
     tessellate_sphere_panel, tessellate_thick_sphere_panel, CurvedError, SpherePanel,
-    SpherePanelOptions, SurfaceMesh, ThickSpherePanel, TrimLoop2d,
+    SpherePanelOptions, SpherePanelSpec, SurfaceMesh, ThickSpherePanel, TrimLoop2d,
 };
 use archi_kernel::{Point3, Tol, Unit3};
 use std::collections::HashMap;
@@ -8,13 +8,15 @@ use std::collections::HashMap;
 fn sphere_panel(holes: Vec<TrimLoop2d>) -> SpherePanel {
     let tol = Tol::default();
     SpherePanel::new(
-        Point3::origin(),
-        4.0_f64,
-        Unit3::Z,
-        0.0_f64,
-        1.2_f64,
-        -0.35_f64,
-        0.45_f64,
+        SpherePanelSpec {
+            center: Point3::origin(),
+            radius: 4.0_f64,
+            pole: Unit3::Z,
+            theta_min: 0.0_f64,
+            theta_max: 1.2_f64,
+            phi_min: -0.35_f64,
+            phi_max: 0.45_f64,
+        },
         holes,
         &tol,
     )
@@ -69,13 +71,15 @@ fn rectangular_uv_hole_removes_spherical_area() {
 fn sphere_panel_rejects_pole_crossing_domain() {
     let tol = Tol::default();
     let err = SpherePanel::new(
-        Point3::origin(),
-        4.0_f64,
-        Unit3::Z,
-        0.0_f64,
-        1.0_f64,
-        -std::f64::consts::FRAC_PI_2,
-        0.2_f64,
+        SpherePanelSpec {
+            center: Point3::origin(),
+            radius: 4.0_f64,
+            pole: Unit3::Z,
+            theta_min: 0.0_f64,
+            theta_max: 1.0_f64,
+            phi_min: -std::f64::consts::FRAC_PI_2,
+            phi_max: 0.2_f64,
+        },
         Vec::new(),
         &tol,
     )

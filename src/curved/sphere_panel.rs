@@ -35,6 +35,26 @@ pub struct SpherePanel {
     pub holes: Vec<TrimLoop2d>,
 }
 
+/// Parameters for constructing a [`SpherePanel`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SpherePanelSpec {
+    /// Sphere centre in metres.
+    pub center: Point3,
+    /// Sphere radius in metres.
+    pub radius: f64,
+    /// Positive latitude direction.
+    pub pole: Unit3,
+    /// Minimum longitude in radians.
+    pub theta_min: f64,
+    /// Maximum longitude in radians.
+    pub theta_max: f64,
+    /// Minimum latitude in radians.
+    pub phi_min: f64,
+    /// Maximum latitude in radians.
+    pub phi_max: f64,
+}
+
 impl SpherePanel {
     /// Construct a spherical panel with UV-space holes.
     ///
@@ -42,16 +62,19 @@ impl SpherePanel {
     /// collapses there. Use separate cap-specific primitives for exact polar
     /// domes in a later phase.
     pub fn new(
-        center: Point3,
-        radius: f64,
-        pole: Unit3,
-        theta_min: f64,
-        theta_max: f64,
-        phi_min: f64,
-        phi_max: f64,
+        spec: SpherePanelSpec,
         holes: Vec<TrimLoop2d>,
         tol: &Tol,
     ) -> Result<Self, CurvedError> {
+        let SpherePanelSpec {
+            center,
+            radius,
+            pole,
+            theta_min,
+            theta_max,
+            phi_min,
+            phi_max,
+        } = spec;
         if radius <= 0.0 || !radius.is_finite() {
             return Err(CurvedError::NonPositiveRadius { value: radius });
         }
@@ -234,8 +257,8 @@ pub fn tessellate_thick_sphere_panel(
             let t1 = theta_values[i + 1];
             let p0 = phi_values[j];
             let p1 = phi_values[j + 1];
-            emit_sphere_cell(&mut builder, mid, ro, t0, t1, p0, p1, false);
-            emit_sphere_cell(&mut builder, mid, ri, t0, t1, p0, p1, true);
+            emit_sphere_cell(&mut builder, mid, ro, [t0, t1], [p0, p1], false);
+            emit_sphere_cell(&mut builder, mid, ri, [t0, t1], [p0, p1], true);
 
             if i == 0 || !material[i - 1][j] {
                 emit_theta_side(&mut builder, mid, [ri, ro], t0, [p0, p1], false);
@@ -293,12 +316,12 @@ fn emit_sphere_cell(
     b: &mut SurfaceMeshBuilder,
     panel: &SpherePanel,
     radius: f64,
-    t0: f64,
-    t1: f64,
-    p0: f64,
-    p1: f64,
+    theta: [f64; 2],
+    phi: [f64; 2],
     inward: bool,
 ) {
+    let [t0, t1] = theta;
+    let [p0, p1] = phi;
     let a = b.vertex(panel.point_at_radius(radius, t0, p0));
     let bb = b.vertex(panel.point_at_radius(radius, t1, p0));
     let c = b.vertex(panel.point_at_radius(radius, t1, p1));
