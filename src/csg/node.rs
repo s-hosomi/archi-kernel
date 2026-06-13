@@ -2,6 +2,7 @@
 
 use crate::csg::ids::{OpeningId, StableId};
 use crate::csg::profile::Profile2d;
+use crate::curved::ThickCylinderPanel;
 use crate::math::{Point3, Vec3};
 
 /// A node in a member's CSG tree.
@@ -26,6 +27,12 @@ pub enum CsgNode {
         /// The extrusion length in metres.
         length: f64,
     },
+    /// A trimmed thick cylindrical panel.
+    ///
+    /// This connects the curved-panel vocabulary to CSG without routing it
+    /// through the prismatic evaluator. B-rep evaluation currently reports an
+    /// explicit unsupported error for this variant.
+    CurvedPanel(CurvedPanelNode),
     /// The union of several sub-nodes.
     Union(Vec<CsgNode>),
     /// `IfcRelVoidsElement`-equivalent semantic opening subtraction.
@@ -57,6 +64,14 @@ pub enum CsgNode {
         /// The solid to subtract.
         negative: Box<CsgNode>,
     },
+}
+
+/// A curved panel node in the CSG tree.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CurvedPanelNode {
+    /// The thick cylindrical panel geometry.
+    pub panel: ThickCylinderPanel,
 }
 
 /// A semantic opening (void) cut from a member.

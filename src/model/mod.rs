@@ -281,6 +281,7 @@ fn occupancy_leaf(node: &CsgNode) -> Option<ExtrudeLeaf> {
             axis: *axis,
             length: *length,
         }),
+        CsgNode::CurvedPanel(_) => None,
         CsgNode::OpeningSubtraction { base, .. } => occupancy_leaf(base),
         CsgNode::Clip { base, .. } => occupancy_leaf(base),
         _ => None,

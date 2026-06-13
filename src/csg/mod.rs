@@ -16,5 +16,5 @@ mod profile;
 pub use crate::boolean::prismatic::Operand;
 pub use ids::{OpeningId, StableId};
 pub use member::{EvalError, Member, UnsupportedReason};
-pub use node::{ClipRule, CsgNode, Opening};
+pub use node::{ClipRule, CsgNode, CurvedPanelNode, Opening};
 pub use profile::Profile2d;

@@ -1,3 +1,4 @@
+use archi_kernel::csg::{CsgNode, CurvedPanelNode, EvalError, Member, UnsupportedReason};
 use archi_kernel::curved::{
     tessellate_cylinder_panel, tessellate_thick_cylinder_panel, CurvedError, CylinderPanel,
     CylinderPanelOptions, SurfaceMesh, ThickCylinderPanel, TrimLoop2d,
@@ -202,6 +203,31 @@ fn thick_cylinder_panel_with_rectangular_hole_is_closed() {
         mesh.signed_volume(),
         panel.volume()
     );
+}
+
+#[test]
+fn curved_panel_csg_node_is_explicitly_unsupported_by_brep_evaluator() {
+    let tol = Tol::default();
+    let mid = CylinderPanel::new(
+        cylinder(),
+        0.0_f64,
+        1.0_f64,
+        0.0_f64,
+        3.0_f64,
+        Vec::new(),
+        &tol,
+    )
+    .expect("mid");
+    let panel = ThickCylinderPanel::new(mid, 0.2_f64).expect("thick");
+    let mut member = Member::new(CsgNode::CurvedPanel(CurvedPanelNode { panel }));
+
+    let err = member.brep(&tol).expect_err("curved B-rep is unsupported");
+    assert!(matches!(
+        err,
+        EvalError::Unsupported3dBoolean {
+            reason: UnsupportedReason::CurvedPanel
+        }
+    ));
 }
 
 fn assert_mesh_edges_closed(mesh: &SurfaceMesh) {

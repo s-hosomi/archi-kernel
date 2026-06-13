@@ -31,7 +31,7 @@ pub(crate) fn clipper_ids(node: &CsgNode, out: &mut BTreeSet<StableId>) {
             clipper_ids(positive, out);
             clipper_ids(negative, out);
         }
-        CsgNode::Extrude { .. } => {}
+        CsgNode::Extrude { .. } | CsgNode::CurvedPanel(_) => {}
     }
 }
 
